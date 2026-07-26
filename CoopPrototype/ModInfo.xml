@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<Mod
+    modName="CoopPrototype"
+    displayName="Coop Prototype"
+    version="0.1.0"
+    author="null234"
+    dllName="CoopPrototype.dll"
+    hasXML="false"
+    hasLevelXML="false"
+    enableShaderCompiler="false">
+</Mod>

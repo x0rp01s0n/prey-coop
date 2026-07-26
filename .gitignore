@@ -1,0 +1,78 @@
+# Build trees and dependency caches
+/_build/
+/_build_*/
+/.build/
+/.build_*/
+/cmake-build-*/
+/_deps
+/_downloads/
+/_xwin-cache
+/Common
+
+# Local runtime, test and recovery data
+/_coop-autotest-logs/
+/runtime-logs/
+/.tmp/
+/CoopPrototype/Recovery/
+/**/SaveGames/
+/**/compatdata/
+/**/shadercache/
+*.log
+*.dmp
+core
+core.*
+
+# Compiled artifacts
+*.dll
+*.pdb
+*.map
+*.ilk
+*.exp
+*.lib
+*.obj
+*.pch
+*.exe
+*.msi
+*.zip
+*.7z
+*.tar
+*.tar.gz
+
+# Python and editor state
+__pycache__/
+*.py[cod]
+/.cache/
+/.pytest_cache/
+/.mypy_cache/
+/.idea/
+/.vscode/
+CMakeUserPresets.json
+*.user
+
+# Secrets and machine-local configuration
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.keystore
+coop_config.xml
+*.state
+*.sav
+*.bak
+
+# Private engineering workspace
+/WORKLOG.md
+/Working_plan/
+/_coop-fixtures/
+/coop-*
+/CoopPrototype/RE/
+/CoopPrototype/Tools/
+/CoopPrototype/NativeSaveBridgeRefactor.md
+/CoopPrototype/SaveStateNativeRE.md
+
+# OS metadata
+.DS_Store
+Thumbs.db

@@ -1,0 +1,17 @@
+{
+  "name": "coop-prototype",
+  "version-string": "0.1.0",
+  "description": "Prey 2017 Chairloader coop proxy prototype",
+  "builtin-baseline": "f7423ee180c4b7f40d43402c2feb3859161ef625",
+  "$deps_": "Please, keep sorted alphabetically",
+  "$boost": "Don't include the whole Boost!",
+  "dependencies": [
+    "boost-algorithm",
+    "boost-bimap",
+    "boost-core",
+    "boost-format",
+    "boost-variant",
+    "detours",
+    "fmt"
+  ]
+}
