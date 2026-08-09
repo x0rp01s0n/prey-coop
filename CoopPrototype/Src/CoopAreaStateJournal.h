@@ -16,7 +16,7 @@ public:
         BeforeOriginal,
         AfterOriginal,
     };
-
+ 
     struct DirtyEntity
     {
         std::string levelName;

@@ -86,6 +86,7 @@
 #include <Prey/CryEntitySystem/IEntityProxy.h>
 #include <Prey/CryEntitySystem/ScriptBind_Entity.h>
 #include <Prey/CryFlowGraph/IFlowSystem.h>
+#include <Prey/CryInput/IInput.h>
 #include <Prey/CryScriptSystem/ScriptHelpers.h>
 #include <Prey/Cry3DEngine/I3DEngine.h>
 #include <Prey/Cry3DEngine/IStatObj.h>
@@ -113,6 +114,9 @@
 #include <Prey/GameDll/ark/ArkListenerManager.h>
 #include <Prey/GameDll/ark/ArkGame.h>
 #include <Prey/GameDll/ark/ArkItemSystem.h>
+#include <Prey/GameDll/ark/ArkSpeakerExtension.h>
+#include <Prey/GameDll/ark/dialog/ArkDialogPlayerPA.h>
+#include <Prey/GameDll/ark/dialog/arkpadialogmanager.h>
 #include <Prey/GameDll/ark/ArkTimeScaleManager.h>
 #include <Prey/GameDll/ark/turret/ArkTurret.h>
 #include <Prey/GameDll/ark/ui/arkuimenubase.h>
@@ -250,10 +254,26 @@ using CoopRuntimeGuards::TryWriteRuntimeValue;
 constexpr uint64_t kCoopLobbyMainLiftGuid = 5617616201710343076ULL;
 constexpr uint64_t kCoopLobbyMainLiftKioskGuid = 5360973934226282836ULL;
 constexpr uint64_t kCoopLobbyMainLiftDoorGuid = 5280804956559454273ULL;
+// Simulation Labs' intro lift button drives process-local authored moving
+// geometry through its native FlowGraph. Typed kiosk/door/switch state covers
+// most of the sequence, but not the closing wall, so every peer must execute
+// this exact button output once.
+constexpr uint64_t kCoopSimulationLabsIntroElevatorKioskGuid =
+    5206024991491167762ULL;
+constexpr uint64_t kCoopSimulationLabsHelicopterUsePromptGuid =
+    4761887372799457931ULL;
 constexpr const char* kCoopMainLiftOutageLink = "PhAmbush";
 constexpr uint64_t kCoopMainLiftOutageRemoteEventId = 1713490239423853535ULL;
 constexpr const char* kCoopMainLiftOutageRemoteEventWireValue =
     "1713490239423853535";
+
+bool IsNativeFanoutGenericElevatorKiosk(
+    uint64_t stableId,
+    uint64_t entityGuid)
+{
+    return stableId == kCoopSimulationLabsIntroElevatorKioskGuid ||
+        entityGuid == kCoopSimulationLabsIntroElevatorKioskGuid;
+}
 
 uint64_t BuildMainLiftOutageEnemyStableId(uint64_t outageEventId)
 {
@@ -3491,6 +3511,65 @@ std::filesystem::path GetPreySaveGamesRoot()
     return root;
 }
 
+bool TryGetCurrentCampaignIdentity(int& outSlot, uint64_t& outGuid)
+{
+    outSlot = -1;
+    outGuid = 0;
+
+    IGameFramework* framework = nullptr;
+    std::string reason;
+    if (!gEnv || !gEnv->pGame ||
+        !TryGuardedCall(
+            "campaign identity IGame::GetIGameFramework",
+            []() { return gEnv->pGame->GetIGameFramework(); },
+            framework,
+            &reason) ||
+        !IsLikelyRuntimeCppObject(framework))
+    {
+        return false;
+    }
+
+    IArkSaveLoadSystem* saveLoadSystem = nullptr;
+    if (!TryGuardedCall(
+            "campaign identity IGameFramework::GetArkSaveLoadSystem",
+            [framework]() { return &framework->GetArkSaveLoadSystem(); },
+            saveLoadSystem,
+            &reason) ||
+        !IsLikelyRuntimeCppObject(saveLoadSystem))
+    {
+        return false;
+    }
+
+    int campaignSlot = -1;
+    if (!TryGuardedCall(
+            "campaign identity IArkSaveLoadSystem::GetCampaignSlot",
+            [saveLoadSystem]() { return saveLoadSystem->GetCampaignSlot(); },
+            campaignSlot,
+            &reason) ||
+        campaignSlot < 0 || campaignSlot > 2)
+    {
+        return false;
+    }
+
+    outSlot = campaignSlot;
+    ArkGame* arkGame = nullptr;
+    if (TryGuardedCall(
+            "campaign identity ArkGame::GetArkGame",
+            []() { return ArkGame::GetArkGame(); },
+            arkGame,
+            &reason) &&
+        IsLikelyRuntimeCppObject(arkGame, sizeof(ArkGame)))
+    {
+        TryGuardedCall(
+            "campaign identity ArkGame campaign GUID",
+            [arkGame, campaignSlot]() { return arkGame->m_campaignGuids[static_cast<size_t>(campaignSlot)]; },
+            outGuid,
+            &reason);
+    }
+
+    return true;
+}
+
 std::filesystem::path BuildCoopClientSessionSavesRoot()
 {
     const std::filesystem::path profileRoot = GetPreyProfileRoot();
@@ -5081,6 +5160,20 @@ bool ResolveReadableSaveFile(const std::string& savePathOrName, std::string& out
 
     if (TryReadableSaveCandidate(saveRoot / savePathOrName, outPath))
         return true;
+
+    // Save/load hooks commonly expose only a rotating slot name such as
+    // "autosave1". That name exists in every campaign directory, so directory
+    // iteration order is not a valid selector. Ask Vanilla which campaign is
+    // active before considering compatibility fallbacks.
+    int campaignSlot = -1;
+    uint64_t campaignGuid = 0;
+    if (TryGetCurrentCampaignIdentity(campaignSlot, campaignGuid))
+    {
+        char campaignName[32] = {};
+        std::snprintf(campaignName, sizeof(campaignName), "Campaign%d", campaignSlot);
+        if (TryReadableSaveCandidate(saveRoot / campaignName / savePathOrName, outPath))
+            return true;
+    }
 
     std::error_code error;
     if (!std::filesystem::is_directory(saveRoot, error) || error)
@@ -7418,6 +7511,7 @@ static auto s_hookArkNpcPerformCombatReaction = ArkNpc::FPerformCombatReaction.M
 static auto s_hookArkNpcStartCowering = ArkNpc::FStartCowering.MakeHook();
 static auto s_hookArkNpcOnNewAttentionTarget = ArkNpc::FOnNewAttentionTarget.MakeHook();
 static auto s_hookArkNpcOnLostAttentionTarget = ArkNpc::FOnLostAttentionTarget.MakeHook();
+static auto s_hookArkNpcSetHasPerformedNoticeDialogue = ArkNpc::FSetHasPerformedNotice.MakeHook();
 static auto s_hookArkOperatorLaserInitialize = ArkOperatorLaserHelper::FInitializeLaserHelper.MakeHook();
 static auto s_hookArkOperatorLaserDestroy = ArkOperatorLaserHelper::FBitNotArkOperatorLaserHelper.MakeHook();
 static auto s_hookArkOperatorLaserStart = ArkOperatorLaserHelper::FStartChargingLaser.MakeHook();
@@ -7459,6 +7553,8 @@ static auto s_hookArkDoorOnClose = ArkDoor::FOnClose.MakeHook();
 static auto s_hookArkDoorOnLock = ArkDoor::FOnLock.MakeHook();
 static auto s_hookArkDoorOnPower = ArkDoor::FOnPower.MakeHook();
 static auto s_hookArkKioskOnButtonPress = ArkKiosk::FOnButtonPress.MakeHook();
+static auto s_hookArkGenericElevatorKioskOnButtonPress =
+    ArkGenericElevatorKiosk::FOnButtonPress.MakeHook();
 // ArkKiosk::OnButtonPress sends the entity script event before it activates
 // the script output below. FlowGraph listeners consume this first channel.
 static PreyFunction<bool(IEntity* const, const char* const)> s_funcArkEntityDispatchScriptOutputEvent(0x11AE4E0);
@@ -7474,6 +7570,7 @@ static auto s_hookArkKioskSetButtonVisible = ArkKiosk::FSetButtonVisible.MakeHoo
 static auto s_hookArkKioskSetKioskHeader = ArkKiosk::FSetKioskHeader.MakeHook();
 static auto s_hookArkKioskSetKioskBody = ArkKiosk::FSetKioskBody.MakeHook();
 static thread_local uint32_t s_arkKioskUiPressDepth = 0;
+static thread_local uint32_t s_arkGenericElevatorKioskUiPressDepth = 0;
 static thread_local uint32_t s_arkKioskDebugPressDepth = 0;
 static auto s_hookArkInteractiveMachineSetPowered = ArkInteractiveMachine::FSetPowered.MakeHook();
 static auto s_hookArkInteractiveScreenSetPowered = ArkInteractiveScreen::FSetPowered.MakeHook();
@@ -7532,7 +7629,10 @@ static auto s_hookArkObjectiveComponentDeactivateTask = ArkObjectiveComponent::F
 static auto s_hookArkObjectiveComponentCompleteTask = ArkObjectiveComponent::FCompleteTask.MakeHook();
 static auto s_hookArkObjectiveComponentFailTask = ArkObjectiveComponent::FFailTask.MakeHook();
 static auto s_hookArkObjectiveComponentSetObjectiveDescription = ArkObjectiveComponent::FSetObjectiveDescription.MakeHook();
+static auto s_hookArkSpeakerBaseTriggerRule = ArkSpeakerBase::FTriggerRule.MakeHook();
 static auto s_hookArkSpeakerBasePlayResponse = ArkSpeakerBase::FPlayResponse.MakeHook();
+static auto s_hookArkSpeakerBaseSetCharacter = ArkSpeakerBase::FSetCharacter.MakeHook();
+static auto s_hookArkSpeakerBaseSetEntity = ArkSpeakerBase::FSetEntity.MakeHook();
 static auto s_hookArkConversationOnComplete = ArkConversation::FOnComplete.MakeHook();
 static auto s_hookArkResponseManagerSetConversationStatus = ArkResponseManager::FSetConversationStatus.MakeHook();
 static auto s_hookArkGlobalFactsOnGameTokenEvent = ArkGlobalFacts::FOnGameTokenEvent.MakeHook();
@@ -7774,7 +7874,30 @@ static auto s_hookArkNpcPerformUnanimatedAbilitySemantic = ArkNpc::FPerformUnani
 static auto s_hookArkNpcPerformHitReactShiftSemantic = ArkNpc::FPerformHitReactShift.MakeHook();
 static auto s_hookArkNpcBeginAnimatedDistractionSemantic = ArkNpc::FBeginAnimatedDistraction.MakeHook();
 static auto s_hookArkNpcPerformPatrolIdleSemantic = ArkNpc::FPerformPatrolIdle.MakeHook();
-static auto s_hookArkNpcAbilityPerformSemantic = ArkNpcAbility::FPerform.MakeHook();
+//static auto s_hookArkNpcAbilityPerformSemantic = ArkNpcAbility::FPerform.MakeHook();
+// The RVA is currently exposed by the generated SDK as ArkNpcAbility::FPerform,
+// but native Windows proves that some calls through this address return a
+// full-width RAX value. Preserve all 64 bits at the detour boundary.
+using ArkNpcAbilityPerformPreserveRaxFn = std::uintptr_t(
+    std::uintptr_t, // ability / native arg 0
+    std::uintptr_t, // npc / native arg 1
+    std::uintptr_t, // contextId / native arg 2
+    std::uintptr_t, // params / native arg 3
+    std::uintptr_t  // abilityInstance / native arg 4
+);
+
+static constexpr std::uintptr_t kArkNpcAbilityPerformRva = 0x1143E80;
+
+static PreyFunction<ArkNpcAbilityPerformPreserveRaxFn>
+    s_funcArkNpcAbilityPerformSemanticPreserveRax(
+        kArkNpcAbilityPerformRva);
+
+static auto s_hookArkNpcAbilityPerformSemantic =
+    s_funcArkNpcAbilityPerformSemanticPreserveRax.MakeHook();
+
+static_assert(sizeof(std::uintptr_t) == 8);
+static_assert(sizeof(EArkNpcAbilityPerformanceResult) == 4);
+
 static auto s_hookArkNpcStartGlooEffects = ArkNpc::FStartGlooEffects.MakeHook();
 static auto s_hookArkNpcStopGlooEffects = ArkNpc::FStopGlooEffects.MakeHook();
 static auto s_hookArkNpcOnGlooFrozen = ArkNpc::FOnGlooFrozen.MakeHook();
@@ -14632,7 +14755,23 @@ static IEntity* ArkNpcSpawnManager_CreateNpcCorpse1_SpawnTrace_Hook(
     }
     return entity;
 }
+bool ModMain::ShouldSuppressNativeSpawnInstrumentation() const noexcept
+{
+    return
+        m_saveLoadGuardActive ||
+        m_waitingForPostLoadContinue ||
+        m_pendingPostLoadResync ||
+        m_arkLevelTransitionLoadActive ||
+        m_runtimeTransitionCleanupPrepared ||
+        IsPostLoadNativeQuarantineActive();
+}
 
+bool ModMain::ShouldTraceNativeNpcSpawn() const
+{
+    return
+        m_nativeNpcSpawnTraceEnabled ||
+        EnvFlagEnabled("COOP_TRACE_NATIVE_NPC_SPAWN");
+}
 static IEntity* ArkNpcSpawnManager_CreateNpcCorpse0_SpawnTrace_Hook(
     IEntityArchetype& archetype,
     Vec3 const& position,
@@ -14641,20 +14780,51 @@ static IEntity* ArkNpcSpawnManager_CreateNpcCorpse0_SpawnTrace_Hook(
     bool rigorMortis,
     unsigned fromStartGameEntityId)
 {
-    IEntity* entity = s_hookArkNpcSpawnManagerCreateNpcCorpse0.InvokeOrig(
-        archetype,
-        position,
-        rotation,
-        poseAnimationName,
-        rigorMortis,
-        fromStartGameEntityId);
-    if (gMod)
+    // Zustand vor InvokeOrig merken. Der Originalcall kann reentrant
+    // Load-/Transition-Zustände verändern.
+    const bool suppressInstrumentationBefore =
+        !gMod ||
+        gMod->ShouldSuppressNativeSpawnInstrumentation();
+
+    // Der originale Engine-Call bleibt notwendig.
+    IEntity* entity =
+        s_hookArkNpcSpawnManagerCreateNpcCorpse0.InvokeOrig(
+            archetype,
+            position,
+            rotation,
+            poseAnimationName,
+            rigorMortis,
+            fromStartGameEntityId);
+
+    // Sowohl Eintrittszustand als auch Zustand nach InvokeOrig prüfen.
+    if (suppressInstrumentationBefore ||
+        !gMod ||
+        gMod->ShouldSuppressNativeSpawnInstrumentation() ||
+        !gMod->ShouldTraceNativeNpcSpawn())
     {
-        std::string detail = BuildNativeNpcSpawnDetail("CreateNpcCorpse/pose", archetype, position, fromStartGameEntityId);
-        detail += " pose=" + StatusToken(ReadRuntimeCString(poseAnimationName, 64));
-        detail += " rigor=" + std::to_string(rigorMortis ? 1 : 0);
-        gMod->RecordNativeNpcSpawnTrace("ArkNpcSpawnManager::CreateNpcCorpse pose after", entity, detail.c_str());
+        return entity;
     }
+
+    std::string detail =
+        BuildNativeNpcSpawnDetail(
+            "CreateNpcCorpse/pose",
+            archetype,
+            position,
+            fromStartGameEntityId);
+
+    detail +=
+        " pose=" +
+        StatusToken(ReadRuntimeCString(poseAnimationName, 64));
+
+    detail +=
+        " rigor=" +
+        std::to_string(rigorMortis ? 1 : 0);
+
+    gMod->RecordNativeNpcSpawnTrace(
+        "ArkNpcSpawnManager::CreateNpcCorpse pose after",
+        entity,
+        detail.c_str());
+
     return entity;
 }
 
@@ -15653,81 +15823,262 @@ static bool ArkNpc_PerformPatrolIdle_SemanticTrace_Hook(
     return result;
 }
 
-static EArkNpcAbilityPerformanceResult ArkNpcAbility_Perform_SemanticTrace_Hook(
-    const ArkNpcAbility* ability,
-    ArkNpc& npc,
-    uint64_t contextId,
-    const ArkNpcAbilityParams& params,
-    ArkNpcAbilityInstance& abilityInstance)
+static std::uintptr_t ArkNpcAbility_Perform_SemanticTrace_Hook(
+    std::uintptr_t abilityRaw,
+    std::uintptr_t npcRaw,
+    std::uintptr_t contextIdRaw,
+    std::uintptr_t paramsRaw,
+    std::uintptr_t abilityInstanceRaw)
 {
-    (void)params;
-    (void)abilityInstance;
-    const uintptr_t abilityPtr = reinterpret_cast<uintptr_t>(ability);
-    ArkNpc* npcPtr = &npc;
+    // This is the only path that calls the trampoline. Its return type remains
+    // uintptr_t throughout, so the complete native RAX value is preserved.
+    const auto invokeOriginal = [&]() -> std::uintptr_t
+    {
+        return s_hookArkNpcAbilityPerformSemantic.InvokeOrig(
+            abilityRaw,
+            npcRaw,
+            contextIdRaw,
+            paramsRaw,
+            abilityInstanceRaw);
+    };
+
+    // During load/restore, perform no object inspection, no entity lookup,
+    // no tracing and no authority decision. Remain a transparent ABI bridge.
+    if (!gMod || gMod->ShouldBypassArkNpcAbilityPerformHook())
+        return invokeOriginal();
+
+    const auto* ability =
+        reinterpret_cast<const ArkNpcAbility*>(abilityRaw);
+
+    auto* npc =
+        reinterpret_cast<ArkNpc*>(npcRaw);
+
+    const auto* params =
+        reinterpret_cast<const ArkNpcAbilityParams*>(paramsRaw);
+
+    auto* abilityInstance =
+        reinterpret_cast<ArkNpcAbilityInstance*>(abilityInstanceRaw);
+
+    const std::uint64_t contextId =
+        static_cast<std::uint64_t>(contextIdRaw);
+
+    // An aliased or incorrectly identified call through this RVA may have a
+    // completely different argument shape. Never interpret it as Perform
+    // unless every required argument has a credible runtime representation.
+    const bool plausiblePerformCall =
+        ability != nullptr &&
+        npc != nullptr &&
+        params != nullptr &&
+        abilityInstance != nullptr &&
+        IsLikelyRuntimeCppObject(
+            ability,
+            sizeof(void*)) &&
+        IsLikelyRuntimeCppObject(
+            npc,
+            sizeof(void*) * 4) &&
+        IsReadableRuntimePointer(
+            params,
+            sizeof(void*)) &&
+        IsReadableRuntimePointer(
+            abilityInstance,
+            sizeof(void*));
+
+    if (!plausiblePerformCall)
+        return invokeOriginal();
+
     EntityId npcEntityId = INVALID_ENTITYID;
-    std::string guardReason;
+    IEntity* npcEntity = nullptr;
+    ArkNpc* npcFromEntity = nullptr;
+
     const bool npcResolved =
-        ability &&
-        CoopRuntimeGuards::IsLikelyRuntimeCppObject(npcPtr, sizeof(void*) * 4) &&
-        TryGuardedCall("npc ability perform GetEntityId", [npcPtr]() { return npcPtr->GetEntityId(); }, npcEntityId, &guardReason) &&
+        TryGuardedCall(
+            "npc ability perform GetEntityId",
+            [npc]()
+            {
+                return npc->GetEntityId();
+            },
+            npcEntityId,
+            nullptr) &&
         npcEntityId != INVALID_ENTITYID &&
         npcEntityId != 0 &&
-        gEnv &&
-        gEnv->pEntitySystem &&
-        gEnv->pEntitySystem->GetEntity(npcEntityId) != nullptr;
+        gEnv != nullptr &&
+        gEnv->pEntitySystem != nullptr &&
+        TryGuardedCall(
+            "npc ability perform entity lookup",
+            [npcEntityId]() -> IEntity*
+            {
+                return gEnv && gEnv->pEntitySystem
+                    ? gEnv->pEntitySystem->GetEntity(npcEntityId)
+                    : nullptr;
+            },
+            npcEntity,
+            nullptr) &&
+        npcEntity != nullptr &&
+        TryGuardedCall(
+            "npc ability perform verify ArkNpc",
+            [npcEntity]() -> ArkNpc*
+            {
+                return EntityUtils::GetArkNpc(npcEntity);
+            },
+            npcFromEntity,
+            nullptr) &&
+        npcFromEntity == npc;
 
-    if (gMod && npcResolved && ShouldConsumeLocalAuthorityAbility(npcPtr, contextId))
+    // If this call does not resolve back to the exact ArkNpc passed in RDX,
+    // treat it as another ABI user of the same RVA and preserve it unchanged.
+    if (!npcResolved ||
+        gMod->ShouldBypassArkNpcAbilityPerformHook())
     {
-        // ArkNpcAbilityManager has already run the native CanBePerformed
-        // prerequisites by the time it reaches this virtual Perform boundary.
-        // Report completion so Vanilla records its normal context cooldown,
-        // but do not create a second body/root action on the observer. The exact
-        // authority action is mirrored independently through the native action lane.
-        gMod->RecordNpcSemanticTrace(
-            "ArkNpcAbility::Perform:consumed-authority-body",
-            npcPtr,
-            contextId,
-            npcEntityId,
-            static_cast<uint32_t>(EArkNpcAbilityPerformanceResult::completed),
-            "native prerequisites passed; local authority-owned action completed as no-op; authority presentation retained");
-        return EArkNpcAbilityPerformanceResult::completed;
+        return invokeOriginal();
     }
 
-    if (gMod && npcResolved && gMod->ShouldBlockRemoteDrivenEnemyIntent(
-            npcPtr,
-            "ArkNpcAbility::Perform",
-            contextId,
-            npcEntityId,
-            CoopProtocol::kEnemyLocomotionFlagAttacking))
+    constexpr std::uintptr_t kResultFailed =
+        static_cast<std::uintptr_t>(
+            EArkNpcAbilityPerformanceResult::failed);
+
+    constexpr std::uintptr_t kResultCompleted =
+        static_cast<std::uintptr_t>(
+            EArkNpcAbilityPerformanceResult::completed);
+
+    constexpr std::uintptr_t kResultInProgress =
+        static_cast<std::uintptr_t>(
+            EArkNpcAbilityPerformanceResult::inProgress);
+
+    bool consumeAuthorityBody = false;
+    bool blockIntent = false;
+
+    try
     {
-        return EArkNpcAbilityPerformanceResult::failed;
+        consumeAuthorityBody =
+            ShouldConsumeLocalAuthorityAbility(
+                npc,
+                contextId);
+
+        if (!consumeAuthorityBody)
+        {
+            blockIntent =
+                gMod->ShouldBlockRemoteDrivenEnemyIntent(
+                    npc,
+                    "ArkNpcAbility::Perform",
+                    contextId,
+                    npcEntityId,
+                    CoopProtocol::kEnemyLocomotionFlagAttacking);
+        }
+    }
+    catch (...)
+    {
+        // No C++ exception may escape through a native engine boundary.
+        return invokeOriginal();
     }
 
-    if (gMod && npcResolved)
+    if (consumeAuthorityBody)
     {
-        const std::string chain = CaptureMannequinCallChainTrace("ArkNpcAbility::Perform");
+        try
+        {
+            gMod->RecordNpcSemanticTrace(
+                "ArkNpcAbility::Perform:consumed-authority-body",
+                npc,
+                contextId,
+                npcEntityId,
+                static_cast<std::uint32_t>(
+                    EArkNpcAbilityPerformanceResult::completed),
+                "native prerequisites passed; local authority-owned action "
+                "completed as no-op; authority presentation retained");
+        }
+        catch (...)
+        {
+            // Tracing must never affect native behavior.
+        }
+
+        // Returned as a full-width uintptr_t. Numerically this is still the
+        // expected enum value 1 for genuine Perform callers.
+        return kResultCompleted;
+    }
+
+    if (blockIntent)
+    {
+        // Full-width return, numerically the expected enum value 0.
+        return kResultFailed;
+    }
+
+    try
+    {
+        const std::string chain =
+            CaptureMannequinCallChainTrace(
+                "ArkNpcAbility::Perform");
+
         std::ostringstream detail;
-        detail << "abilityPtr=0x" << std::hex << abilityPtr << std::dec << chain;
+        detail
+            << "abilityPtr=0x"
+            << std::hex
+            << abilityRaw
+            << std::dec
+            << chain;
+
         const std::string detailString = detail.str();
-        gMod->RecordNpcSemanticTrace("ArkNpcAbility::Perform:before", npcPtr, contextId, npcEntityId, 0, detailString.c_str());
-    }
-    const EArkNpcAbilityPerformanceResult result =
-        s_hookArkNpcAbilityPerformSemantic.InvokeOrig(ability, npc, contextId, params, abilityInstance);
-    if (gMod && npcResolved)
-    {
-        std::ostringstream detail;
-        detail << "abilityPtr=0x" << std::hex << abilityPtr << std::dec
-            << " result=" << static_cast<int>(result);
-        const std::string detailString = detail.str();
+
         gMod->RecordNpcSemanticTrace(
-            "ArkNpcAbility::Perform:after",
-            npcPtr,
+            "ArkNpcAbility::Perform:before",
+            npc,
             contextId,
             npcEntityId,
-            static_cast<uint32_t>(result),
+            0,
             detailString.c_str());
     }
-    return result;
+    catch (...)
+    {
+        // Continue into Vanilla even if diagnostic allocation fails.
+    }
+
+    // Never assign this directly to EArkNpcAbilityPerformanceResult.
+    const std::uintptr_t rawResult =
+        invokeOriginal();
+
+    // The load/transition state may have changed inside the native call.
+    if (!gMod ||
+        gMod->ShouldBypassArkNpcAbilityPerformHook())
+    {
+        return rawResult;
+    }
+
+    // Only interpret the value as an enum after proving it is in the enum
+    // domain. Anything else may be a pointer or another aliased return value.
+    if (rawResult <= kResultInProgress)
+    {
+        const auto resultForTrace =
+            static_cast<EArkNpcAbilityPerformanceResult>(
+                static_cast<std::uint32_t>(rawResult));
+
+        try
+        {
+            std::ostringstream detail;
+            detail
+                << "abilityPtr=0x"
+                << std::hex
+                << abilityRaw
+                << std::dec
+                << " result="
+                << static_cast<int>(resultForTrace);
+
+            const std::string detailString = detail.str();
+
+            gMod->RecordNpcSemanticTrace(
+                "ArkNpcAbility::Perform:after",
+                npc,
+                contextId,
+                npcEntityId,
+                static_cast<std::uint32_t>(resultForTrace),
+                detailString.c_str());
+        }
+        catch (...)
+        {
+            // Preserve the native result even if tracing fails.
+        }
+    }
+
+    // Crucially, return the original full-width RAX value. Do not return the
+    // enum-shaped resultForTrace.
+    return rawResult;
 }
 
 void ModMain::RegisterOperatorLaserHelperForHook(
@@ -18908,6 +19259,87 @@ static void ArkNpc_OnLostAttentionTarget_Hook(
     }
 }
 
+static void ArkNpc_SetHasPerformedNotice_DialogueSync_Hook(
+    ArkNpc* npc,
+    bool value)
+{
+    bool before = false;
+    bool after = value;
+    IEntity* entity = nullptr;
+    EntityGUID guid = 0;
+
+    if (npc)
+    {
+        TryGuardedCall(
+            "dialogue notice before",
+            [npc]()
+            {
+                return npc->HasPerformedNotice();
+            },
+            before,
+            nullptr);
+
+        TryGuardedCall(
+            "dialogue notice entity",
+            [npc]() -> IEntity*
+            {
+                return npc->GetEntity();
+            },
+            entity,
+            nullptr);
+
+        if (entity)
+        {
+            TryGuardedCall(
+                "dialogue notice guid",
+                [entity]()
+                {
+                    return entity->GetGuid();
+                },
+                guid,
+                nullptr);
+        }
+    }
+
+    s_hookArkNpcSetHasPerformedNoticeDialogue.InvokeOrig(
+        npc,
+        value);
+
+    if (npc)
+    {
+        TryGuardedCall(
+            "dialogue notice after",
+            [npc]()
+            {
+                return npc->HasPerformedNotice();
+            },
+            after,
+            nullptr);
+    }
+
+    if (guid != 0 && before != after)
+    {
+        LogCoop(
+            "npc dialogue notice guid=" +
+            std::to_string(static_cast<uint64_t>(guid)) +
+            " entity=" +
+            std::to_string(entity ? entity->GetId() : 0) +
+            " before=" +
+            std::to_string(before ? 1 : 0) +
+            " after=" +
+            std::to_string(after ? 1 : 0));
+    }
+
+    if (gMod && guid != 0 && before != after)
+    {
+        gMod->OnLocalNpcPerformedNoticeChanged(
+            npc,
+            static_cast<uint64_t>(guid),
+            after,
+            "ArkNpc::SetHasPerformedNotice");
+    }
+}
+
 static void ArkPlayer_TakeDamage_Hook(ArkPlayer* player, float damage)
 {
     if (gMod && player)
@@ -19957,6 +20389,23 @@ static void ArkKiosk_OnButtonPress_Hook(
         --s_arkKioskUiPressDepth;
 }
 
+static void ArkGenericElevatorKiosk_OnButtonPress_Hook(
+    ArkGenericElevatorKiosk* kiosk,
+    IUIElement* sender,
+    const SUIEventDesc& event,
+    const SUIArguments& args)
+{
+    // Generic elevator kiosks use the same Button*Pressed output names for
+    // their real UI input and for later authored callbacks. Mark only the
+    // native UI callback as the network-owned interaction source; later
+    // outputs continue locally but are not routed as fresh player presses.
+    ++s_arkGenericElevatorKioskUiPressDepth;
+    s_hookArkGenericElevatorKioskOnButtonPress.InvokeOrig(
+        kiosk, sender, event, args);
+    if (s_arkGenericElevatorKioskUiPressDepth > 0)
+        --s_arkGenericElevatorKioskUiPressDepth;
+}
+
 static int ArkKioskButtonFromPressedOutput(const char* output)
 {
     if (!output)
@@ -19993,13 +20442,27 @@ static bool ArkEntity_DispatchScriptOutputEvent_Hook(
     ArkKiosk* kiosk = GetArkKioskExtensionFromEntity(entity);
     ArkGenericElevatorKiosk* elevatorKiosk =
         GetArkGenericElevatorKioskExtensionFromEntity(entity);
+    const bool localNativeFanoutKiosk = elevatorKiosk &&
+        IsNativeFanoutGenericElevatorKiosk(entity->GetGuid(), entity->GetGuid());
+    const bool ownedGenericElevatorInput =
+        !elevatorKiosk ||
+        s_arkGenericElevatorKioskUiPressDepth > 0 ||
+        s_arkKioskDebugPressDepth > 0;
+    if (elevatorKiosk && !ownedGenericElevatorInput)
+    {
+        // This is an authored follow-up output, not a new player press. Keep
+        // the local Vanilla graph running, but do not route it as another
+        // AreaAuthority input.
+        return s_hookArkEntityDispatchScriptOutputEvent.InvokeOrig(
+            entity, output);
+    }
     if (kiosk && s_arkKioskUiPressDepth == 0 &&
         s_arkKioskDebugPressDepth == 0 &&
         gMod->ShouldSuppressUnownedKioskOutputForHook())
     {
         return true;
     }
-    if ((kiosk || elevatorKiosk) &&
+    if ((kiosk || elevatorKiosk) && !localNativeFanoutKiosk &&
         gMod->ShouldRouteLocalKioskPressToAreaAuthorityForHook(
             kiosk, elevatorKiosk))
     {
@@ -20017,6 +20480,23 @@ static bool ArkEntity_ActivateScriptOutput_Hook(
     IScriptTable* scriptTable,
     const char* output)
 {
+    // The Simulation Labs helicopter sequence stages Actor:LocalPlayer. A
+    // remote proxy cannot be carried by the origin's cinematic, so replay this
+    // exact authored use output once and let every process stage its own real
+    // player in its own Vanilla sequence.
+    const bool helicopterPassengerStart =
+        gMod && entity && output &&
+        std::strcmp(output, "Activated") == 0 &&
+        entity->GetGuid() == kCoopSimulationLabsHelicopterUsePromptGuid;
+    if (helicopterPassengerStart)
+    {
+        const bool result = s_hookArkEntityActivateScriptOutput.InvokeOrig(
+            entity, scriptTable, output);
+        gMod->OnLocalHelicopterPassengerStartForHook(
+            "Simulation Labs helicopter use output");
+        return result;
+    }
+
     const int button = ArkKioskButtonFromPressedOutput(output);
     if (!gMod || !entity || button < 0)
     {
@@ -20027,6 +20507,19 @@ static bool ArkEntity_ActivateScriptOutput_Hook(
     ArkKiosk* kiosk = GetArkKioskExtensionFromEntity(entity);
     ArkGenericElevatorKiosk* elevatorKiosk =
         GetArkGenericElevatorKioskExtensionFromEntity(entity);
+    const bool localNativeFanoutKiosk = elevatorKiosk &&
+        IsNativeFanoutGenericElevatorKiosk(entity->GetGuid(), entity->GetGuid());
+    const bool ownedGenericElevatorInput =
+        !elevatorKiosk ||
+        s_arkGenericElevatorKioskUiPressDepth > 0 ||
+        s_arkKioskDebugPressDepth > 0;
+    if (elevatorKiosk && !ownedGenericElevatorInput)
+    {
+        // Continue the already-started local authored graph, but do not emit a
+        // second network command for its internal Button*Pressed callbacks.
+        return s_hookArkEntityActivateScriptOutput.InvokeOrig(
+            entity, scriptTable, output);
+    }
     if (kiosk && s_arkKioskUiPressDepth == 0 &&
         s_arkKioskDebugPressDepth == 0 &&
         gMod->ShouldSuppressUnownedKioskOutputForHook())
@@ -20034,7 +20527,7 @@ static bool ArkEntity_ActivateScriptOutput_Hook(
         gMod->RecordSuppressedUnownedKioskOutputForHook(kiosk, button);
         return true;
     }
-    if ((kiosk || elevatorKiosk) &&
+    if ((kiosk || elevatorKiosk) && !localNativeFanoutKiosk &&
         gMod->ShouldRouteLocalKioskPressToAreaAuthorityForHook(
             kiosk, elevatorKiosk))
     {
@@ -20065,7 +20558,9 @@ static bool ArkEntity_ActivateScriptOutput_Hook(
         gMod->OnLocalAreaObjectGenericElevatorKioskButtonPressed(
             elevatorKiosk,
             button,
-            "ArkGenericElevatorKiosk::OnButtonPress output");
+            localNativeFanoutKiosk
+                ? "ArkGenericElevatorKiosk::OnButtonPress local native fanout output"
+                : "ArkGenericElevatorKiosk::OnButtonPress output");
     }
     return result;
 }
@@ -21474,6 +21969,99 @@ static uint16_t BuildStoryResponseUsageFlags(const ArkResponseRule* rule, const 
     return flags;
 }
 
+static bool TryApplyStoryResponseWriteback(
+    ArkSpeakerBase* speaker,
+    const ArkResponseRule* rule,
+    float currentTime,
+    uint32_t& appliedFacts,
+    std::string* reason)
+{
+    appliedFacts = 0;
+    if (!speaker ||
+        !rule ||
+        !IsLikelyRuntimeCppObject(speaker, sizeof(void*) * 4) ||
+        !IsReadableRuntimePointer(rule, sizeof(ArkResponseRule)))
+    {
+        if (reason)
+            *reason = "invalid_response_writeback_target";
+        return false;
+    }
+
+    return TryGuardedVoidCall(
+        "story apply response speaker writeback",
+        [speaker, rule, currentTime, &appliedFacts]()
+        {
+            for (const ArkWritebackFact& writeback : rule->m_writeback)
+            {
+                if (writeback.m_id == 0)
+                    continue;
+
+                auto memoryIt = std::lower_bound(
+                    speaker->m_memory.begin(),
+                    speaker->m_memory.end(),
+                    writeback.m_id,
+                    [](const ArkResponseFact& fact, uint64_t id)
+                    {
+                        return fact.key < id;
+                    });
+
+                const int operation = static_cast<int>(writeback.m_type);
+                if (memoryIt != speaker->m_memory.end() &&
+                    memoryIt->key == writeback.m_id)
+                {
+                    if (operation == 0)
+                    {
+                        memoryIt->value = writeback.m_value;
+                    }
+                    else if (operation == 1)
+                    {
+                        memoryIt->value.num.fp += writeback.m_value.num.fp;
+                    }
+                    else if (operation == 2)
+                    {
+                        memoryIt->value.num.fp -= writeback.m_value.num.fp;
+                    }
+                }
+                else
+                {
+                    ArkResponseFact fact = {};
+                    fact.key = writeback.m_id;
+                    fact.value = writeback.m_value;
+                    if (operation == 2)
+                        fact.value.num.fp = -fact.value.num.fp;
+                    speaker->m_memory.insert(memoryIt, std::move(fact));
+                }
+
+                if (writeback.m_timeout > 0.0f)
+                {
+                    const float expiresAt = currentTime + writeback.m_timeout;
+                    for (auto timeoutIt = speaker->m_timeouts.begin();
+                         timeoutIt != speaker->m_timeouts.end();)
+                    {
+                        if (timeoutIt->first == writeback.m_id)
+                            timeoutIt = speaker->m_timeouts.erase(timeoutIt);
+                        else
+                            ++timeoutIt;
+                    }
+
+                    auto insertAt = speaker->m_timeouts.begin();
+                    while (insertAt != speaker->m_timeouts.end() &&
+                        insertAt->second <= expiresAt)
+                    {
+                        ++insertAt;
+                    }
+                    speaker->m_timeouts.emplace(
+                        insertAt,
+                        writeback.m_id,
+                        expiresAt);
+                }
+
+                ++appliedFacts;
+            }
+        },
+        reason);
+}
+
 static bool IsStoryConditionEventKind(uint16_t eventKind)
 {
     return eventKind == CoopProtocol::kStoryEventConditionExecuted ||
@@ -21731,6 +22319,14 @@ static constexpr StoryRemoteEventWhitelistEntry kStoryRemoteEventWhitelist[] = {
     { 12889009725016286236ull, "PlayerUsedMedicalStation" },
     { 844024417286454381ull, "CoralNodeScanned" },
     { 3149325216938423078ull, "FirstAbilityInstalled" },
+    // Simulation Labs keeps this event level-local rather than in the global
+    // RemoteEvent library. It retires live Patricia after the apartment
+    // sequence and spawns the authored corpse variant.
+    { 12889009725009012008ull, "" },
+    // Simulation Labs' Shy Mimic is also driven by a level-local event. The
+    // event spawns it, stores the process-local entity token, and initializes
+    // its authored mimicry sequence. Every peer must execute that same graph.
+    { 12889009725050222101ull, "" },
     // Campaign branch commits. Presentation-only TrackViews remain local.
     { 13680621263370127148ull, "RE_StationSelfDestructStarted" },
     { 844024417287297631ull, "g_SelfDestructInitiated" },
@@ -21854,6 +22450,81 @@ static bool ActivateRegisteredMainLiftOutageRemoteEvent(std::string& reason)
 
     reason = "registered_main_lift_remote_event_not_found";
     return false;
+}
+
+static bool ActivateRegisteredStoryRemoteEventById(
+    uint64_t eventId,
+    std::string& reason)
+{
+    CArkFlowGraphManager* manager = GetStoryFlowGraphManagerForCoop();
+    IFlowSystem* flowSystem =
+        gEnv && gEnv->pSystem ? gEnv->pSystem->GetIFlowSystem() : nullptr;
+    if (!manager || !flowSystem)
+    {
+        reason = manager ? "missing_flow_system" : "missing_flow_graph_manager";
+        return false;
+    }
+
+    uint32_t activatedCount = 0;
+    for (const CArkFlowGraphManager::ConsoleEvent& registered : manager->m_remoteEvents)
+    {
+        IFlowGraph* graph = nullptr;
+        uint64_t registeredEventId = 0;
+        std::string guardReason;
+        bool resolved = false;
+        const bool matched = TryGuardedCall(
+            "story resolve registered RemoteEvent",
+            [flowSystem, &registered, &graph, &registeredEventId]()
+            {
+                graph = flowSystem->GetGraphById(registered.m_graphID);
+                if (!graph)
+                    return false;
+                const char* nodeType =
+                    graph->GetNodeTypeName(registered.m_nodeID);
+                if (!nodeType ||
+                    std::strcmp(nodeType, "Ark:RemoteEvent") != 0)
+                {
+                    return false;
+                }
+
+                const TFlowInputData* eventInput =
+                    graph->GetInputValue(registered.m_nodeID, 0);
+                string serializedEventId;
+                return eventInput &&
+                    eventInput->GetValueWithConversion(serializedEventId) &&
+                    TryParseUint64(
+                        serializedEventId.c_str(),
+                        registeredEventId);
+            },
+            resolved,
+            &guardReason) &&
+            resolved && registeredEventId == eventId;
+        if (!matched)
+            continue;
+
+        const bool activated = TryGuardedVoidCall(
+            "story activate registered RemoteEvent output",
+            [graph, &registered]()
+            {
+                graph->ActivatePort(
+                    SFlowAddress(registered.m_nodeID, 0, true),
+                    SFlowSystemVoid());
+            },
+            &guardReason);
+        if (!activated)
+        {
+            reason = guardReason.empty()
+                ? "remote_event_output_activation_failed"
+                : guardReason;
+            return false;
+        }
+        ++activatedCount;
+    }
+
+    reason = activatedCount != 0
+        ? "activated_nodes_" + std::to_string(activatedCount)
+        : "registered_story_remote_event_not_found";
+    return activatedCount != 0;
 }
 
 static bool IsWhitelistedStoryGlobalBoolTokenId(int tokenId)
@@ -22414,27 +23085,319 @@ static void ArkResponseManager_SetConversationStatus_Hook(
             before != after,
             "ArkResponseManager::SetConversationStatus");
 }
+void ModMain::BindDialogueRuntimeId(
+    uint64_t runtimeId,
+    uint64_t storyId)
+{
+    if (runtimeId != 0 && storyId != 0)
+        m_dialogueStoryIdByRuntimeId[runtimeId] = storyId;
+}
+
+uint64_t ModMain::ResolveDialogueStoryId(
+    uint64_t runtimeId) const
+{
+    const auto it =
+        m_dialogueStoryIdByRuntimeId.find(runtimeId);
+
+    if (it != m_dialogueStoryIdByRuntimeId.end() && it->second != 0)
+    {
+        return it->second;
+    }
+
+    if (m_dialogueLeaseDialogueId != 0)
+    {
+        return m_dialogueLeaseDialogueId;
+    }
+
+    if (m_dialogueLeasePendingId != 0)
+    {
+        return m_dialogueLeasePendingId;
+    }
+
+    if (m_lastActiveStoryConversationId != 0)
+    {
+        return m_lastActiveStoryConversationId;
+    }
+
+    return runtimeId;
+}
+
+bool ModMain::IsRemoteDialogueRuntimeId(
+    uint64_t runtimeId) const
+{
+    return runtimeId != 0 &&
+        m_remoteDialogueRuntimeIds.find(runtimeId) !=
+            m_remoteDialogueRuntimeIds.end();
+}
+
+void ModMain::ForgetDialogueRuntimeId(uint64_t runtimeId)
+{
+    uint64_t storyId = 0;
+    const auto mapping =
+        m_dialogueStoryIdByRuntimeId.find(runtimeId);
+    if (mapping != m_dialogueStoryIdByRuntimeId.end())
+        storyId = mapping->second;
+
+    const bool wasRemote =
+        m_remoteDialogueRuntimeIds.erase(runtimeId) != 0;
+    m_dialogueStoryIdByRuntimeId.erase(runtimeId);
+
+    if (!wasRemote || storyId == 0)
+    {
+        // A one-shot replay can complete synchronously before
+        // ReplayGrantedDialogue has registered its runtime id.
+        if (runtimeId != 0 && IsReplayingRemoteDialogue())
+        {
+            m_remoteDialogueCompletedDuringReplayIds.insert(
+                runtimeId);
+        }
+        return;
+    }
+
+    bool storyStillRemote = false;
+    for (const uint64_t remoteRuntimeId :
+         m_remoteDialogueRuntimeIds)
+    {
+        const auto remoteMapping =
+            m_dialogueStoryIdByRuntimeId.find(
+                remoteRuntimeId);
+        if (remoteMapping !=
+                m_dialogueStoryIdByRuntimeId.end() &&
+            remoteMapping->second == storyId)
+        {
+            storyStillRemote = true;
+            break;
+        }
+    }
+
+    if (!storyStillRemote)
+        m_remoteDialogueStoryIds.erase(storyId);
+}
+
+static void ArkSpeakerBase_SetCharacter_CoopHook(
+    ArkSpeakerBase* speaker,
+    const ArkCharacter* character,
+    uint64_t voiceOverride)
+{
+    s_hookArkSpeakerBaseSetCharacter.InvokeOrig(
+        speaker,
+        character,
+        voiceOverride);
+    if (gMod)
+    {
+        gMod->RememberDialogueSpeakerForHook(
+            speaker,
+            "ArkSpeakerBase::SetCharacter");
+    }
+}
+
+static void ArkSpeakerBase_SetEntity_CoopHook(
+    ArkSpeakerBase* speaker,
+    IEntity* entity)
+{
+    s_hookArkSpeakerBaseSetEntity.InvokeOrig(
+        speaker,
+        entity);
+    if (gMod)
+    {
+        gMod->RememberDialogueSpeakerForHook(
+            speaker,
+            "ArkSpeakerBase::SetEntity");
+    }
+}
+
+static ArkConversation*
+ArkSpeakerBase_TriggerRule_CoopHook(
+    ArkSpeakerBase* speaker,
+    uint64_t ruleId,
+    bool ignoreVoiceRequirement,
+    const char* concept,
+    ArkResponseQuery* query,
+    int paChannel,
+    bool isLiveAudio,
+    int priority)
+{
+    bool remoteContinuation = false;
+
+    if (gMod && speaker)
+    {
+        gMod->RememberDialogueSpeakerForHook(
+            speaker,
+            "ArkSpeakerBase::TriggerRule");
+
+        ArkConversation* currentConversation = nullptr;
+        uint64_t currentRuntimeId = 0;
+
+        if (TryGuardedCall(
+                "dialogue TriggerRule current conversation",
+                [speaker]()
+                {
+                    return speaker->m_pCurrentConversation;
+                },
+                currentConversation,
+                nullptr) &&
+            currentConversation)
+        {
+            TryGuardedCall(
+                "dialogue TriggerRule current runtime id",
+                [currentConversation]()
+                {
+                    return currentConversation->m_conversationId;
+                },
+                currentRuntimeId,
+                nullptr);
+        }
+
+        remoteContinuation =
+            gMod->IsReplayingRemoteDialogue() ||
+            gMod->IsRemoteDialogueRuntimeId(
+                currentRuntimeId);
+
+        if (currentConversation &&
+            gMod->IsRemoteDialogueRuntimeId(
+                currentRuntimeId) &&
+            gMod->ShouldSuppressRemoteDialogueRetrigger(
+                ruleId))
+        {
+            return currentConversation;
+        }
+    }
+
+    ArkConversation* conversation =
+        s_hookArkSpeakerBaseTriggerRule.InvokeOrig(
+            speaker,
+            ruleId,
+            ignoreVoiceRequirement,
+            concept,
+            query,
+            paChannel,
+            isLiveAudio,
+            priority);
+
+    uint64_t resultRuntimeId = 0;
+
+    if (conversation)
+    {
+        TryGuardedCall(
+            "dialogue TriggerRule result runtime id",
+            [conversation]()
+            {
+                return conversation->m_conversationId;
+            },
+            resultRuntimeId,
+            nullptr);
+    }
+
+    ArkConversation* currentConversationAfter = nullptr;
+
+    if (speaker)
+    {
+        TryGuardedCall(
+            "dialogue TriggerRule current conversation after",
+            [speaker]()
+            {
+                return speaker->m_pCurrentConversation;
+            },
+            currentConversationAfter,
+            nullptr);
+    }
+
+    const bool completedInline =
+        conversation &&
+        resultRuntimeId != 0 &&
+        currentConversationAfter == nullptr;
+
+    if (conversation &&
+        gMod &&
+        !remoteContinuation &&
+        !gMod->IsReplayingRemoteDialogue() &&
+        !gMod->IsRemoteDialogueRuntimeId(
+            resultRuntimeId))
+    {
+        gMod->ObserveLocalDialogueTrigger(
+            speaker,
+            conversation,
+            ruleId,
+            ignoreVoiceRequirement,
+            concept,
+            query,
+            paChannel,
+            isLiveAudio,
+            priority);
+
+        if (completedInline)
+        {
+            const uint64_t storyId =
+                gMod->ResolveDialogueStoryId(
+                    resultRuntimeId);
+
+            gMod->OnLocalDialogueCompleted(
+                storyId,
+                true,
+                "ArkSpeakerBase::TriggerRule inline completion");
+
+            gMod->ForgetDialogueRuntimeId(
+                resultRuntimeId);
+        }
+    }
+
+    return conversation;
+}
+ArkConversation* ModMain::InvokeOriginalDialogueTrigger(
+    ArkSpeakerBase* speaker,
+    uint64_t ruleId,
+    bool ignoreVoiceRequirement,
+    const char* concept,
+    ArkResponseQuery* query,
+    int paChannel,
+    bool isLiveAudio,
+    int priority)
+{
+    return s_hookArkSpeakerBaseTriggerRule.InvokeOrig(
+        speaker,
+        ruleId,
+        ignoreVoiceRequirement,
+        concept,
+        query,
+        paChannel,
+        isLiveAudio,
+        priority);
+}
 
 static bool ArkSpeakerBase_PlayResponse_Hook(
     ArkSpeakerBase* speaker,
     ArkResponseRule& rule,
     ArkConversation* conversation,
-    const float currentTime,
-    const bool useRuleVoice,
-    const int paChannel)
+    float currentTime,
+    bool useRuleVoice,
+    int paChannel)
 {
-    ArkResponseManager* manager = (g_pGame ? g_pGame->m_pArkResponseManager.get() : nullptr);
+    if (gMod && speaker)
+    {
+        gMod->RememberDialogueSpeakerForHook(
+            speaker,
+            "ArkSpeakerBase::PlayResponse");
+    }
+
+    ArkResponseManager* manager =
+        g_pGame
+            ? g_pGame->m_pArkResponseManager.get()
+            : nullptr;
+
     uint64_t ruleId = 0;
     bool ruleUsedBefore = false;
     bool ruleIdOk = false;
     std::string reason;
+
     if (manager)
     {
         ruleIdOk = TryGuardedCall(
             "story response rule id before",
             [&rule]() { return rule.m_id; },
             ruleId,
-            &reason) && ruleId != 0;
+            &reason) &&
+            ruleId != 0;
+
         if (ruleIdOk)
         {
             TryReadStoryResponseUsage(
@@ -22448,51 +23411,119 @@ static bool ArkSpeakerBase_PlayResponse_Hook(
         }
     }
 
-    const bool result = s_hookArkSpeakerBasePlayResponse.InvokeOrig(
-        speaker,
-        rule,
-        conversation,
-        currentTime,
-        useRuleVoice,
-        paChannel);
+    const bool result =
+        s_hookArkSpeakerBasePlayResponse.InvokeOrig(
+            speaker,
+            rule,
+            conversation,
+            currentTime,
+            useRuleVoice,
+            paChannel);
 
     if (!result || !gMod || !manager || !ruleIdOk)
         return result;
 
     const ArkResponse* response = nullptr;
     uint64_t responseId = 0;
+
     TryGuardedCall(
         "story response current response ptr",
-        [speaker]() { return speaker ? speaker->m_pCurrentResponse : nullptr; },
+        [speaker]()
+        {
+            return speaker
+                ? speaker->m_pCurrentResponse
+                : nullptr;
+        },
         response,
         &reason);
+
     if (response)
     {
         TryGuardedCall(
             "story response id",
-            [response]() { return response->m_id; },
+            [response]()
+            {
+                return response->m_id;
+            },
             responseId,
             &reason);
     }
 
-    uint64_t conversationId = ruleId;
-    if (conversation)
+    // The input argument may be null even though PlayResponse has now
+    // created or joined an active runtime conversation.
+    ArkConversation* activeConversation = conversation;
+
+    if (!activeConversation && speaker)
     {
         TryGuardedCall(
-            "dialogue conversation id",
-            [conversation]() { return conversation->m_conversationId; },
-            conversationId,
+            "dialogue active conversation after PlayResponse",
+            [speaker]()
+            {
+                return speaker->m_pCurrentConversation;
+            },
+            activeConversation,
             &reason);
     }
+
+    uint64_t runtimeConversationId = 0;
+
+    if (activeConversation)
+    {
+        TryGuardedCall(
+            "dialogue runtime conversation id",
+            [activeConversation]()
+            {
+                return activeConversation->m_conversationId;
+            },
+            runtimeConversationId,
+            &reason);
+    }
+
+    if (runtimeConversationId == 0 && speaker)
+    {
+        TryGuardedCall(
+            "dialogue speaker runtime conversation id",
+            [speaker]()
+            {
+                return speaker->m_conversationId;
+            },
+            runtimeConversationId,
+            &reason);
+    }
+
+    if (gMod->IsReplayingRemoteDialogue() ||
+        gMod->IsRemoteDialogueRuntimeId(
+            runtimeConversationId))
+    {
+        return result;
+    }
+
+    // ruleId is the persistent/story identity used by conversation status.
+    const uint64_t storyConversationId = ruleId;
+
+    if (gMod && storyConversationId != 0)
+    {
+        gMod->m_lastActiveStoryConversationId = storyConversationId;
+    }
+
+    if (runtimeConversationId != 0 && storyConversationId != 0)
+    {
+        gMod->BindDialogueRuntimeId(
+            runtimeConversationId,
+            storyConversationId);
+    }
+
     gMod->ObserveLocalDialogueActivity(
-        conversationId != 0 ? conversationId : ruleId,
+        storyConversationId,
         responseId,
         "ArkSpeakerBase::PlayResponse");
 
     if (ruleUsedBefore)
         return result;
 
-    const uint16_t flags = BuildStoryResponseUsageFlags(&rule, response);
+    const uint16_t flags =
+        BuildStoryResponseUsageFlags(&rule, response);
+
     if (flags == 0)
         return result;
 
@@ -22502,7 +23533,10 @@ static bool ArkSpeakerBase_PlayResponse_Hook(
         ruleId,
         flags,
         true,
-        "ArkSpeakerBase::PlayResponse");
+        "ArkSpeakerBase::PlayResponse",
+        speaker,
+        paChannel);
+
     if (responseId != 0)
     {
         gMod->OnLocalStoryResponseUsageChanged(
@@ -22517,20 +23551,55 @@ static bool ArkSpeakerBase_PlayResponse_Hook(
     return result;
 }
 
-static void ArkConversation_OnComplete_Hook(ArkConversation* conversation, bool complete)
+static void ArkConversation_OnComplete_Hook(
+    ArkConversation* conversation,
+    bool complete)
 {
-    uint64_t conversationId = 0;
+    uint64_t runtimeConversationId = 0;
+
     if (conversation)
     {
         TryGuardedCall(
-            "dialogue complete conversation id",
-            [conversation]() { return conversation->m_conversationId; },
-            conversationId,
+            "dialogue complete runtime conversation id",
+            [conversation]()
+            {
+                return conversation->m_conversationId;
+            },
+            runtimeConversationId,
             nullptr);
     }
-    s_hookArkConversationOnComplete.InvokeOrig(conversation, complete);
-    if (gMod && conversationId != 0)
-        gMod->OnLocalDialogueCompleted(conversationId, complete, "ArkConversation::OnComplete");
+
+    const bool remoteReplay =
+        gMod &&
+        (gMod->IsReplayingRemoteDialogue() ||
+            gMod->IsRemoteDialogueRuntimeId(
+                runtimeConversationId));
+
+    s_hookArkConversationOnComplete.InvokeOrig(
+        conversation,
+        complete);
+
+    if (!gMod || runtimeConversationId == 0)
+        return;
+
+    if (remoteReplay)
+    {
+        gMod->ForgetDialogueRuntimeId(
+            runtimeConversationId);
+        return;
+    }
+
+    const uint64_t storyConversationId =
+        gMod->ResolveDialogueStoryId(
+            runtimeConversationId);
+
+    gMod->OnLocalDialogueCompleted(
+        storyConversationId,
+        complete,
+        "ArkConversation::OnComplete");
+
+    gMod->ForgetDialogueRuntimeId(
+        runtimeConversationId);
 }
 
 static void ArkGlobalFacts_OnGameTokenEvent_Hook(
@@ -22719,6 +23788,8 @@ static void CArkFlowGraphManager_ExecuteRemoteEvent_Hook(
             eventId,
             &reason);
     }
+    if (!entry && eventId != 0)
+        entry = FindStoryRemoteEventById(eventId);
 
     // Observe before vanilla dispatch. The Lobby graph can synchronously spawn
     // the ambush NPC, so the deterministic identity capture must already be
@@ -24247,6 +25318,11 @@ void ModMain::ResetRuntimeWorldRefsForLoad(const char* reason)
     // invalid at this point; clear our bookkeeping and let the new player start
     // from the level/save state.
     ResetWorldPresentationForLoad(reason, false);
+    // Native conversation ids and speaker pointers are scoped to the loaded
+    // world. Keeping replay classifications across a reload can make a newly
+    // allocated local conversation look like an old remote replay and block
+    // its continuation lines.
+    ResetDialogueLeaseState(reason);
     m_localDownedAttentionObjectDisabled = false;
     m_localDownedInputDisabled = false;
     m_localDownedWeaponDisabled = false;
@@ -29011,7 +30087,16 @@ bool ModMain::IsPostLoadNativeQuarantineActive() const
     return !m_sessionGameplayReady &&
         !CoopRuntimeConfig::UnsafeFlag("COOP_ALLOW_POSTLOAD_NATIVE_HOOKS_BEFORE_SESSION");
 }
-
+bool ModMain::ShouldBypassArkNpcAbilityPerformHook() const
+{
+    return
+        m_saveLoadGuardActive ||
+        m_waitingForPostLoadContinue ||
+        m_pendingPostLoadResync ||
+        m_arkLevelTransitionLoadActive ||
+        m_runtimeTransitionCleanupPrepared ||
+        IsPostLoadNativeQuarantineActive();
+}
 bool ModMain::ShouldBypassNpcMannequinHooksBeforeSession() const
 {
     return !m_sessionGameplayReady &&
@@ -29664,6 +30749,7 @@ void ModMain::InitHooks()
     s_hookArkNpcStartCowering.SetHookFunc(&ArkNpc_StartCowering_ProxyGuard_Hook);
     s_hookArkNpcOnNewAttentionTarget.SetHookFunc(&ArkNpc_OnNewAttentionTarget_Hook);
     s_hookArkNpcOnLostAttentionTarget.SetHookFunc(&ArkNpc_OnLostAttentionTarget_Hook);
+    s_hookArkNpcSetHasPerformedNoticeDialogue.SetHookFunc(&ArkNpc_SetHasPerformedNotice_DialogueSync_Hook);
     s_hookArkSignalManagerSendPackage.SetHookFunc(&ArkSignalManager_SendPackage_Hook);
     s_hookArkSignalManagerSendToReceiver.SetHookFunc(&ArkSignalManager_SendToReceiver_Hook);
     s_hookArkPlayerTakeDamage.SetHookFunc(&ArkPlayer_TakeDamage_Hook);
@@ -29707,7 +30793,10 @@ void ModMain::InitHooks()
         s_hookArkObjectiveComponentCompleteTask.SetHookFunc(&ArkObjectiveComponent_CompleteTask_Hook);
         s_hookArkObjectiveComponentFailTask.SetHookFunc(&ArkObjectiveComponent_FailTask_Hook);
         s_hookArkObjectiveComponentSetObjectiveDescription.SetHookFunc(&ArkObjectiveComponent_SetObjectiveDescription_Hook);
+        s_hookArkSpeakerBaseTriggerRule.SetHookFunc(&ArkSpeakerBase_TriggerRule_CoopHook);
         s_hookArkSpeakerBasePlayResponse.SetHookFunc(&ArkSpeakerBase_PlayResponse_Hook);
+        s_hookArkSpeakerBaseSetCharacter.SetHookFunc(&ArkSpeakerBase_SetCharacter_CoopHook);
+        s_hookArkSpeakerBaseSetEntity.SetHookFunc(&ArkSpeakerBase_SetEntity_CoopHook);
         s_hookArkConversationOnComplete.SetHookFunc(&ArkConversation_OnComplete_Hook);
         s_hookArkResponseManagerSetConversationStatus.SetHookFunc(&ArkResponseManager_SetConversationStatus_Hook);
         s_hookArkGlobalFactsOnGameTokenEvent.SetHookFunc(&ArkGlobalFacts_OnGameTokenEvent_Hook);
@@ -29728,6 +30817,8 @@ void ModMain::InitHooks()
         s_hookArkDoorOnLock.SetHookFunc(&ArkDoor_OnLock_Hook);
         s_hookArkDoorOnPower.SetHookFunc(&ArkDoor_OnPower_Hook);
         s_hookArkKioskOnButtonPress.SetHookFunc(&ArkKiosk_OnButtonPress_Hook);
+        s_hookArkGenericElevatorKioskOnButtonPress.SetHookFunc(
+            &ArkGenericElevatorKiosk_OnButtonPress_Hook);
         s_hookArkInteractiveMachineSetPowered.SetHookFunc(&ArkInteractiveMachine_SetPowered_Hook);
         s_hookArkInteractiveScreenSetPowered.SetHookFunc(&ArkInteractiveScreen_SetPowered_Hook);
         s_hookArkFabricatorSetState.SetHookFunc(&ArkFabricator_SetState_Hook);
@@ -32202,7 +33293,8 @@ void ModMain::OnArkSaveLoadLoadCurrentLevelState(ArkSaveLoadSystem* saveLoadSyst
         m_saveLoadGuardActive ||
         m_pendingPostLoadResync ||
         m_arkLevelTransitionLoadActive ||
-        inTransition;
+        inTransition ||
+        restoring;
 
     if (m_networkMode != CoopNetworkMode::Off && transitionActive)
     {
@@ -35917,6 +37009,11 @@ std::string ModMain::BuildRuntimeControlStatus() const
             << "/" << m_breakableHealthEventsApplied
             << "/" << m_breakableHealthEventSkips
         << " breakableLast=" << StatusToken(m_lastBreakableHealthEvent)
+        << " breakableGlass=" << m_breakableGlassHookCalls
+            << "/" << m_breakableGlassEventsQueued
+            << "/" << m_breakableGlassEventsApplied
+            << "/" << m_breakableGlassEventSkips
+        << " breakableGlassLast=" << StatusToken(m_lastBreakableGlassEvent)
         << " areaObjectJournal=" << m_areaObjectJournal.GetEntryCount()
             << "/" << m_areaObjectJournalReplayRows
             << "/" << m_areaObjectJournalReplayApplied
@@ -36727,6 +37824,127 @@ bool ModMain::DebugExportLocalPlayerJsonl(std::string& detail)
         << ",\"oxygen\":" << oxygen
         << ",\"maxOxygen\":" << maxOxygen
         << ",\"consumingOxygen\":" << (consumingOxygen ? "true" : "false")
+        << "}\n";
+
+    ArkPlayerInteraction& interaction = player->m_interaction;
+    EntityId interactionTargetId = INVALID_ENTITYID;
+    bool hasValidInteraction = false;
+    std::string interactionReason;
+    TryGuardedCall(
+        "dump interaction target",
+        [&interaction]() { return interaction.m_targetSelector.GetInteractionTarget(); },
+        interactionTargetId,
+        &interactionReason);
+    TryGuardedCall(
+        "dump interaction validity",
+        [&interaction]() { return interaction.HasValidInteractionInfo(); },
+        hasValidInteraction,
+        &interactionReason);
+
+    IEntity* interactionTarget =
+        gEnv && gEnv->pEntitySystem && interactionTargetId != INVALID_ENTITYID
+            ? gEnv->pEntitySystem->GetEntity(interactionTargetId)
+            : nullptr;
+    uint64_t interactionTargetGuid = 0;
+    std::string interactionTargetName;
+    std::string interactionTargetClass;
+    if (interactionTarget)
+    {
+        const char* rawName = nullptr;
+        IEntityClass* entityClass = nullptr;
+        const char* rawClass = nullptr;
+        TryGuardedCall("dump interaction guid", [interactionTarget]() { return interactionTarget->GetGuid(); }, interactionTargetGuid, &interactionReason);
+        TryGuardedCall("dump interaction name", [interactionTarget]() { return interactionTarget->GetName(); }, rawName, &interactionReason);
+        TryGuardedCall("dump interaction class", [interactionTarget]() { return interactionTarget->GetClass(); }, entityClass, &interactionReason);
+        if (entityClass)
+            TryGuardedCall("dump interaction class name", [entityClass]() { return entityClass->GetName(); }, rawClass, &interactionReason);
+        interactionTargetName = ReadRuntimeCString(rawName, 160);
+        interactionTargetClass = ReadRuntimeCString(rawClass, 96);
+    }
+
+    ArkSpeakerBase* targetSpeaker = nullptr;
+    if (interactionTarget && gEnv && gEnv->pGame)
+    {
+        IGameFramework* framework = gEnv->pGame->GetIGameFramework();
+        IGameObject* gameObject = framework
+            ? framework->GetGameObject(interactionTargetId)
+            : nullptr;
+        if (gameObject)
+        {
+            IGameObjectExtension* extension = nullptr;
+            const char* extensionNames[] = { "ArkSpeaker", "ArkSpeakerExtension" };
+            for (const char* extensionName : extensionNames)
+            {
+                TryGuardedCall(
+                    "dump interaction speaker extension",
+                    [gameObject, extensionName]() { return gameObject->QueryExtension(extensionName); },
+                    extension,
+                    &interactionReason);
+                if (extension)
+                    break;
+            }
+            if (extension)
+            {
+                ArkSpeakerExtension* speakerExtension =
+                    static_cast<ArkSpeakerExtension*>(extension);
+                TryGuardedCall(
+                    "dump interaction speaker pointer",
+                    [speakerExtension]() { return speakerExtension->m_pSpeaker.get(); },
+                    targetSpeaker,
+                    &interactionReason);
+            }
+        }
+    }
+
+    uint64_t speakerRuntimeConversationId = 0;
+    uint64_t speakerConversationFieldId = 0;
+    uint64_t speakerResponseId = 0;
+    bool speakerSpeaking = false;
+    int speakerPlayerType = -1;
+    if (targetSpeaker)
+    {
+        ArkConversation* conversation = nullptr;
+        const ArkResponse* response = nullptr;
+        TryGuardedCall("dump interaction speaker conversation", [targetSpeaker]() { return targetSpeaker->m_pCurrentConversation; }, conversation, &interactionReason);
+        TryGuardedCall("dump interaction speaker response", [targetSpeaker]() { return targetSpeaker->m_pCurrentResponse; }, response, &interactionReason);
+        TryGuardedCall("dump interaction speaker field id", [targetSpeaker]() { return targetSpeaker->m_conversationId; }, speakerConversationFieldId, &interactionReason);
+        TryGuardedCall("dump interaction speaker speaking", [targetSpeaker]() { return targetSpeaker->IsSpeaking(); }, speakerSpeaking, &interactionReason);
+        EArkDialogPlayerType playerType = EArkDialogPlayerType::invalid;
+        TryGuardedCall("dump interaction speaker type", [targetSpeaker]() { return targetSpeaker->GetPlayerType(); }, playerType, &interactionReason);
+        speakerPlayerType = static_cast<int>(playerType);
+        if (conversation)
+            TryGuardedCall("dump interaction runtime conversation", [conversation]() { return conversation->m_conversationId; }, speakerRuntimeConversationId, &interactionReason);
+        if (response)
+            TryGuardedCall("dump interaction response id", [response]() { return response->m_id; }, speakerResponseId, &interactionReason);
+    }
+
+    output
+        << "{\"kind\":\"player_interaction\""
+        << ",\"targetId\":" << interactionTargetId
+        << ",\"usableEntityId\":" << interaction.m_usableEntityId
+        << ",\"forceSelectEntity\":" << interaction.m_targetSelector.m_forceSelectEntity
+        << ",\"candidateCount\":" << interaction.m_targetSelector.m_candidateTargets.size()
+        << ",\"disablePromptCount\":" << interaction.m_disableInteractionPromptCount
+        << ",\"hasValidInteraction\":" << (hasValidInteraction ? "true" : "false")
+        << ",\"typeUse\":" << static_cast<int>(interaction.m_interactionInfo[0].m_interactionType)
+        << ",\"typeHold\":" << static_cast<int>(interaction.m_interactionInfo[1].m_interactionType)
+        << ",\"typeLoot\":" << static_cast<int>(interaction.m_interactionInfo[2].m_interactionType)
+        << ",\"typeSpecial\":" << static_cast<int>(interaction.m_interactionInfo[3].m_interactionType)
+        << ",\"hiddenUse\":" << (interaction.m_interactionHidden[0] ? "true" : "false")
+        << ",\"hiddenHold\":" << (interaction.m_interactionHidden[1] ? "true" : "false")
+        << ",\"hiddenLoot\":" << (interaction.m_interactionHidden[2] ? "true" : "false")
+        << ",\"hiddenSpecial\":" << (interaction.m_interactionHidden[3] ? "true" : "false")
+        << ",\"useText\":\"" << JsonEscapeForCoopDump(interaction.m_interactionInfo[0].m_displayText.c_str()) << "\""
+        << ",\"targetGuid\":" << interactionTargetGuid
+        << ",\"targetName\":\"" << JsonEscapeForCoopDump(interactionTargetName) << "\""
+        << ",\"targetClass\":\"" << JsonEscapeForCoopDump(interactionTargetClass) << "\""
+        << ",\"speakerPresent\":" << (targetSpeaker ? "true" : "false")
+        << ",\"speakerSpeaking\":" << (speakerSpeaking ? "true" : "false")
+        << ",\"speakerPlayerType\":" << speakerPlayerType
+        << ",\"speakerRuntimeConversationId\":" << speakerRuntimeConversationId
+        << ",\"speakerConversationFieldId\":" << speakerConversationFieldId
+        << ",\"speakerResponseId\":" << speakerResponseId
+        << ",\"reason\":\"" << JsonEscapeForCoopDump(interactionReason) << "\""
         << "}\n";
 
     CArkPsiComponent& psiComponent = player->m_playerComponent.GetPsiComponent();
@@ -41766,6 +42984,32 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
             action = "disconnect_peer";
         }
     }
+    else if (command == "coop_peer_timeout_now")
+    {
+        if (m_networkMode != CoopNetworkMode::Client ||
+            !m_hasRemoteSession || !m_sessionGameplayReady)
+        {
+            ok = false;
+            action = "peer_timeout_now_not_connected_client";
+        }
+        else
+        {
+            // Drive the production warning/freeze/disconnect cleanup in one
+            // deterministic frame. A new process can have less than 1000 s
+            // of async timer uptime, so subtracting from m_lastPacketTime
+            // would make it negative and trip TickPeerTimeout's inactive
+            // sentinel instead of the timeout path.
+            const float now = GetNowSeconds();
+            m_lastPacketTime = 0.0f;
+            m_peerConnectionThrottleActive = false;
+            m_peerTimeoutWarningActive = true;
+            m_peerTimeoutWarningStartTime = now - 301.0f;
+            m_peerTimeoutResumeCandidateStartTime = -1.0f;
+            m_peerTimeoutWarningReason = "server timeout warning";
+            TickPeerTimeout(0.0f);
+            action = "peer_timeout_now";
+        }
+    }
     else if (command == "coop_offer_world")
     {
         if (m_networkMode == CoopNetworkMode::Host)
@@ -41800,6 +43044,105 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
         }
         QueueAutoReengageAfterLoadingScreen(command.c_str(), true);
         action = "continue_after_load_queued";
+    }
+    else if (command == "coop_input_tap" || command == "coop_input_key")
+    {
+        const std::string requestedKey = args.empty() ? std::string("enter") : ToLowerAscii(args.front());
+        const std::string requestedState = args.size() >= 2 ? ToLowerAscii(args[1]) : std::string("tap");
+        EKeyId keyId = eKI_Unknown;
+        const char* keyName = nullptr;
+        if (requestedKey == "enter" || requestedKey == "return")
+        {
+            keyId = eKI_Enter;
+            keyName = "enter";
+        }
+        else if (requestedKey == "space")
+        {
+            keyId = eKI_Space;
+            keyName = "space";
+        }
+        else if (requestedKey == "f" || requestedKey == "use")
+        {
+            keyId = eKI_F;
+            keyName = "f";
+        }
+
+        if (!gEnv || !gEnv->pInput)
+        {
+            ok = false;
+            action = "input_tap_no_input";
+        }
+        else if (keyId == eKI_Unknown || !keyName)
+        {
+            ok = false;
+            action = "input_tap_bad_key";
+        }
+        else if (command == "coop_input_key" &&
+            requestedState != "down" && requestedState != "press" &&
+            requestedState != "up" && requestedState != "release")
+        {
+            ok = false;
+            action = "input_key_bad_state";
+        }
+        else
+        {
+            SInputSymbol* symbol = nullptr;
+            TryGuardedCall(
+                "runtime input tap LookupSymbol",
+                [keyId]() { return gEnv->pInput->LookupSymbol(eIDT_Keyboard, 0, keyId); },
+                symbol,
+                nullptr);
+
+            SInputEvent event = {};
+            event.deviceType = eIDT_Keyboard;
+            event.inputChar = L'\0';
+            event.keyName = TKeyName{keyName};
+            event.keyId = keyId;
+            event.modifiers = 0;
+            event.pSymbol = symbol;
+            event.deviceIndex = 0;
+
+            const bool postDown = command == "coop_input_tap" ||
+                requestedState == "down" || requestedState == "press";
+            const bool postUp = command == "coop_input_tap" ||
+                requestedState == "up" || requestedState == "release";
+            std::string guardReason;
+            ok = TryGuardedVoidCall(
+                "runtime input PostInputEvent",
+                [&event, symbol, postDown, postUp]()
+                {
+                    if (postDown)
+                    {
+                        event.state = eIS_Pressed;
+                        event.value = 1.0f;
+                        if (symbol)
+                        {
+                            symbol->state = event.state;
+                            symbol->value = event.value;
+                        }
+                        gEnv->pInput->PostInputEvent(event, true);
+                    }
+                    if (postUp)
+                    {
+                        event.state = eIS_Released;
+                        event.value = 0.0f;
+                        if (symbol)
+                        {
+                            symbol->state = event.state;
+                            symbol->value = event.value;
+                        }
+                        gEnv->pInput->PostInputEvent(event, true);
+                    }
+                },
+                &guardReason);
+            action = ok
+                ? (command == "coop_input_tap" ? "input_tap" : "input_key")
+                : "input_post_guard_failed";
+            m_lastRuntimeInteropEvent =
+                action + "_key_" + keyName +
+                "_state_" + (command == "coop_input_tap" ? std::string("tap") : requestedState) +
+                (guardReason.empty() ? std::string() : "_" + StatusToken(guardReason));
+        }
     }
     else if (command == "coop_world_ready")
     {
@@ -42011,6 +43354,56 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
         ok = DebugRunConsoleCommand(commandLine, command == "coop_console_defer", detail);
         action = "console_raw";
     }
+    else if (command == "coop_input_mouse1")
+    {
+        action = "input_mouse1";
+        std::string reason;
+        SInputSymbol* symbol = gEnv && gEnv->pInput
+            ? gEnv->pInput->LookupSymbol(eIDT_Mouse, 0, eKI_Mouse1)
+            : nullptr;
+        ok = symbol != nullptr;
+        if (ok)
+        {
+            SInputEvent event = {};
+            event.deviceType = eIDT_Mouse;
+            event.inputChar = 0;
+            event.keyName = symbol->name;
+            event.keyId = eKI_Mouse1;
+            event.modifiers = eMM_None;
+            event.pSymbol = symbol;
+            event.deviceIndex = 0;
+
+            ok = TryGuardedVoidCall(
+                "runtime synthetic mouse1 press",
+                [symbol, &event]()
+                {
+                    symbol->state = eIS_Pressed;
+                    symbol->value = 1.0f;
+                    event.state = eIS_Pressed;
+                    event.value = 1.0f;
+                    gEnv->pInput->PostInputEvent(event, true);
+                },
+                &reason);
+            if (ok)
+            {
+                ok = TryGuardedVoidCall(
+                    "runtime synthetic mouse1 release",
+                    [symbol, &event]()
+                    {
+                        symbol->state = eIS_Released;
+                        symbol->value = 0.0f;
+                        event.state = eIS_Released;
+                        event.value = 0.0f;
+                        gEnv->pInput->PostInputEvent(event, true);
+                    },
+                    &reason);
+            }
+        }
+        m_networkStatus =
+            std::string(ok ? "input_mouse1_posted" : "input_mouse1_failed") +
+            "_symbol_" + std::to_string(symbol ? 1 : 0) +
+            "_reason_" + StatusToken(reason.empty() ? std::string("-") : reason);
+    }
     else if (command == "coop_render_resume")
     {
         action = "render_resume";
@@ -42081,6 +43474,114 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
                 DebugProbeLocalInventoryArchetype(archetypeId, detail);
             action = "inventory_probe";
         }
+    }
+    else if (command == "coop_native_wrench_hit")
+    {
+        action = "native_wrench_hit";
+        float direction = 1.0f;
+        float damageScale = 1.0f;
+        if (!args.empty())
+            TryParseFloat(args[0], direction);
+        if (args.size() >= 2)
+            TryParseFloat(args[1], damageScale);
+        direction = std::clamp(direction, -1.0f, 1.0f);
+        damageScale = std::clamp(damageScale, 0.01f, 8.0f);
+
+        unsigned wrenchId = INVALID_ENTITYID;
+        unsigned equippedBefore = INVALID_ENTITYID;
+        unsigned equippedAfter = INVALID_ENTITYID;
+        bool equipAccepted = false;
+        ArkGame* arkGame = nullptr;
+        IArkItem* rawWrench = nullptr;
+        std::string guardReason;
+        ok = ArkPlayer::GetInstancePtr() &&
+            TryGuardedCall(
+                "native wrench hit FindWeapon",
+                []() -> unsigned
+                {
+                    return ArkPlayer::GetInstance().m_weaponComponent.FindWeapon(
+                        ArkWrenchComponent::GetWrenchArchetypeId());
+                },
+                wrenchId,
+                &guardReason) &&
+            wrenchId != INVALID_ENTITYID &&
+            TryGuardedCall(
+                "native wrench hit ArkGame",
+                []() { return ArkGame::GetArkGame(); },
+                arkGame,
+                &guardReason) &&
+            arkGame &&
+            TryGuardedCall(
+                "native wrench hit item",
+                [arkGame, wrenchId]() -> IArkItem*
+                {
+                    return arkGame->GetArkItemSystem().GetItem(wrenchId);
+                },
+                rawWrench,
+                &guardReason) &&
+            rawWrench;
+        if (ok)
+        {
+            ArkPlayerWeaponComponent& weapons =
+                ArkPlayer::GetInstance().m_weaponComponent;
+            ok = TryGuardedCall(
+                "native wrench hit equipped before",
+                [&weapons]() -> unsigned
+                {
+                    return weapons.GetEquippedOrToEquipWeaponId();
+                },
+                equippedBefore,
+                &guardReason);
+            if (ok && equippedBefore != wrenchId)
+            {
+                ok = TryGuardedCall(
+                    "native wrench hit EquipWeapon",
+                    [&weapons, wrenchId]()
+                    {
+                        return weapons.EquipWeapon(wrenchId);
+                    },
+                    equipAccepted,
+                    &guardReason) &&
+                    equipAccepted;
+            }
+            else
+            {
+                equipAccepted = ok;
+            }
+            if (ok)
+            {
+                TryGuardedCall(
+                    "native wrench hit equipped after",
+                    [&weapons]() -> unsigned
+                    {
+                        return weapons.GetEquippedOrToEquipWeaponId();
+                    },
+                    equippedAfter,
+                    &guardReason);
+            }
+        }
+        if (ok)
+        {
+            ok =
+            TryGuardedVoidCall(
+                "native wrench hit OnHit",
+                [rawWrench, direction, damageScale]()
+                {
+                    auto* wrench = static_cast<ArkWeaponWrench*>(
+                        static_cast<CArkItem*>(rawWrench));
+                    wrench->OnHit(direction, damageScale);
+                },
+                &guardReason);
+        }
+        commandDetail =
+            "wrenchId=" + std::to_string(wrenchId) +
+            ",equippedBefore=" + std::to_string(equippedBefore) +
+            ",equipAccepted=" + std::to_string(equipAccepted ? 1 : 0) +
+            ",equippedAfter=" + std::to_string(equippedAfter) +
+            ",direction=" + std::to_string(direction) +
+            ",scale=" + std::to_string(damageScale) +
+            ",reason=" + StatusToken(
+                guardReason.empty() ? std::string("-") : guardReason);
     }
     else if (command == "coop_story_grant_keycard" ||
         command == "coop_story_grant_keycode" ||
@@ -42630,16 +44131,28 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
                 else
                 {
                     std::string reason;
-                    const string eventName(entry->name);
                     const uint32_t beforeCount = m_storyRemoteEventCounts[id];
-                    ok = TryGuardedVoidCall(
-                        "runtime story ExecuteRemoteEvent",
-                        [manager, &eventName]() { manager->ExecuteRemoteEvent(eventName); },
-                        &reason);
+                    if (entry->name && *entry->name)
+                    {
+                        const string eventName(entry->name);
+                        ok = TryGuardedVoidCall(
+                            "runtime story ExecuteRemoteEvent",
+                            [manager, &eventName]() { manager->ExecuteRemoteEvent(eventName); },
+                            &reason);
+                    }
+                    else
+                    {
+                        ok = ActivateRegisteredStoryRemoteEventById(
+                            entry->id,
+                            reason);
+                    }
                     if (ok && m_storyRemoteEventCounts[id] == beforeCount)
                         OnLocalStoryRemoteEventTriggered(id, command.c_str());
                     detail = ok
-                        ? "remote_event_called_" + StatusToken(entry->name)
+                        ? "remote_event_called_" +
+                            (entry->name && *entry->name
+                                ? StatusToken(entry->name)
+                                : std::to_string(entry->id))
                         : "remote_event_guard_" + StatusToken(reason.empty() ? std::string("-") : reason);
                     action = "story_trigger_remote_event";
                 }
@@ -44982,6 +46495,8 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
                             scriptTable,
                             &reason) &&
                         scriptTable;
+                    if (identitiesOk)
+                        ++s_arkKioskDebugPressDepth;
                     const bool eventCallOk = identitiesOk && TryGuardedCall(
                         "runtime elevator kiosk press DispatchScriptOutputEvent",
                         [outputEntity, output]()
@@ -45000,6 +46515,8 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
                         },
                         activationResult,
                         &reason);
+                    if (identitiesOk && s_arkKioskDebugPressDepth > 0)
+                        --s_arkKioskDebugPressDepth;
                     ok = eventCallOk && activationCallOk;
                     TryReadArkGenericElevatorKioskState(
                         kiosk,
@@ -45624,6 +47141,19 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
         }
         m_networkStatus = action + "_detail_" + StatusToken(detail.empty() ? std::string("-") : detail);
     }
+    else if (command == "coop_breakable_glass_probe" ||
+        command == "coop_breakable_glass_impact")
+    {
+        const bool impact = command == "coop_breakable_glass_impact";
+        const std::string target = args.empty() ? std::string("nearest") : args.front();
+        std::string detail;
+        ok = DebugBreakableGlassCommand(target, impact, detail);
+        action = impact ? "breakable_glass_impact" : "breakable_glass_probe";
+        if (!ok)
+            action += "_failed";
+        m_networkStatus = action + "_detail_" +
+            StatusToken(detail.empty() ? std::string("-") : detail);
+    }
     else if (command == "coop_rotator_spawn" || command == "coop_rotator_probe" || command == "coop_rotator_active")
     {
         IEntity* entity = nullptr;
@@ -45923,26 +47453,68 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
             "_doors_" + std::to_string(doorsOpen ? 1 : 0) +
             "_reason_" + StatusToken(reason.empty() ? std::string("-") : reason);
     }
-    else if (command == "coop_dialogue_lease")
+        else if (command == "coop_dialogue_lease")
     {
-        const std::string operation = args.empty() ? "probe" : ToLowerAscii(args[0]);
-        uint64_t dialogueId = args.size() >= 2 ? std::strtoull(args[1].c_str(), nullptr, 0) : m_dialogueLeaseDialogueId;
-        if (operation == "request" && dialogueId != 0)
-            ok = RequestDialogueLease(dialogueId, "runtime command");
+        const std::string operation =
+            args.empty() ? "probe" : ToLowerAscii(args[0]);
+
+        const uint64_t descriptorDialogueId =
+            m_dialogueLeaseDescriptor.dialogueId;
+        const uint64_t dialogueId =
+            args.size() >= 2
+                ? std::strtoull(args[1].c_str(), nullptr, 0)
+                : (descriptorDialogueId != 0
+                    ? descriptorDialogueId
+                    : m_dialogueLeaseDialogueId);
+
+        if (operation == "request")
+        {
+            const bool descriptorReady =
+                dialogueId != 0 &&
+                descriptorDialogueId == dialogueId &&
+                m_dialogueLeaseDescriptor.triggerEventId != 0;
+
+            ok = descriptorReady &&
+                RequestDialogueLease(
+                    m_dialogueLeaseDescriptor,
+                    "runtime command");
+        }
         else if (operation == "release")
-            ok = ReleaseLocalDialogueLease("runtime command");
+        {
+            ok = ReleaseLocalDialogueLease(
+                "runtime command");
+        }
         else if (operation == "probe")
+        {
             ok = true;
+        }
         else
+        {
             ok = false;
-        action = ok ? "dialogue_lease" : "dialogue_lease_failed";
-        m_networkStatus = action + "_dialogue_" + std::to_string(m_dialogueLeaseDialogueId) +
-            "_owner_" + std::to_string(m_dialogueLeaseOwnerHash) +
-            "_epoch_" + std::to_string(m_dialogueLeaseEpoch) +
-            "_pending_" + std::to_string(m_dialogueLeasePendingId);
+        }
+
+        action = ok
+            ? "dialogue_lease"
+            : "dialogue_lease_failed";
+        m_networkStatus =
+            action +
+            "_dialogue_" +
+            std::to_string(m_dialogueLeaseDialogueId) +
+            "_owner_" +
+            std::to_string(m_dialogueLeaseOwnerHash) +
+            "_epoch_" +
+            std::to_string(m_dialogueLeaseEpoch) +
+            "_pending_" +
+            std::to_string(m_dialogueLeasePendingId) +
+            "_descriptor_" +
+            std::to_string(descriptorDialogueId) +
+            "_trigger_" +
+            std::to_string(
+                m_dialogueLeaseDescriptor.triggerEventId);
     }
     else if (command == "coop_dialogue_event")
     {
+
         const std::string operation = args.empty() ? std::string() : ToLowerAscii(args[0]);
         uint64_t id = args.size() >= 2 ? std::strtoull(args[1].c_str(), nullptr, 0) : 0;
         uint16_t eventKind =
@@ -46037,17 +47609,23 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
         {
             inventory = FindNearestArkInventoryForCoop(&entityId, &guid, &distance, &targetDetail);
         }
-        else if (target.rfind("guid:", 0) == 0)
+        else
         {
-            uint64_t parsedGuid = 0;
-            if (TryParseUint64(std::string_view(target).substr(5), parsedGuid) && parsedGuid != 0 && gEnv && gEnv->pEntitySystem)
+            IEntity* entity = ResolveRuntimeEntityTarget(target, targetDetail);
+            if (entity)
             {
-                EntityId resolvedId = gEnv->pEntitySystem->FindEntityByGuid(static_cast<EntityGUID>(parsedGuid));
-                IEntity* entity = resolvedId != INVALID_ENTITYID ? gEnv->pEntitySystem->GetEntity(resolvedId) : nullptr;
                 inventory = GetArkInventoryExtensionFromEntity(entity);
-                entityId = resolvedId;
-                guid = parsedGuid;
-                if (entity && ArkPlayer::GetInstancePtr() && ArkPlayer::GetInstance().GetEntity())
+                TryGuardedCall(
+                    "runtime area container GetId",
+                    [entity]() { return entity->GetId(); },
+                    entityId,
+                    &reason);
+                TryGuardedCall(
+                    "runtime area container GetGuid",
+                    [entity]() { return entity->GetGuid(); },
+                    guid,
+                    &reason);
+                if (ArkPlayer::GetInstancePtr() && ArkPlayer::GetInstance().GetEntity())
                     distance = (entity->GetWorldPos() - ArkPlayer::GetInstance().GetEntity()->GetWorldPos()).GetLength();
             }
         }
@@ -46601,6 +48179,62 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
         ok = DebugSetRuntimeEntityTransform(args, detail);
         action = "entity_transform";
     }
+    else if (command == "coop_player_place_aim")
+    {
+        action = "player_place_aim";
+        Vec3 position(ZERO);
+        float targetZOffset = 1.5f;
+        std::string targetDetail;
+        IEntity* target = args.size() >= 4
+            ? ResolveRuntimeEntityTarget(args[3], targetDetail)
+            : nullptr;
+        const bool parsed = args.size() >= 4 &&
+            TryParseFloat(args[0], position.x) &&
+            TryParseFloat(args[1], position.y) &&
+            TryParseFloat(args[2], position.z);
+        if (args.size() >= 5)
+            TryParseFloat(args[4], targetZOffset);
+        targetZOffset = std::clamp(targetZOffset, -5.0f, 8.0f);
+
+        ArkPlayer* player = ArkPlayer::GetInstancePtr();
+        IEntity* playerEntity = player ? player->GetEntity() : nullptr;
+        std::string guardReason;
+        Vec3 targetPosition(ZERO);
+        ok = parsed && target && player && playerEntity &&
+            TryGuardedCall(
+                "player place aim target position",
+                [target]() { return target->GetWorldPos(); },
+                targetPosition,
+                &guardReason);
+        targetPosition.z += targetZOffset;
+        Vec3 eyePosition = position + Vec3(0.0f, 0.0f, 1.5f);
+        Vec3 direction = targetPosition - eyePosition;
+        direction.NormalizeSafe(FORWARD_DIRECTION);
+        const Quat viewRotation = Quat::CreateRotationVDir(direction);
+        if (ok)
+        {
+            ok = TryGuardedVoidCall(
+                "player place aim native transform",
+                [player, playerEntity, position, viewRotation]()
+                {
+                    playerEntity->SetPos(position, 0, true, true);
+                    player->SetViewRotation(viewRotation);
+                },
+                &guardReason);
+        }
+        commandDetail =
+            "target=" + StatusToken(
+                targetDetail.empty() ? std::string("missing") : targetDetail) +
+            ",player=" + std::to_string(position.x) + "," +
+                std::to_string(position.y) + "," + std::to_string(position.z) +
+            ",targetPos=" + std::to_string(targetPosition.x) + "," +
+                std::to_string(targetPosition.y) + "," +
+                std::to_string(targetPosition.z) +
+            ",direction=" + std::to_string(direction.x) + "," +
+                std::to_string(direction.y) + "," + std::to_string(direction.z) +
+            ",reason=" + StatusToken(
+                guardReason.empty() ? std::string("-") : guardReason);
+    }
     else if (command == "coop_prop_test_move_nearest")
     {
         std::string detail;
@@ -46612,6 +48246,371 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
         std::string detail;
         ok = DebugProbeRuntimeEntity(args, detail);
         action = "entity_probe";
+    }
+    else if (command == "coop_helicopter_passenger_start")
+    {
+        action = "helicopter_passenger_start";
+        std::string targetDetail;
+        IEntity* entity = ResolveRuntimeEntityTarget(
+            "guid:" + std::to_string(
+                kCoopSimulationLabsHelicopterUsePromptGuid),
+            targetDetail);
+        IScriptTable* scriptTable = nullptr;
+        std::string reason;
+        bool eventResult = false;
+        bool activationResult = false;
+        const bool identityOk = entity &&
+            TryGuardedCall(
+                "runtime helicopter passenger script table",
+                [entity]() { return entity->GetScriptTable(); },
+                scriptTable,
+                &reason) &&
+            scriptTable;
+        const bool eventOk = identityOk && TryGuardedCall(
+            "runtime helicopter passenger DispatchScriptOutputEvent",
+            [entity]()
+            {
+                return s_funcArkEntityDispatchScriptOutputEvent(
+                    entity, "Activated");
+            },
+            eventResult,
+            &reason);
+        const bool activationOk = eventOk && TryGuardedCall(
+            "runtime helicopter passenger ActivateScriptOutput",
+            [entity, scriptTable]()
+            {
+                return s_funcArkEntityActivateScriptOutput(
+                    entity, scriptTable, "Activated");
+            },
+            activationResult,
+            &reason);
+        ok = eventOk && activationOk;
+        commandDetail =
+            "target=" + StatusToken(
+                targetDetail.empty() ? std::string("missing") : targetDetail) +
+            ",eventResult=" + std::to_string(eventResult ? 1 : 0) +
+            ",activationResult=" +
+                std::to_string(activationResult ? 1 : 0) +
+            ",reason=" + StatusToken(
+                reason.empty() ? std::string("-") : reason);
+    }
+    else if (command == "coop_dialogue_trigger_pa")
+    {
+        action = "dialogue_trigger_pa";
+        uint64_t ruleId = 0;
+        const int channel = args.size() >= 2
+            ? std::atoi(args[1].c_str())
+            : 0;
+        if (args.empty() || !TryParseUint64(args[0], ruleId) ||
+            ruleId == 0 || channel < 0 || channel >= 4)
+        {
+            ok = false;
+            commandDetail = "usage=ruleId_channel0to3";
+        }
+        else
+        {
+            CArkPADialogManager* manager = static_cast<CArkPADialogManager*>(
+                gEnv && gEnv->pGame
+                    ? gEnv->pGame->GetIArkPADialogManager()
+                    : nullptr);
+            ArkSpeakerBase* speaker = manager
+                ? &manager->m_speakers[static_cast<size_t>(channel)]
+                : nullptr;
+            ArkResponseManager* responseManager = GetStoryResponseManager();
+            bool usedBefore = false;
+            bool usedAfter = false;
+            std::string reason;
+            if (responseManager)
+            {
+                TryReadStoryResponseUsage(
+                    responseManager,
+                    CoopProtocol::kStoryEventResponseRuleUsed,
+                    ruleId,
+                    usedBefore,
+                    nullptr,
+                    "runtime PA dialogue usage before",
+                    &reason);
+            }
+            ArkConversation* conversation = nullptr;
+            const bool callOk = speaker && TryGuardedCall(
+                "runtime PA dialogue TriggerRule",
+                [speaker, ruleId]()
+                {
+                    // Preserve the production failure shape: Vanilla's PA path
+                    // can call TriggerRule with -1, while speaker identity must
+                    // derive the real channel from the manager-owned address.
+                    return speaker->TriggerRule(
+                        ruleId, true, nullptr, nullptr, -1, false, 0);
+                },
+                conversation,
+                &reason);
+            if (responseManager)
+            {
+                TryReadStoryResponseUsage(
+                    responseManager,
+                    CoopProtocol::kStoryEventResponseRuleUsed,
+                    ruleId,
+                    usedAfter,
+                    nullptr,
+                    "runtime PA dialogue usage after",
+                    &reason);
+            }
+            ok = callOk && conversation;
+            commandDetail =
+                "rule=" + std::to_string(ruleId) +
+                ",channel=" + std::to_string(channel) +
+                ",speaker=" + PointerHex(speaker) +
+                ",usedBefore=" + std::to_string(usedBefore ? 1 : 0) +
+                ",usedAfter=" + std::to_string(usedAfter ? 1 : 0) +
+                ",conversation=" + PointerHex(conversation) +
+                ",reason=" + StatusToken(
+                    reason.empty() ? std::string("-") : reason);
+        }
+    }
+    else if (command == "coop_dialogue_memory_probe" ||
+        command == "coop_dialogue_trigger_rule")
+    {
+        const bool triggerRule = command == "coop_dialogue_trigger_rule";
+        action = triggerRule
+            ? "dialogue_trigger_rule"
+            : "dialogue_memory_probe";
+
+        std::string targetDetail;
+        IEntity* target = args.empty()
+            ? nullptr
+            : ResolveRuntimeEntityTarget(args.front(), targetDetail);
+        uint64_t ruleOrFactId = 0;
+        const bool parsedId = args.size() >= 2 &&
+            TryParseUint64(args[1], ruleOrFactId) &&
+            ruleOrFactId != 0;
+        uint64_t speakerCharacterId = 0;
+        if (args.size() >= 3)
+            TryParseUint64(args[2], speakerCharacterId);
+
+        std::string speakerDetail;
+        ArkSpeakerBase* speaker = target
+            ? ResolveDialogueSpeaker(
+                static_cast<uint64_t>(target->GetGuid()),
+                speakerCharacterId,
+                0,
+                -1,
+                speakerDetail)
+            : nullptr;
+
+        if (!target || !parsedId || !speaker)
+        {
+            ok = false;
+            commandDetail =
+                "target=" + StatusToken(targetDetail.empty() ? std::string("missing") : targetDetail) +
+                ",id=" + std::to_string(ruleOrFactId) +
+                ",character=" + std::to_string(speakerCharacterId) +
+                ",speaker=" + StatusToken(speakerDetail.empty() ? std::string("missing") : speakerDetail);
+        }
+        else if (triggerRule)
+        {
+            ArkResponseManager* manager = GetStoryResponseManager();
+            bool usedBefore = false;
+            bool usedAfter = false;
+            std::string reason;
+            if (manager)
+            {
+                TryReadStoryResponseUsage(
+                    manager,
+                    CoopProtocol::kStoryEventResponseRuleUsed,
+                    ruleOrFactId,
+                    usedBefore,
+                    nullptr,
+                    "runtime dialogue trigger usage before",
+                    &reason);
+            }
+
+            ArkConversation* conversation = nullptr;
+            const bool callOk = TryGuardedCall(
+                "runtime dialogue TriggerRule",
+                [speaker, ruleOrFactId]()
+                {
+                    return speaker->TriggerRule(
+                        ruleOrFactId,
+                        true,
+                        nullptr,
+                        nullptr,
+                        -1,
+                        false,
+                        0);
+                },
+                conversation,
+                &reason);
+
+            if (manager)
+            {
+                TryReadStoryResponseUsage(
+                    manager,
+                    CoopProtocol::kStoryEventResponseRuleUsed,
+                    ruleOrFactId,
+                    usedAfter,
+                    nullptr,
+                    "runtime dialogue trigger usage after",
+                    &reason);
+            }
+            ok = callOk && usedAfter;
+            commandDetail =
+                "entity=" + std::to_string(target->GetId()) +
+                ",guid=" + std::to_string(target->GetGuid()) +
+                ",rule=" + std::to_string(ruleOrFactId) +
+                ",usedBefore=" + std::to_string(usedBefore ? 1 : 0) +
+                ",usedAfter=" + std::to_string(usedAfter ? 1 : 0) +
+                ",conversation=" + PointerHex(conversation) +
+                ",reason=" + StatusToken(reason.empty() ? std::string("-") : reason);
+        }
+        else
+        {
+            bool found = false;
+            uint64_t numberBits = 0;
+            double number = 0.0;
+            std::string stringValue;
+            size_t memoryCount = 0;
+            std::string reason;
+            const bool readOk = TryGuardedCall(
+                "runtime dialogue memory probe",
+                [speaker, ruleOrFactId, &found, &numberBits, &number, &stringValue, &memoryCount]()
+                {
+                    memoryCount = speaker->m_memory.size();
+                    const auto it = std::lower_bound(
+                        speaker->m_memory.begin(),
+                        speaker->m_memory.end(),
+                        ruleOrFactId,
+                        [](const ArkResponseFact& fact, uint64_t id)
+                        {
+                            return fact.key < id;
+                        });
+                    found = it != speaker->m_memory.end() &&
+                        it->key == ruleOrFactId;
+                    if (found)
+                    {
+                        numberBits = it->value.num.integer;
+                        number = it->value.num.fp;
+                        stringValue = it->value.str.c_str();
+                    }
+                    return true;
+                },
+                ok,
+                &reason) && ok;
+            ok = readOk;
+            std::ostringstream probe;
+            probe << std::setprecision(17)
+                << "entity=" << target->GetId()
+                << ",guid=" << target->GetGuid()
+                << ",fact=" << ruleOrFactId
+                << ",present=" << (found ? 1 : 0)
+                << ",numberBits=" << numberBits
+                << ",number=" << number
+                << ",string=" << StatusToken(stringValue.empty() ? std::string("-") : stringValue)
+                << ",memory=" << memoryCount
+                << ",reason=" << StatusToken(reason.empty() ? std::string("-") : reason);
+            commandDetail = probe.str();
+        }
+    }
+    else if (command == "coop_player_interaction_probe" ||
+        command == "coop_player_interact_target")
+    {
+        const bool perform = command == "coop_player_interact_target";
+        action = perform
+            ? "player_interact_target"
+            : "player_interaction_probe";
+
+        ArkPlayer* player = ArkPlayer::GetInstancePtr();
+        IEntity* playerEntity = player ? player->GetEntity() : nullptr;
+        std::string targetDetail;
+        IEntity* target = args.empty()
+            ? nullptr
+            : ResolveRuntimeEntityTarget(args.front(), targetDetail);
+        std::string reason;
+        std::array<ArkInteractionInfo, 4> interactionInfo = {};
+        bool populated = false;
+        const bool populateCallOk =
+            player && playerEntity && target &&
+            TryGuardedCall(
+                "runtime player interaction PopulateInteractionInfo",
+                [target, &interactionInfo]()
+                {
+                    return ArkPlayerInteraction::PopulateInteractionInfo(
+                        target,
+                        interactionInfo);
+                },
+                populated,
+                &reason);
+
+        std::array<ArkInteractionTestResult, 4> testResults = {};
+        std::array<bool, 4> testCallOk = {};
+        if (populateCallOk && populated)
+        {
+            for (size_t modeIndex = 0;
+                 modeIndex < interactionInfo.size();
+                 ++modeIndex)
+            {
+                testCallOk[modeIndex] = TryGuardedCall(
+                    "runtime player interaction TestInteractionType",
+                    [player, target, modeIndex, &interactionInfo]()
+                    {
+                        return player->m_interaction.TestInteractionType(
+                            target,
+                            static_cast<EArkInteractionMode>(modeIndex),
+                            interactionInfo[modeIndex]);
+                    },
+                    testResults[modeIndex],
+                    &reason);
+            }
+        }
+
+        bool interactionInvoked = false;
+        if (perform && populateCallOk && populated &&
+            interactionInfo[0].m_interactionType !=
+                EArkInteractionType::none &&
+            testCallOk[0] && testResults[0].m_bPassedTest)
+        {
+            interactionInvoked = TryGuardedVoidCall(
+                "runtime player interaction PerformInteraction",
+                [player, target, &interactionInfo]()
+                {
+                    player->m_interaction.PerformInteraction(
+                        interactionInfo[0].m_interactionType,
+                        EArkInteractionMode::use,
+                        target,
+                        0.0f);
+                },
+                &reason);
+        }
+
+        std::ostringstream interactionStatus;
+        interactionStatus
+            << "player_interaction_target_"
+            << (target ? target->GetId() : INVALID_ENTITYID)
+            << "_resolved_" << (target ? 1 : 0)
+            << "_populated_" << (populated ? 1 : 0)
+            << "_invoked_" << (interactionInvoked ? 1 : 0);
+        for (size_t modeIndex = 0;
+             modeIndex < interactionInfo.size();
+             ++modeIndex)
+        {
+            interactionStatus
+                << "_m" << modeIndex
+                << "t" << static_cast<int>(
+                    interactionInfo[modeIndex].m_interactionType)
+                << "p" << (testCallOk[modeIndex] &&
+                    testResults[modeIndex].m_bPassedTest ? 1 : 0)
+                << "h" << (testCallOk[modeIndex] &&
+                    testResults[modeIndex].m_bHideLine ? 1 : 0);
+        }
+        interactionStatus
+            << "_target_" << StatusToken(
+                targetDetail.empty() ? std::string("-") : targetDetail)
+            << "_reason_" << StatusToken(
+                reason.empty() ? std::string("-") : reason);
+        m_lastRuntimeInteropEvent = interactionStatus.str();
+        LogCoop(m_lastRuntimeInteropEvent);
+
+        ok = populateCallOk && populated &&
+            (!perform || interactionInvoked);
     }
     else if (command == "coop_repair_huge_physics_bounds" || command == "coop_repair_physics_bounds")
     {
@@ -49101,6 +51100,8 @@ void ModMain::ResetStoryEventState(const char* lastEvent)
     m_lastStoryEvent = lastEvent ? lastEvent : "-";
     m_appliedStoryEventIds.clear();
     m_storyRemoteEventCounts.clear();
+    m_pendingDialogueWritebacks.clear();
+    m_pendingDialogueWritebackRetrySeconds = 0.0f;
     m_applyingRemoteStoryEvent = false;
 }
 
@@ -54899,6 +56900,38 @@ bool ModMain::BuildEnemyDamageRequestPacket(
     if (enemyNetId == 0)
         return false;
 
+    // Death is terminal for one enemy-roster generation. Late contact with a
+    // corpse must not become another authority damage request while a Mimic
+    // is asynchronously building its native breakup and loot presentation.
+    bool terminalDeathKnown =
+        m_enemyDeathPresentations.find(enemyNetId) != m_enemyDeathPresentations.end() ||
+        m_pendingEnemyDeathCommits.find(enemyNetId) != m_pendingEnemyDeathCommits.end();
+    if (const auto authorityIt = m_enemyAuthorities.find(enemyNetId);
+        authorityIt != m_enemyAuthorities.end())
+    {
+        terminalDeathKnown = terminalDeathKnown ||
+            authorityIt->second.sentDeadState ||
+            (authorityIt->second.localDeathPresentationEpochSent != 0 &&
+                authorityIt->second.localDeathPresentationEpochSent == authorityIt->second.authorityEpoch);
+    }
+    if (const auto puppetIt = m_enemyPuppets.find(enemyNetId);
+        puppetIt != m_enemyPuppets.end())
+    {
+        terminalDeathKnown = terminalDeathKnown || puppetIt->second.dead;
+    }
+    if (const auto rosterIt = m_enemyRosterByNetId.find(enemyNetId);
+        rosterIt != m_enemyRosterByNetId.end())
+    {
+        terminalDeathKnown = terminalDeathKnown ||
+            (rosterIt->second.flags & CoopProtocol::kEnemyRosterFlagAlive) == 0;
+    }
+    if (terminalDeathKnown)
+    {
+        m_lastEnemyDamageEvent =
+            "suppressed corpse damage request net=" + std::to_string(enemyNetId);
+        return false;
+    }
+
     const auto signalIt = m_pendingEnemyDamageSignals.find(targetId);
     if (signalIt == m_pendingEnemyDamageSignals.end() ||
         signalIt->second.packageId != damagePackageId ||
@@ -55286,6 +57319,13 @@ bool ModMain::BuildAreaObjectEventPacket(
     {
         return false;
     }
+    if (eventKind == CoopProtocol::kAreaObjectEventHelicopterPassengerStart &&
+        (targetGuid != kCoopSimulationLabsHelicopterUsePromptGuid ||
+            value != 1 || flags != 0 || count != 0 ||
+            (textValue && textValue[0])))
+    {
+        return false;
+    }
     if ((eventKind == CoopProtocol::kAreaObjectEventKioskButtonState ||
             eventKind == CoopProtocol::kAreaObjectEventKioskButtonPressed ||
             eventKind ==
@@ -55374,7 +57414,8 @@ bool ModMain::BuildAreaObjectEventPacket(
     else if (eventKind == CoopProtocol::kAreaObjectEventContainerOpen)
         packet.targetClassHash = HashStoryString("ArkInventory");
     else if (eventKind == CoopProtocol::kAreaObjectEventInteractiveObjectActive ||
-        eventKind == CoopProtocol::kAreaObjectEventInteractiveObjectDisabled)
+        eventKind == CoopProtocol::kAreaObjectEventInteractiveObjectDisabled ||
+        eventKind == CoopProtocol::kAreaObjectEventHelicopterPassengerStart)
         packet.targetClassHash = HashStoryString("ArkInteractiveObject");
     else if (eventKind == CoopProtocol::kAreaObjectEventSwitchOn)
         packet.targetClassHash = HashStoryString("ArkSwitch");
@@ -55387,6 +57428,8 @@ bool ModMain::BuildAreaObjectEventPacket(
         packet.targetClassHash = HashStoryString("ArkRotator");
     else if (eventKind == CoopProtocol::kAreaObjectEventBreakableHealth)
         packet.targetClassHash = HashStoryString("ArkBreakable");
+    else if (eventKind == CoopProtocol::kAreaObjectEventBreakableGlassImpact)
+        packet.targetClassHash = HashStoryString("BreakableGlass");
     else if (eventKind == CoopProtocol::kAreaObjectEventLevelGameTokenBool ||
         eventKind == CoopProtocol::kAreaObjectEventLevelGameTokenInt ||
         eventKind == CoopProtocol::kAreaObjectEventLevelGameTokenString)
@@ -56088,18 +58131,54 @@ void ModMain::OnLocalStoryConversationStatusChanged(
     bool changed,
     const char* reason)
 {
-    if (!changed || !IsLocalStoryResponseManager(manager))
-        return;
-
-    if (!IsValidStoryConversationStatus(status))
+    if (!changed ||
+        !IsLocalStoryResponseManager(manager) ||
+        !IsValidStoryConversationStatus(status) ||
+        ShouldSuppressDialogueStoryEvent(id))
     {
-        m_lastStoryEvent =
-            "story_event_skip_unknown_conversation_status_" + std::to_string(status) +
-            "_target_" + std::to_string(id);
         return;
     }
 
-    QueueLocalStoryEventForHook(CoopProtocol::kStoryEventConversationStatus, id, status, 0, reason);
+    const auto conversationStatus =
+        static_cast<EArkConversationStatus>(status);
+
+    // started/interrupted/not_started are process-local presentation state.
+    if (conversationStatus !=
+        EArkConversationStatus::completed)
+    {
+        m_lastStoryEvent =
+            "story_event_kept_transient_conversation_status_local_" +
+            std::to_string(status) +
+            "_target_" +
+            std::to_string(id);
+
+        return;
+    }
+
+    // A Client may commit completion only for the dialogue lease it owns.
+    if (m_networkMode == CoopNetworkMode::Client)
+    {
+        const bool ownsLease =
+            m_dialogueLeaseDialogueId == id &&
+            m_dialogueLeaseOwnerHash ==
+                GetLocalAccountToken() &&
+            m_dialogueLeaseSeconds > 0.0f;
+
+        if (!ownsLease)
+        {
+            m_lastStoryEvent =
+                "story_event_skip_unowned_conversation_completion_" +
+                std::to_string(id);
+            return;
+        }
+    }
+
+    QueueLocalStoryEventForHook(
+        CoopProtocol::kStoryEventConversationStatus,
+        id,
+        status,
+        0,
+        reason);
 }
 
 void ModMain::OnLocalStoryGlobalBoolChanged(IGameToken* token, bool value, bool changed, const char* reason)
@@ -56241,9 +58320,13 @@ void ModMain::OnLocalStoryResponseUsageChanged(
     uint64_t id,
     uint16_t flags,
     bool changed,
-    const char* reason)
+    const char* reason,
+    ArkSpeakerBase* speaker,
+    int paChannel)
 {
-    if (!changed || !IsLocalStoryResponseManager(manager))
+    if (!changed ||
+        !IsLocalStoryResponseManager(manager) ||
+        IsReplayingRemoteDialogue())
         return;
 
     if (!IsStoryResponseUsageEventKind(eventKind))
@@ -56254,7 +58337,42 @@ void ModMain::OnLocalStoryResponseUsageChanged(
         return;
     }
 
-    QueueLocalStoryEventForHook(eventKind, id, 1, flags, reason);
+    uint64_t speakerEntityGuid = 0;
+    uint64_t speakerCharacterId = 0;
+    uint16_t speakerIdentityFlags = 0;
+    int32_t resolvedPaChannel = paChannel;
+    std::string captureDetail;
+    if (eventKind == CoopProtocol::kStoryEventResponseRuleUsed &&
+        (flags & CoopProtocol::kStoryEventFlagResponseWriteback) != 0 &&
+        !CaptureDialogueSpeakerIdentity(
+            speaker,
+            paChannel,
+            speakerEntityGuid,
+            speakerCharacterId,
+            speakerIdentityFlags,
+            resolvedPaChannel,
+            captureDetail))
+    {
+        m_lastStoryEvent =
+            "story_event_skip_response_writeback_missing_speaker_target_" +
+            std::to_string(id) + "_reason_" +
+            StatusToken(captureDetail.empty() ? std::string("-") : captureDetail);
+        ++m_storyEventFailures;
+        LogCoop(m_lastStoryEvent);
+        return;
+    }
+
+    QueueLocalStoryEventForHook(
+        eventKind,
+        id,
+        1,
+        flags,
+        reason,
+        nullptr,
+        speakerEntityGuid,
+        speakerCharacterId,
+        speakerIdentityFlags,
+        resolvedPaChannel);
 }
 
 void ModMain::OnLocalStoryConditionStateChanged(
@@ -56450,8 +58568,15 @@ bool ModMain::QueueLocalStoryEventForHook(
     int32_t count,
     uint16_t flags,
     const char* reason,
-    const char* textValue)
+    const char* textValue,
+    uint64_t contextEntityGuid,
+    uint64_t contextCharacterId,
+    uint16_t contextFlags,
+    int32_t contextChannel)
 {
+    if (IsReplayingRemoteDialogue())
+        return false;
+
     const bool classifiedStoryKind =
         eventKind >= CoopProtocol::kStoryEventGrantKeycard &&
         eventKind <= CoopProtocol::kStoryEventGlobalString;
@@ -56507,6 +58632,11 @@ bool ModMain::QueueLocalStoryEventForHook(
             "_target_" + std::to_string(targetId);
         return false;
     }
+
+    packet.contextEntityGuid = contextEntityGuid;
+    packet.contextCharacterId = contextCharacterId;
+    packet.contextFlags = contextFlags;
+    packet.contextChannel = contextChannel;
 
     if (!SendStoryEventTo(packet, m_remoteAddress, m_remotePort, "story event send failed"))
     {
@@ -56837,6 +58967,22 @@ void ModMain::OnLocalAreaObjectInteractiveObjectStateChanged(
         return;
     }
     QueueLocalAreaObjectEventForHook(eventKind, guid, value ? 1u : 0u, 0, reason);
+}
+
+void ModMain::OnLocalNpcPerformedNoticeChanged(
+    ArkNpc* npc,
+    uint64_t npcGuid,
+    bool performedNotice,
+    const char* reason)
+{
+    (void)npc;
+
+    QueueLocalAreaObjectEventForHook(
+        CoopProtocol::kAreaObjectEventNpcPerformedNotice,
+        npcGuid,
+        performedNotice ? 1u : 0u,
+        0,
+        reason);
 }
 
 void ModMain::OnLocalAreaObjectSwitchStateChanged(
@@ -57327,6 +59473,16 @@ void ModMain::OnLocalAreaObjectGenericElevatorKioskButtonPressed(
     }
 }
 
+void ModMain::OnLocalHelicopterPassengerStartForHook(const char* reason)
+{
+    QueueLocalAreaObjectEventForHook(
+        CoopProtocol::kAreaObjectEventHelicopterPassengerStart,
+        kCoopSimulationLabsHelicopterUsePromptGuid,
+        1,
+        0,
+        reason);
+}
+
 void ModMain::OnLocalAreaObjectKioskButtonStateChanged(
     ArkKiosk* kiosk,
     int button,
@@ -57507,8 +59663,12 @@ bool ModMain::ShouldRouteLocalKioskPressToAreaAuthorityForHook(
             &entityGuid,
             &detail);
         if (stableId == kCoopLobbyMainLiftKioskGuid ||
-            entityGuid == kCoopLobbyMainLiftKioskGuid)
+            entityGuid == kCoopLobbyMainLiftKioskGuid ||
+            IsNativeFanoutGenericElevatorKiosk(stableId, entityGuid))
         {
+            // These authored movers need the process-local Vanilla graph on
+            // the physically interacting peer. The reliable button command
+            // remains the one-shot/deduplication source for all other peers.
             return false;
         }
         return true;
@@ -59329,6 +61489,131 @@ bool ModMain::ApplyAreaObjectWorldItemRemoved(uint64_t targetGuid, std::string& 
 
 bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPacket& packet, std::string& detail)
 {
+    if (packet.eventKind == CoopProtocol::kAreaObjectEventNpcPerformedNotice)
+    {
+        if (packet.value > 1 || !gEnv || !gEnv->pEntitySystem)
+        {
+            detail = "invalid_npc_notice_event";
+            return false;
+        }
+
+        EntityId entityId = INVALID_ENTITYID;
+        std::string reason;
+
+        const bool found =
+            TryGuardedCall(
+                "npc notice FindEntityByGuid",
+                [&packet]()
+                {
+                    return gEnv->pEntitySystem->FindEntityByGuid(
+                        static_cast<EntityGUID>(
+                            packet.targetGuid));
+                },
+                entityId,
+                &reason) &&
+            entityId != INVALID_ENTITYID;
+
+        if (!found)
+        {
+            detail =
+                "missing_npc_notice_guid_" +
+                std::to_string(packet.targetGuid);
+            return false;
+        }
+
+        IEntity* entity = nullptr;
+
+        if (!TryGuardedCall(
+                "npc notice GetEntity",
+                [entityId]()
+                {
+                    return gEnv->pEntitySystem->GetEntity(
+                        entityId);
+                },
+                entity,
+                &reason) ||
+            !entity)
+        {
+            detail =
+                "missing_npc_notice_entity_" +
+                std::to_string(entityId);
+            return false;
+        }
+
+        ArkNpc* npc = nullptr;
+
+        if (!TryGuardedCall(
+                "npc notice GetArkNpc",
+                [entity]()
+                {
+                    return EntityUtils::GetArkNpc(entity);
+                },
+                npc,
+                &reason) ||
+            !npc)
+        {
+            detail =
+                "missing_npc_notice_extension_" +
+                std::to_string(entityId);
+            return false;
+        }
+
+        const bool desired = packet.value != 0;
+        bool before = false;
+        bool after = false;
+
+        TryGuardedCall(
+            "npc notice before",
+            [npc]()
+            {
+                return npc->HasPerformedNotice();
+            },
+            before,
+            &reason);
+
+        if (before == desired)
+        {
+            detail =
+                "already_npc_notice_" +
+                std::to_string(desired ? 1 : 0);
+            return true;
+        }
+
+        const bool callOk =
+            TryGuardedVoidCall(
+                "npc notice SetHasPerformedNotice",
+                [npc, desired]()
+                {
+                    npc->SetHasPerformedNotice(desired);
+                },
+                &reason);
+
+        TryGuardedCall(
+            "npc notice after",
+            [npc]()
+            {
+                return npc->HasPerformedNotice();
+            },
+            after,
+            &reason);
+
+        detail =
+            callOk && after == desired
+                ? "applied_npc_notice_" +
+                    std::to_string(desired ? 1 : 0)
+                : "failed_npc_notice_" +
+                    std::to_string(desired ? 1 : 0) +
+                    "_after_" +
+                    std::to_string(after ? 1 : 0) +
+                    "_reason_" +
+                    StatusToken(
+                        reason.empty()
+                            ? std::string("-")
+                            : reason);
+
+        return callOk && after == desired;
+    }
+
     if (packet.eventKind == CoopProtocol::kAreaObjectEventLevelGameTokenBool ||
         packet.eventKind == CoopProtocol::kAreaObjectEventLevelGameTokenInt ||
         packet.eventKind == CoopProtocol::kAreaObjectEventLevelGameTokenString)
@@ -59484,6 +61769,9 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
 
     if (packet.eventKind == CoopProtocol::kAreaObjectEventBreakableHealth)
         return ApplyAreaObjectBreakableHealth(packet.targetGuid, packet.value, detail);
+
+    if (packet.eventKind == CoopProtocol::kAreaObjectEventBreakableGlassImpact)
+        return ApplyAreaObjectBreakableGlassImpact(packet, detail);
 
     if (packet.eventKind == CoopProtocol::kAreaObjectEventWorkstationLocked)
     {
@@ -60118,11 +62406,18 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
         const bool localAreaAuthority =
             m_networkMode == CoopNetworkMode::Host ||
             IsClientAreaAuthorityActive();
-        if (m_applyingRemoteAreaObjectEvent && !localAreaAuthority)
+        const bool nativeFanoutObserver =
+            m_applyingRemoteAreaObjectEvent &&
+            !localAreaAuthority &&
+            IsNativeFanoutGenericElevatorKiosk(packet.targetGuid, guid);
+        if (m_applyingRemoteAreaObjectEvent &&
+            !localAreaAuthority &&
+            !nativeFanoutObserver)
         {
-            // The button press is an input for the current Area Authority.
-            // Observers receive kiosk state and the resulting elevator transit
-            // as presentation commits instead of running the mission graph.
+            // Most elevator kiosk inputs run only on Area Authority. Observers
+            // consume their typed kiosk/door/transit outcomes. A small allowlist
+            // is different: its native graph owns local moving geometry that
+            // has no typed presentation packet.
             detail =
                 "accepted_generic_elevator_kiosk_button_press_observer_" +
                 std::to_string(packet.count) +
@@ -60163,19 +62458,28 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
         bool activationResult = false;
         const bool eventCallOk = TryGuardedCall(
             "area object apply generic elevator kiosk DispatchScriptOutputEvent",
-            [outputEntity, output]()
+            [outputEntity, output, nativeFanoutObserver]()
             {
-                return s_funcArkEntityDispatchScriptOutputEvent(
-                    outputEntity, output);
+                // Calling the patched entry on a non-authority Client would be
+                // routed/suppressed again by our own hook. InvokeOrig preserves
+                // the exact Vanilla FlowGraph output for this observer replay.
+                return nativeFanoutObserver
+                    ? s_hookArkEntityDispatchScriptOutputEvent.InvokeOrig(
+                        outputEntity, output)
+                    : s_funcArkEntityDispatchScriptOutputEvent(
+                        outputEntity, output);
             },
             eventResult,
             &reason);
         const bool activationCallOk = eventCallOk && TryGuardedCall(
             "area object apply generic elevator kiosk ActivateScriptOutput",
-            [outputEntity, scriptTable, output]()
+            [outputEntity, scriptTable, output, nativeFanoutObserver]()
             {
-                return s_funcArkEntityActivateScriptOutput(
-                    outputEntity, scriptTable, output);
+                return nativeFanoutObserver
+                    ? s_hookArkEntityActivateScriptOutput.InvokeOrig(
+                        outputEntity, scriptTable, output)
+                    : s_funcArkEntityActivateScriptOutput(
+                        outputEntity, scriptTable, output);
             },
             activationResult,
             &reason);
@@ -60186,6 +62490,8 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
                 "_id_" + std::to_string(entityId) +
                 "_guid_" + std::to_string(guid) +
                 "_dist_" + std::to_string(distance) +
+                "_nativeFanout_" +
+                    std::to_string(nativeFanoutObserver ? 1 : 0) +
                 "_eventResult_" + std::to_string(eventResult ? 1 : 0) +
                 "_activationResult_" +
                     std::to_string(activationResult ? 1 : 0))
@@ -61290,6 +63596,78 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
         return applied;
     }
 
+    if (packet.eventKind ==
+        CoopProtocol::kAreaObjectEventHelicopterPassengerStart)
+    {
+        if (packet.targetGuid !=
+                kCoopSimulationLabsHelicopterUsePromptGuid ||
+            packet.targetClassHash !=
+                HashStoryString("ArkInteractiveObject") ||
+            packet.value != 1 || packet.count != 0 || packet.flags != 0)
+        {
+            detail = "invalid_helicopter_passenger_start_payload";
+            return false;
+        }
+
+        IEntityClass* entityClass = nullptr;
+        const char* className = nullptr;
+        if (!TryGuardedCall(
+                "helicopter passenger GetClass",
+                [entity]() { return entity->GetClass(); },
+                entityClass,
+                &reason) ||
+            !entityClass ||
+            !TryGuardedCall(
+                "helicopter passenger class GetName",
+                [entityClass]() { return entityClass->GetName(); },
+                className,
+                &reason) ||
+            !className ||
+            std::strcmp(className, "ArkInteractiveObject") != 0)
+        {
+            detail =
+                "invalid_helicopter_passenger_start_identity_guid_" +
+                std::to_string(packet.targetGuid);
+            return false;
+        }
+
+        IScriptTable* scriptTable = nullptr;
+        bool eventResult = false;
+        bool activationResult = false;
+        const bool identitiesOk = TryGuardedCall(
+            "helicopter passenger script table",
+            [entity]() { return entity->GetScriptTable(); },
+            scriptTable,
+            &reason) && scriptTable;
+        const bool eventOk = identitiesOk && TryGuardedCall(
+            "helicopter passenger DispatchScriptOutputEvent",
+            [entity]()
+            {
+                return s_hookArkEntityDispatchScriptOutputEvent.InvokeOrig(
+                    entity, "Activated");
+            },
+            eventResult,
+            &reason);
+        const bool activationOk = eventOk && TryGuardedCall(
+            "helicopter passenger ActivateScriptOutput",
+            [entity, scriptTable]()
+            {
+                return s_hookArkEntityActivateScriptOutput.InvokeOrig(
+                    entity, scriptTable, "Activated");
+            },
+            activationResult,
+            &reason);
+        const bool applied = eventOk && activationOk;
+        detail = std::string(applied ? "applied" : "failed") +
+            "_helicopter_passenger_start_id_" +
+            std::to_string(entityId) +
+            "_event_" + std::to_string(eventResult ? 1 : 0) +
+            "_activation_" + std::to_string(activationResult ? 1 : 0) +
+            "_reason_" +
+            StatusToken(reason.empty() ? std::string("-") : reason);
+        return applied;
+    }
+
     if (packet.eventKind == CoopProtocol::kAreaObjectEventInteractiveObjectActive ||
         packet.eventKind == CoopProtocol::kAreaObjectEventInteractiveObjectDisabled)
     {
@@ -62098,6 +64476,7 @@ bool ModMain::ApplyStoryEventMutation(const CoopProtocol::StoryEventPacket& pack
         return ok && knownAfter && activeAfter;
     }
 
+
     if (packet.eventKind == CoopProtocol::kStoryEventConversationStatus)
     {
         ArkResponseManager* manager = GetStoryResponseManager();
@@ -62108,9 +64487,10 @@ bool ModMain::ApplyStoryEventMutation(const CoopProtocol::StoryEventPacket& pack
         }
 
         const int desiredStatus = packet.count;
-        if (!IsValidStoryConversationStatus(desiredStatus))
+        if (!IsValidStoryConversationStatus(desiredStatus) ||
+            static_cast<EArkConversationStatus>(desiredStatus) != EArkConversationStatus::completed)
         {
-            detail = "invalid_conversation_status_" + std::to_string(desiredStatus);
+            detail = "invalid_or_transient_conversation_status_" + std::to_string(desiredStatus);
             return false;
         }
 
@@ -62182,6 +64562,61 @@ bool ModMain::ApplyStoryEventMutation(const CoopProtocol::StoryEventPacket& pack
             return true;
         }
 
+        uint32_t appliedWritebackFacts = 0;
+        if (packet.eventKind == CoopProtocol::kStoryEventResponseRuleUsed &&
+            (packet.flags & CoopProtocol::kStoryEventFlagResponseWriteback) != 0)
+        {
+            ArkResponseRule* rule = nullptr;
+            if (!TryGuardedCall(
+                    "story apply response FindRuleByID",
+                    [manager, &packet]()
+                    {
+                        return manager->FindRuleByID(packet.targetId);
+                    },
+                    rule,
+                    &reason) ||
+                !rule)
+            {
+                detail =
+                    "missing_response_writeback_rule_" +
+                    std::to_string(packet.targetId) +
+                    "_reason_" +
+                    StatusToken(reason.empty() ? std::string("-") : reason);
+                return false;
+            }
+
+            std::string speakerDetail;
+            ArkSpeakerBase* speaker = ResolveDialogueSpeaker(
+                packet.contextEntityGuid,
+                packet.contextCharacterId,
+                packet.contextFlags,
+                packet.contextChannel,
+                speakerDetail);
+            if (!speaker)
+            {
+                detail =
+                    "missing_response_writeback_speaker_" +
+                    StatusToken(speakerDetail.empty() ? std::string("-") : speakerDetail);
+                return false;
+            }
+
+            if (!TryApplyStoryResponseWriteback(
+                    speaker,
+                    rule,
+                    GetNowSeconds(),
+                    appliedWritebackFacts,
+                    &reason) ||
+                appliedWritebackFacts == 0)
+            {
+                detail =
+                    "failed_response_writeback_facts_" +
+                    std::to_string(appliedWritebackFacts) +
+                    "_reason_" +
+                    StatusToken(reason.empty() ? std::string("-") : reason);
+                return false;
+            }
+        }
+
         const bool ok = TryMarkStoryResponseUsage(
             manager,
             packet.eventKind,
@@ -62200,7 +64635,8 @@ bool ModMain::ApplyStoryEventMutation(const CoopProtocol::StoryEventPacket& pack
             &reason);
         detail = ok && after
             ? (packet.eventKind == CoopProtocol::kStoryEventResponseRuleUsed
-                ? "applied_response_rule_used"
+                ? "applied_response_rule_used_writeback_" +
+                    std::to_string(appliedWritebackFacts)
                 : "applied_response_used")
             : (packet.eventKind == CoopProtocol::kStoryEventResponseRuleUsed
                 ? "failed_response_rule_used_"
@@ -62319,12 +64755,22 @@ bool ModMain::ApplyStoryEventMutation(const CoopProtocol::StoryEventPacket& pack
             ? static_cast<uint32_t>(packet.count)
             : 1u;
         const uint32_t beforeCount = m_storyRemoteEventCounts[packet.targetId];
-        const string eventName(entry->name);
         std::string reason;
-        const bool ok = TryGuardedVoidCall(
-            "story apply ExecuteRemoteEvent",
-            [manager, &eventName]() { manager->ExecuteRemoteEvent(eventName); },
-            &reason);
+        bool ok = false;
+        if (entry->name && *entry->name)
+        {
+            const string eventName(entry->name);
+            ok = TryGuardedVoidCall(
+                "story apply ExecuteRemoteEvent",
+                [manager, &eventName]() { manager->ExecuteRemoteEvent(eventName); },
+                &reason);
+        }
+        else
+        {
+            ok = ActivateRegisteredStoryRemoteEventById(
+                entry->id,
+                reason);
+        }
         if (ok)
         {
             m_storyRemoteEventCounts[packet.targetId] =
@@ -62897,7 +65343,8 @@ bool ModMain::ApplyStoryEventMutation(const CoopProtocol::StoryEventPacket& pack
     return false;
 }
 
-void ModMain::HandleStoryEvent(const CoopProtocol::StoryEventPacket& packet)
+void ModMain::HandleStoryEvent(
+    const CoopProtocol::StoryEventPacket& packet)
 {
     ++m_receivedStoryEventPackets;
 
@@ -62908,69 +65355,186 @@ void ModMain::HandleStoryEvent(const CoopProtocol::StoryEventPacket& packet)
         return;
     }
 
-    if (packet.worldEpoch != 0 && packet.worldEpoch != m_localWorldEpoch)
+    if (packet.worldEpoch != 0 &&
+        packet.worldEpoch != m_localWorldEpoch)
     {
         ++m_droppedStoryEventPackets;
         m_lastStoryEvent =
-            "drop_story_event_old_world_event_" + std::to_string(packet.eventId) +
-            "_packet_" + std::to_string(packet.worldEpoch) +
-            "_local_" + std::to_string(m_localWorldEpoch);
+            "drop_story_event_old_world_event_" +
+            std::to_string(packet.eventId) +
+            "_packet_" +
+            std::to_string(packet.worldEpoch) +
+            "_local_" +
+            std::to_string(m_localWorldEpoch);
         return;
     }
 
-    const uint64_t localSaveHash = CurrentHostSaveKeyHash();
-    if (packet.hostSaveKeyHash != 0 && localSaveHash != 0 &&
-        !IsCurrentOrRecentHostSaveKeyHash(packet.hostSaveKeyHash))
+    const uint64_t localSaveHash =
+        CurrentHostSaveKeyHash();
+
+    if (packet.hostSaveKeyHash != 0 &&
+        localSaveHash != 0 &&
+        !IsCurrentOrRecentHostSaveKeyHash(
+            packet.hostSaveKeyHash))
     {
         ++m_droppedStoryEventPackets;
         m_lastStoryEvent =
-            "drop_story_event_wrong_save_event_" + std::to_string(packet.eventId) +
-            "_packet_" + std::to_string(packet.hostSaveKeyHash) +
-            "_local_" + std::to_string(localSaveHash);
+            "drop_story_event_wrong_save_event_" +
+            std::to_string(packet.eventId) +
+            "_packet_" +
+            std::to_string(packet.hostSaveKeyHash) +
+            "_local_" +
+            std::to_string(localSaveHash);
         return;
     }
 
-    if (packet.eventId != 0 && m_appliedStoryEventIds.find(packet.eventId) != m_appliedStoryEventIds.end())
+    if (packet.eventId != 0 &&
+        m_appliedStoryEventIds.find(packet.eventId) !=
+            m_appliedStoryEventIds.end())
     {
         ++m_duplicateStoryEventPackets;
         m_lastStoryEvent =
-            "duplicate_story_event_" + std::to_string(packet.eventId) +
-            "_kind_" + std::to_string(packet.eventKind) +
-            "_target_" + std::to_string(packet.targetId);
+            "duplicate_story_event_" +
+            std::to_string(packet.eventId) +
+            "_kind_" +
+            std::to_string(packet.eventKind) +
+            "_target_" +
+            std::to_string(packet.targetId);
         return;
     }
 
+    // A remote peer may commit conversation completion only
+    // while owning the corresponding dialogue lease.
+    if (packet.eventKind ==
+            CoopProtocol::kStoryEventConversationStatus &&
+        m_networkMode == CoopNetworkMode::Host &&
+        m_activePacketSourceAccountToken != 0)
+    {
+        const bool validCompletion =
+            packet.count ==
+                static_cast<int32_t>(
+                    EArkConversationStatus::completed) &&
+            packet.targetId ==
+                m_dialogueLeaseDialogueId &&
+            m_dialogueLeaseOwnerHash ==
+                m_activePacketSourceAccountToken &&
+            m_dialogueLeaseSeconds > 0.0f;
+
+        if (!validCompletion)
+        {
+            ++m_droppedStoryEventPackets;
+            m_lastStoryEvent =
+                "drop_unowned_conversation_status"
+                "_source_" +
+                std::to_string(
+                    m_activePacketSourceAccountToken) +
+                "_target_" +
+                std::to_string(packet.targetId) +
+                "_status_" +
+                std::to_string(packet.count);
+
+            LogCoop(m_lastStoryEvent);
+            return;
+        }
+    }
+
     std::string detail;
+
     m_applyingRemoteStoryEvent = true;
-    const bool applied = ApplyStoryEventMutation(packet, detail);
+    const bool applied =
+        ApplyStoryEventMutation(packet, detail);
     m_applyingRemoteStoryEvent = false;
 
     if (!applied)
     {
+        const bool missingDialogueSpeaker =
+            packet.eventKind ==
+                CoopProtocol::kStoryEventResponseRuleUsed &&
+            (packet.flags &
+                CoopProtocol::kStoryEventFlagResponseWriteback) != 0 &&
+            detail.rfind(
+                "missing_response_writeback_speaker_",
+                0) == 0;
+        if (missingDialogueSpeaker)
+        {
+            const auto alreadyPending = std::find_if(
+                m_pendingDialogueWritebacks.begin(),
+                m_pendingDialogueWritebacks.end(),
+                [&packet](const CoopProtocol::StoryEventPacket& pending)
+                {
+                    return packet.eventId != 0
+                        ? pending.eventId == packet.eventId
+                        : pending.targetId == packet.targetId &&
+                            pending.sourcePeerHash == packet.sourcePeerHash;
+                });
+            if (alreadyPending ==
+                m_pendingDialogueWritebacks.end())
+            {
+                static constexpr size_t
+                    kMaxPendingDialogueWritebacks = 64;
+                if (m_pendingDialogueWritebacks.size() >=
+                    kMaxPendingDialogueWritebacks)
+                {
+                    m_pendingDialogueWritebacks.pop_front();
+                    ++m_droppedStoryEventPackets;
+                    ++m_storyEventFailures;
+                }
+                m_pendingDialogueWritebacks.push_back(packet);
+            }
+            m_pendingDialogueWritebackRetrySeconds = 0.0f;
+            m_lastStoryEvent =
+                "deferred_story_event_" +
+                std::to_string(packet.eventId) +
+                "_kind_" +
+                std::to_string(packet.eventKind) +
+                "_target_" +
+                std::to_string(packet.targetId) +
+                "_detail_" + StatusToken(detail);
+            LogCoop(m_lastStoryEvent);
+            return;
+        }
+
         ++m_droppedStoryEventPackets;
         ++m_storyEventFailures;
         m_lastStoryEvent =
-            "failed_story_event_" + std::to_string(packet.eventId) +
-            "_kind_" + std::to_string(packet.eventKind) +
-            "_target_" + std::to_string(packet.targetId) +
-            "_detail_" + StatusToken(detail);
+            "failed_story_event_" +
+            std::to_string(packet.eventId) +
+            "_kind_" +
+            std::to_string(packet.eventKind) +
+            "_target_" +
+            std::to_string(packet.targetId) +
+            "_detail_" +
+            StatusToken(detail);
+
         LogCoop(m_lastStoryEvent);
         return;
     }
 
     if (packet.eventId != 0)
         m_appliedStoryEventIds.insert(packet.eventId);
-    m_storyRevision = std::max(m_storyRevision, packet.postVersion != 0 ? packet.postVersion : m_storyRevision + 1);
+
+    m_storyRevision = std::max(
+        m_storyRevision,
+        packet.postVersion != 0
+            ? packet.postVersion
+            : m_storyRevision + 1);
+
     m_lastStoryEventId = packet.eventId;
     ++m_appliedStoryEventPackets;
-    m_lastStoryEvent =
-        "applied_story_event_" + std::to_string(packet.eventId) +
-        "_kind_" + std::to_string(packet.eventKind) +
-        "_target_" + std::to_string(packet.targetId) +
-        "_rev_" + std::to_string(m_storyRevision) +
-        "_detail_" + StatusToken(detail);
-    LogCoop(m_lastStoryEvent);
 
+    m_lastStoryEvent =
+        "applied_story_event_" +
+        std::to_string(packet.eventId) +
+        "_kind_" +
+        std::to_string(packet.eventKind) +
+        "_target_" +
+        std::to_string(packet.targetId) +
+        "_rev_" +
+        std::to_string(m_storyRevision) +
+        "_detail_" +
+        StatusToken(detail);
+
+    LogCoop(m_lastStoryEvent);
 }
 
 void ModMain::FinalizeAppliedAreaObjectEvent(
@@ -63977,27 +66541,69 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
         }
         ActivateRemotePeerContext(packet.sourceAccountToken);
     }
-    const uint32_t areaObjectDropsBefore = m_droppedAreaObjectEventPackets;
-    const uint32_t enemyAbilityDropsBefore = m_droppedEnemyAbilityFxPackets;
-    const uint32_t enemyMannequinActionDropsBefore = m_droppedEnemyMannequinActionPackets;
-    const uint32_t enemyDeathPresentationDropsBefore = m_droppedEnemyDeathPresentationPackets;
-    HandleReliablePayload(packet.payloadType, packet.payload, packet.payloadSize);
+    const uint32_t storyDropsBefore =
+        m_droppedStoryEventPackets;
+    const uint32_t areaObjectDropsBefore =
+        m_droppedAreaObjectEventPackets;
+    const uint32_t enemyAbilityDropsBefore =
+        m_droppedEnemyAbilityFxPackets;
+    const uint32_t enemyMannequinActionDropsBefore =
+        m_droppedEnemyMannequinActionPackets;
+    const uint32_t enemyDeathPresentationDropsBefore =
+        m_droppedEnemyDeathPresentationPackets;
+
+    HandleReliablePayload(
+        packet.payloadType,
+        packet.payload,
+        packet.payloadSize);
+
+    const bool rejectedStoryEvent =
+        packet.payloadType ==
+            static_cast<uint16_t>(
+                CoopProtocol::PacketType::StoryEvent) &&
+        m_droppedStoryEventPackets !=
+            storyDropsBefore;
+
     const bool rejectedAreaObject =
-        packet.payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::AreaObjectEvent) &&
-        m_droppedAreaObjectEventPackets != areaObjectDropsBefore;
+        packet.payloadType ==
+            static_cast<uint16_t>(
+                CoopProtocol::PacketType::AreaObjectEvent) &&
+        m_droppedAreaObjectEventPackets !=
+            areaObjectDropsBefore;
+
     const bool rejectedEnemyAbility =
-        packet.payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::EnemyAbilityFxEvent) &&
-        m_droppedEnemyAbilityFxPackets != enemyAbilityDropsBefore;
+        packet.payloadType ==
+            static_cast<uint16_t>(
+                CoopProtocol::PacketType::EnemyAbilityFxEvent) &&
+        m_droppedEnemyAbilityFxPackets !=
+            enemyAbilityDropsBefore;
+
     const bool rejectedEnemyMannequinAction =
-        packet.payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::EnemyMannequinAction) &&
-        m_droppedEnemyMannequinActionPackets != enemyMannequinActionDropsBefore;
+        packet.payloadType ==
+            static_cast<uint16_t>(
+                CoopProtocol::PacketType::EnemyMannequinAction) &&
+        m_droppedEnemyMannequinActionPackets !=
+            enemyMannequinActionDropsBefore;
+
     const bool rejectedEnemyDeathPresentation =
-        packet.payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::EnemyDeathPresentation) &&
-        m_droppedEnemyDeathPresentationPackets != enemyDeathPresentationDropsBefore;
+        packet.payloadType ==
+            static_cast<uint16_t>(
+                CoopProtocol::PacketType::EnemyDeathPresentation) &&
+        m_droppedEnemyDeathPresentationPackets !=
+            enemyDeathPresentationDropsBefore;
+
     if (m_networkMode == CoopNetworkMode::Host &&
-        !rejectedAreaObject && !rejectedEnemyAbility && !rejectedEnemyMannequinAction &&
+        !rejectedStoryEvent &&
+        !rejectedAreaObject &&
+        !rejectedEnemyAbility &&
+        !rejectedEnemyMannequinAction &&
         !rejectedEnemyDeathPresentation)
-        RelayReliablePayloadToPeers(packet, fromAddress, fromPort);
+    {
+        RelayReliablePayloadToPeers(
+            packet,
+            fromAddress,
+            fromPort);
+    }
     StoreActiveRemotePeerContext();
     m_activePacketSourceAccountToken = 0;
 }
@@ -65951,6 +68557,7 @@ void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
         m_networkStatus = m_sessionStatus;
         return;
     }
+    /*
     if (m_networkMode == CoopNetworkMode::Host &&
         m_kickedAccountTokens.find(packet.accountToken) != m_kickedAccountTokens.end())
     {
@@ -65961,7 +68568,7 @@ void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
             fromPort);
         m_networkStatus = "rejected previously kicked player";
         return;
-    }
+    }*/
 
     const auto existingIt = m_remotePeers.find(packet.accountToken);
     const bool newPeer = existingIt == m_remotePeers.end();
@@ -69541,12 +72148,34 @@ std::string ModMain::BuildHostSaveStateKey(const std::string& savePathOrName) co
     if (tail.empty())
         tail = "unknown_save";
 
+    // CCryAction frequently reports only "autosaveN" even though that slot is
+    // scoped under Campaign0..2. Include Vanilla's campaign identity in the
+    // key so a new campaign or another campaign slot can never inherit an
+    // unrelated player's health, inventory, abilities, or saved area.
+    const bool hasDirectory = tail.find('/') != std::string::npos;
+    if (!hasDirectory && tail != "unknown_save" && tail != "coophostsnapshot")
+    {
+        int campaignSlot = -1;
+        uint64_t campaignGuid = 0;
+        if (TryGetCurrentCampaignIdentity(campaignSlot, campaignGuid))
+        {
+            std::string campaignIdentity = "campaign" + std::to_string(campaignSlot);
+            if (campaignGuid != 0)
+                campaignIdentity += "_" + Hex64(campaignGuid);
+            tail = campaignIdentity + "/" + tail;
+        }
+    }
+
+    // Hash the complete identity before shortening the human-readable suffix.
+    // Otherwise a long save name could trim the campaign prefix and recreate
+    // the same cross-campaign collision this key is meant to prevent.
+    const std::string hashIdentity = tail;
+    hash = kFnv1aOffsetBasis;
+    for (const char ch : hashIdentity)
+        hash = UpdateFnv1a(hash, reinterpret_cast<const uint8_t*>(&ch), 1);
+
     if (tail.size() > 48)
         tail = tail.substr(tail.size() - 48);
-
-    hash = kFnv1aOffsetBasis;
-    for (const char ch : tail)
-        hash = UpdateFnv1a(hash, reinterpret_cast<const uint8_t*>(&ch), 1);
 
     return Hex32(hash) + "_" + SanitizePathComponent(tail);
 }
@@ -69779,7 +72408,10 @@ bool ModMain::BeginHostPlayerStateTransfer(const char* reason, const std::string
     const std::string latestPath = GetHostPlayerStatePathForAccount(accountToken);
     const std::string canonicalCurrentSaveKey = BuildHostSaveStateKey(m_lastSaveLoadPath);
     const std::string previousFormatSaveKey = BuildLegacyHostSaveStateKey(m_lastSaveLoadPath);
+    const bool canonicalHasCampaignIdentity =
+        canonicalCurrentSaveKey.find("_campaign") != std::string::npos;
     const bool hasPreviousFormatSaveKey =
+        !canonicalHasCampaignIdentity &&
         !canonicalCurrentSaveKey.empty() &&
         SanitizePathComponent(canonicalCurrentSaveKey) == SanitizePathComponent(saveKey) &&
         !previousFormatSaveKey.empty() &&
@@ -79977,8 +82609,17 @@ bool ModMain::ShouldTraceNativeEntityLifecycle(EntityId entityId) const
     return false;
 }
 
-void ModMain::RecordNativeNpcSpawnTrace(const char* stage, IEntity* entity, const char* detail)
+void ModMain::RecordNativeNpcSpawnTrace(
+    const char* stage,
+    IEntity* entity,
+    const char* detail)
 {
+    if (ShouldSuppressNativeSpawnInstrumentation())
+        return;
+
+    if (!ShouldTraceNativeNpcSpawn())
+        return;
+    
     if (!m_nativeNpcSpawnTraceEnabled && !EnvFlagEnabled("COOP_TRACE_NATIVE_NPC_SPAWN"))
         return;
 
@@ -82181,6 +84822,29 @@ bool ModMain::ApplyEnemyDamageRequestToHost(const CoopProtocol::EnemyDamageReque
     if (!npc)
     {
         m_lastEnemyDamageEvent = "apply failed target has no ArkNpc signal receiver";
+        return false;
+    }
+
+    bool alreadyDead = health <= 0.0f || state->sentDeadState;
+    bool nativeDead = false;
+    if (TryGuardedCall(
+            "enemy damage request IsDead",
+            [npc]() { return npc->IsDead(); },
+            nativeDead,
+            nullptr))
+    {
+        alreadyDead = alreadyDead || nativeDead;
+    }
+    if (const auto rosterIt = m_enemyRosterByNetId.find(packet.enemyNetId);
+        rosterIt != m_enemyRosterByNetId.end())
+    {
+        alreadyDead = alreadyDead ||
+            (rosterIt->second.flags & CoopProtocol::kEnemyRosterFlagAlive) == 0;
+    }
+    if (alreadyDead)
+    {
+        m_lastEnemyDamageEvent =
+            "apply rejected terminal corpse net=" + std::to_string(packet.enemyNetId);
         return false;
     }
 

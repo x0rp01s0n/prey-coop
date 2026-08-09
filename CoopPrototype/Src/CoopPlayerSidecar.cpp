@@ -4324,44 +4324,11 @@ bool ModMain::DebugProbeLocalInventoryArchetype(uint64_t archetypeId, std::strin
     if (knownInfo)
     {
         AppendDetail(detail, std::string("known=") + knownInfo->className + "/" + knownInfo->archetypeName);
-
-        IEntityArchetype* itemSystemArchetype = nullptr;
-        reason.clear();
-        if (TryGetArkItemSystemArchetype(*itemSystem, *knownInfo, itemSystemArchetype, reason))
-            AppendDetail(detail, "itemSystem=" + ArchetypeSummary(itemSystemArchetype));
-        else
-            AppendDetail(detail, "itemSystem failed: " + reason);
-
-        std::vector<IEntityArchetype*> classArchetypes;
-        reason.clear();
-        if (TryGuardedCall(
-                "coop probe GetArchetypesForClass",
-                [&]() -> std::vector<IEntityArchetype*>
-                {
-                    return itemSystem->GetArchetypesForClass(knownInfo->className);
-                },
-                classArchetypes,
-                &reason))
-        {
-            bool foundClassMatch = false;
-            for (IEntityArchetype* candidate : classArchetypes)
-            {
-                uint64_t candidateId = 0;
-                if (candidate &&
-                    TryGuardedCall("coop probe class candidate GetId", [candidate]() -> uint64_t { return candidate->GetId(); }, candidateId, &reason) &&
-                    candidateId == archetypeId)
-                {
-                    foundClassMatch = true;
-                    break;
-                }
-            }
-            AppendDetail(detail, "classArchetypes=" + std::to_string(classArchetypes.size()) +
-                " found=" + (foundClassMatch ? std::string("1") : std::string("0")));
-        }
-        else
-        {
-            AppendDetail(detail, "classArchetypes failed: " + reason);
-        }
+        // ArkItemSystem::GetArchetype raises CryEngine's non-SEH 0x80000100
+        // control exception for some missing class/name pairs. The production
+        // restore path only uses that fallback when EntitySystem lookup fails;
+        // a read-only probe must not call it unconditionally.
+        AppendDetail(detail, "itemSystemLookup=skipped_read_only_probe");
     }
     else
     {

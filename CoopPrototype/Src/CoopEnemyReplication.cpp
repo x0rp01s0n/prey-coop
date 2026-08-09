@@ -2615,6 +2615,8 @@ bool ModMain::InterruptEnemyAbilityForAuthorityTransition(
         [npc]() { return npc->InterruptAbility(); },
         nativeResult,
         &guardReason);
+
+
     bool performingAfter = performingBefore;
     uint64_t contextAfter = contextBefore;
     TryGuardedCall(
@@ -7562,11 +7564,19 @@ bool ModMain::ApplyEnemyDeathCommitToLocal(
             return false;
         }
 
+        const bool nativeSignalAlreadyApplied = state &&
+            state->remoteDeathPresentationSignalAppliedSequence == deathPresentation->sequence;
+
         // Align only the still-living positive health baseline that existed
         // on authority immediately before the lethal package. The package is
         // then delivered through the same ArkSignalSystem path as Vanilla;
         // Vanilla alone decides HP, mimic breakup, reaction, ragdoll and loot.
-        if (!alreadyDead && deathPresentation->targetHealthBeforeHit > 0.0f)
+        // Some Mimics expose IsDead before breakup has disabled their AI. A
+        // later state snapshot must observe that transition, not hit the same
+        // corpse again and create another set of native gibs.
+        if (!nativeSignalAlreadyApplied &&
+            !alreadyDead &&
+            deathPresentation->targetHealthBeforeHit > 0.0f)
         {
             SetEntityHealthFromAuthority(
                 entity->GetId(),
@@ -7574,7 +7584,15 @@ bool ModMain::ApplyEnemyDeathCommitToLocal(
                 false,
                 false);
         }
-        nativeHitAttempted = TryApplyVanillaEnemyDeathHit(*npc, *entity, *deathPresentation);
+        if (!nativeSignalAlreadyApplied)
+        {
+            nativeHitAttempted = TryApplyVanillaEnemyDeathHit(*npc, *entity, *deathPresentation);
+            if (nativeHitAttempted && state)
+            {
+                state->remoteDeathPresentationSignalAppliedSequence =
+                    deathPresentation->sequence;
+            }
+        }
 
         bool deadAfter = false;
         TryGuardedCall("enemy death signal IsDead", [npc]() { return npc->IsDead(); }, deadAfter, nullptr);
@@ -7587,8 +7605,13 @@ bool ModMain::ApplyEnemyDeathCommitToLocal(
 
     if (!nativeDeathFinalized)
     {
+        const bool waitingForNativeFinalization = state && deathPresentation &&
+            state->remoteDeathPresentationSignalAppliedSequence == deathPresentation->sequence;
         m_lastEnemyLocomotionEvent =
-            "native death signal did not finalize net=" + std::to_string(enemyNetId) +
+            std::string(waitingForNativeFinalization
+                ? "native death signal awaiting finalization net="
+                : "native death signal did not finalize net=") +
+            std::to_string(enemyNetId) +
             " attempted=" + std::to_string(nativeHitAttempted ? 1 : 0);
         AppendEnemySyncTrace("death", m_lastEnemyLocomotionEvent);
         return false;

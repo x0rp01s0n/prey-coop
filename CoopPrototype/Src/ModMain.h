@@ -67,6 +67,9 @@ class ArkKiosk;
 class ArkKeypad;
 class ArkKeycardReader;
 class ArkResponseManager;
+class ArkSpeakerBase;
+class ArkConversation;
+class ArkResponseQuery;
 class ArkGlobalFacts;
 class ArkObjectiveComponent;
 class ArkUtilityComponent;
@@ -75,6 +78,7 @@ class ArkInventory;
 class ArkItemSystem;
 class ArkGame;
 class ArkPlayerCarry;
+struct EventPhysCollision;
 class ArkPlayerHealthComponent;
 class ArkTimeScaleManager;
 class CArkUIHUD;
@@ -191,7 +195,7 @@ public:
     //---------------------------------------------------------------------------------
     // Mod Methods
     //---------------------------------------------------------------------------------
-
+    
     void SpawnProxy();
     void ConfigureProxy();
     void SpawnMimicNearProxy();
@@ -296,6 +300,7 @@ public:
         const void* ability,
         const char* reason);
     bool IsPostLoadNativeQuarantineActive() const;
+    bool ShouldBypassArkNpcAbilityPerformHook() const;
     bool IsRuntimeTransitionCleanupPrepared() const { return m_runtimeTransitionCleanupPrepared; }
     bool ShouldBypassNpcMannequinHooksBeforeSession() const;
     bool ShouldBypassNpcDesireHooksBeforeSession() const;
@@ -749,6 +754,37 @@ public:
     void OnAnimationQueueLogLine(const char* text, bool newLine);
     void OnPhysicalWorldGetEntitiesInBoxHook(const Vec3& ptmin, const Vec3& ptmax, int objtypes, int szListPrealloc);
     std::string BuildCrashBreadcrumbs() const;
+    bool ShouldSuppressNativeSpawnInstrumentation() const noexcept;
+    bool ShouldTraceNativeNpcSpawn() const;
+
+    void BindDialogueRuntimeId(uint64_t runtimeId, uint64_t storyId);
+    uint64_t ResolveDialogueStoryId(uint64_t runtimeId) const;
+    void ForgetDialogueRuntimeId(uint64_t runtimeId);
+    bool IsRemoteDialogueRuntimeId(uint64_t runtimeId) const;
+    bool ShouldSuppressRemoteDialogueRetrigger(uint64_t ruleId);
+    bool IsReplayingRemoteDialogue() const noexcept
+    {
+        return m_remoteDialogueReplayDepth != 0;
+    }
+    void ObserveLocalDialogueTrigger(
+        ArkSpeakerBase* speaker,
+        ArkConversation* conversation,
+        uint64_t ruleId,
+        bool ignoreVoiceRequirement,
+        const char* concept,
+        const ArkResponseQuery* query,
+        int paChannel,
+        bool isLiveAudio,
+        int priority);
+    ArkConversation* InvokeOriginalDialogueTrigger(
+        ArkSpeakerBase* speaker,
+        uint64_t ruleId,
+        bool ignoreVoiceRequirement,
+        const char* concept,
+        ArkResponseQuery* query,
+        int paChannel,
+        bool isLiveAudio,
+        int priority);
 
     //---------------------------------------------------------------------------------
     // Mod Initialization
@@ -813,7 +849,7 @@ private:
     class ProxyReviveInteractionListener;
     class SystemEventListener;
     class CoopEntitySystemSink;
-
+    std::unordered_map<uint64_t, uint64_t> m_dialogueStoryIdByRuntimeId;
     struct NativeInventorySerializeScopeState
     {
         uint32_t depth = 0;
@@ -1078,6 +1114,10 @@ private:
         CoopProtocol::TestMimicStatePacket lastTransmittedStatePacket = {};
         uint32_t deathCommitRepeatsRemaining = 0;
         uint32_t localDeathPresentationEpochSent = 0;
+        // A Mimic can report IsDead before its native breakup/loot transition
+        // has disabled every AI lane. Never replay the same lethal signal
+        // while waiting for that asynchronous Vanilla finalization.
+        uint32_t remoteDeathPresentationSignalAppliedSequence = 0;
         bool hasLastPosition = false;
         bool sentDeadState = false;
         bool localAttentionClaimed = false;
@@ -1576,7 +1616,8 @@ public:
     void OnLocalStoryGlobalIntChanged(IGameToken* token, int32_t value, bool changed, const char* reason);
     void OnLocalStoryGlobalStringChanged(IGameToken* token, const std::string& value, bool changed, const char* reason);
     void OnLocalAreaGameTokenChanged(IGameToken* token, uint16_t eventKind, uint16_t value, int32_t count, const std::string& textValue, const char* reason);
-    void OnLocalStoryResponseUsageChanged(ArkResponseManager* manager, uint16_t eventKind, uint64_t id, uint16_t flags, bool changed, const char* reason);
+    void OnLocalStoryResponseUsageChanged(ArkResponseManager* manager, uint16_t eventKind, uint64_t id, uint16_t flags, bool changed, const char* reason, ArkSpeakerBase* speaker = nullptr, int paChannel = -1);
+    void RememberDialogueSpeakerForHook(ArkSpeakerBase* speaker, const char* reason);
     void ObserveLocalDialogueActivity(uint64_t dialogueId, uint64_t lineId, const char* reason);
     void OnLocalDialogueCompleted(uint64_t dialogueId, bool complete, const char* reason);
     void OnLocalStoryConditionStateChanged(ArkGameStateConditionManager* manager, uint16_t eventKind, uint64_t id, int count, bool changed, const char* reason);
@@ -1603,6 +1644,7 @@ public:
     void OnLocalAreaObjectFabricatorStateChanged(ArkFabricator* fabricator, uint16_t eventKind, uint16_t value, bool changed, const char* reason);
     void OnLocalAreaObjectElevatorKioskStateChanged(ArkGenericElevatorKiosk* kiosk, uint16_t eventKind, uint16_t value, bool changed, const char* reason);
     void OnLocalAreaObjectGenericElevatorKioskButtonPressed(ArkGenericElevatorKiosk* kiosk, int button, const char* reason);
+    void OnLocalHelicopterPassengerStartForHook(const char* reason);
     void OnLocalAreaObjectKioskButtonStateChanged(ArkKiosk* kiosk, int button, uint16_t value, bool changed, const char* reason);
     void OnLocalAreaObjectKioskPresentationChanged(ArkKiosk* kiosk, uint16_t eventKind, int button, uint16_t value, const char* textValue, bool changed, const char* reason);
     void OnLocalAreaObjectKioskButtonPressed(ArkKiosk* kiosk, int button, const char* reason);
@@ -1652,6 +1694,11 @@ public:
     void OnNativeGravShaftStateChanged(IEntity* entity, bool changed, const char* reason);
     void OnNativePsiLiftFieldStarted(CArkPsiPowerLift* power, bool result, const char* reason);
     void OnNativeBreakableHealthChanged(CArkBreakable* breakable, float before, float after, const char* reason);
+    void OnNativeBreakableGlassImpact(
+        const EventPhysCollision& collision,
+        uint64_t targetGuid,
+        int glassSide,
+        int glassSlot);
     bool IsApplyingRemoteHazardEvent() const { return m_hazardEventApplyDepth != 0; }
     bool RepairFirstNativeLeak(ArkLeakable* leakable, const char* context, std::string* detail = nullptr);
     bool DebugSpawnPersistentAreaHazard(std::string& detail);
@@ -1674,6 +1721,8 @@ public:
     bool ShouldSuppressDefocusedNativePauseMenu() const;
     bool HandleFocusedNativePauseMultiplayerInput(const SInputEvent& event);
     void CloseMultiplayerUi(const char* reason);
+    void OnLocalNpcPerformedNoticeChanged(ArkNpc* npc, uint64_t npcGuid, bool performedNotice, const char* reason);
+    uint64_t m_lastActiveStoryConversationId = 0;
 
 private:
 
@@ -1837,7 +1886,7 @@ private:
     void HandleAreaObjectEvent(const CoopProtocol::AreaObjectEventPacket& packet);
     void ResetStoryEventState(const char* lastEvent);
     void ResetAreaObjectEventState(const char* lastEvent);
-    bool QueueLocalStoryEventForHook(uint16_t eventKind, uint64_t targetId, int32_t count, uint16_t flags, const char* reason, const char* textValue = nullptr);
+    bool QueueLocalStoryEventForHook(uint16_t eventKind, uint64_t targetId, int32_t count, uint16_t flags, const char* reason, const char* textValue = nullptr, uint64_t contextEntityGuid = 0, uint64_t contextCharacterId = 0, uint16_t contextFlags = 0, int32_t contextChannel = -1);
     bool ApplyStoryEventMutation(const CoopProtocol::StoryEventPacket& packet, std::string& detail);
     bool QueueLocalAreaObjectEventForHook(uint16_t eventKind, uint64_t targetGuid, uint16_t value, uint32_t flags, const char* reason, int32_t count = 0, const char* textValue = nullptr);
     bool ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPacket& packet, std::string& detail);
@@ -1872,9 +1921,11 @@ private:
     bool ApplyAreaObjectWorldItemRemoved(uint64_t targetGuid, std::string& detail);
     void InitBreakableSyncHooks();
     bool ApplyAreaObjectBreakableHealth(uint64_t targetGuid, uint16_t encodedHealth, std::string& detail);
+    bool ApplyAreaObjectBreakableGlassImpact(const CoopProtocol::AreaObjectEventPacket& packet, std::string& detail);
     bool DebugSpawnBreakableSyncTarget(std::string& detail, bool scalable = false);
     bool DebugProbeBreakableSyncTarget(std::string& detail, uint64_t targetGuid = 0);
     bool DebugSetBreakableSyncTargetHealth(float health, std::string& detail, uint64_t targetGuid = 0);
+    bool DebugBreakableGlassCommand(const std::string& target, bool impact, std::string& detail);
     struct SharedDropRecord
     {
         uint64_t stableSpawnId = 0;
@@ -1943,9 +1994,46 @@ private:
         const CoopProtocol::TestMimicStatePacket* deathPacket,
         const char* reason);
     void TickPendingEnemyDeathCommits(float frameTime);
-    bool BuildDialogueLeasePacket(CoopProtocol::DialogueLeasePacket& packet, CoopProtocol::DialogueLeaseCommand command, uint64_t dialogueId, uint64_t targetPeerHash = 0) const;
-    bool RequestDialogueLease(uint64_t dialogueId, const char* reason);
+    bool BuildDialogueLeasePacket(
+        CoopProtocol::DialogueLeasePacket& packet,
+        CoopProtocol::DialogueLeaseCommand command,
+        uint64_t dialogueId,
+        uint64_t targetPeerHash = 0) const;
+    bool CaptureDialogueTriggerPacket(
+        CoopProtocol::DialogueLeasePacket& packet,
+        ArkSpeakerBase* speaker,
+        ArkConversation* conversation,
+        uint64_t ruleId,
+        bool ignoreVoiceRequirement,
+        const char* concept,
+        const ArkResponseQuery* query,
+        int paChannel,
+        bool isLiveAudio,
+        int priority,
+        std::string& detail);
+    bool CaptureDialogueSpeakerIdentity(
+        ArkSpeakerBase* speaker,
+        int paChannel,
+        uint64_t& speakerEntityGuid,
+        uint64_t& speakerCharacterId,
+        uint16_t& speakerIdentityFlags,
+        int32_t& resolvedPaChannel,
+        std::string& detail) const;
+    bool RequestDialogueLease(
+        const CoopProtocol::DialogueLeasePacket& request,
+        const char* reason);
     bool ReleaseLocalDialogueLease(const char* reason);
+    bool ReplayGrantedDialogue(
+        const CoopProtocol::DialogueLeasePacket& packet,
+        std::string& detail);
+    ArkSpeakerBase* ResolveDialogueSpeaker(
+        uint64_t speakerEntityGuid,
+        uint64_t speakerCharacterId,
+        uint16_t flags,
+        int32_t paChannel,
+        std::string& detail);
+    bool ShouldSuppressDialogueStoryEvent(uint64_t id) const;
+    void ClearActiveDialogueLease(const char* reason);
     void TickDialogueLease(float frameTime);
     void ResetDialogueLeaseState(const char* reason);
     bool BuildTimeDilationPacket(CoopProtocol::TimeDilationPacket& packet, CoopProtocol::TimeDilationCommand command, unsigned timers, float scale) const;
@@ -2938,6 +3026,11 @@ private:
     uint32_t m_breakableHealthEventsApplied = 0;
     uint32_t m_breakableHealthEventSkips = 0;
     std::string m_lastBreakableHealthEvent = "-";
+    uint32_t m_breakableGlassHookCalls = 0;
+    uint32_t m_breakableGlassEventsQueued = 0;
+    uint32_t m_breakableGlassEventsApplied = 0;
+    uint32_t m_breakableGlassEventSkips = 0;
+    std::string m_lastBreakableGlassEvent = "-";
     uint32_t m_reentrantAreaObjectEventSkips = 0;
     uint32_t m_areaObjectEventFailures = 0;
     uint32_t m_areaObjectJournalReplayRows = 0;
@@ -3107,6 +3200,8 @@ private:
     uint64_t m_dialogueLeaseDialogueId = 0;
     uint64_t m_dialogueLeasePendingId = 0;
     uint64_t m_dialogueLeaseOwnerHash = 0;
+    uint64_t m_dialogueLeaseTriggerEventId = 0;
+    uint64_t m_dialogueLeaseRuleId = 0;
     uint32_t m_dialogueLeaseSequence = 0;
     uint32_t m_dialogueLeaseEpoch = 0;
     uint32_t m_dialogueLeaseSent = 0;
@@ -3114,7 +3209,23 @@ private:
     uint32_t m_dialogueLeaseApplied = 0;
     uint32_t m_dialogueLeaseDropped = 0;
     uint32_t m_dialogueLeaseDenied = 0;
+    uint32_t m_remoteDialogueReplayDepth = 0;
     float m_dialogueLeaseSeconds = 0.0f;
+    float m_dialogueLeaseActivitySendSeconds = 0.0f;
+    float m_pendingRemoteDialogueReplaySeconds = 0.0f;
+    bool m_dialogueLeasePendingCompletion = false;
+    bool m_pendingRemoteDialogueReplayActive = false;
+    CoopProtocol::DialogueLeasePacket m_dialogueLeaseDescriptor = {};
+    CoopProtocol::DialogueLeasePacket m_pendingRemoteDialogueReplay = {};
+    std::unordered_set<uint64_t> m_appliedDialogueLeaseEventIds;
+    std::unordered_set<uint64_t> m_appliedDialogueTriggerIds;
+    std::unordered_set<uint64_t> m_remoteDialogueRuntimeIds;
+    std::unordered_set<uint64_t> m_remoteDialogueCompletedDuringReplayIds;
+    std::unordered_set<uint64_t> m_remoteDialogueStoryIds;
+    std::unordered_map<uint64_t, ArkSpeakerBase*> m_dialogueSpeakersByGuid;
+    std::unordered_map<uint64_t, ArkSpeakerBase*> m_dialogueSpeakersByCharacterId;
+    std::deque<CoopProtocol::StoryEventPacket> m_pendingDialogueWritebacks;
+    float m_pendingDialogueWritebackRetrySeconds = 0.0f;
     std::string m_lastDialogueLeaseEvent = "-";
     uint32_t m_timeDilationSequence = 0;
     uint32_t m_timeDilationRevision = 0;

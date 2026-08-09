@@ -2,11 +2,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 237;
+constexpr uint16_t kProtocolVersion = 241;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -312,6 +313,10 @@ constexpr uint16_t kAreaObjectEventKioskButtonVisible = 34;
 constexpr uint16_t kAreaObjectEventKioskHeader = 35;
 constexpr uint16_t kAreaObjectEventKioskBody = 36;
 constexpr uint16_t kAreaObjectEventMainLiftOutage = 37;
+constexpr uint16_t kAreaObjectEventNpcPerformedNotice = 38;
+constexpr uint16_t kAreaObjectEventBreakableGlassImpact = 39;
+constexpr uint16_t kAreaObjectEventHelicopterPassengerStart = 40;
+
 
 constexpr bool IsTransientAreaObjectEvent(uint16_t eventKind)
 {
@@ -319,7 +324,8 @@ constexpr bool IsTransientAreaObjectEvent(uint16_t eventKind)
         eventKind == kAreaObjectEventElevatorTransit ||
         eventKind == kAreaObjectEventWorkstationUtilityPressed ||
         eventKind == kAreaObjectEventGenericElevatorKioskButtonPressed ||
-        eventKind == kAreaObjectEventMainLiftOutage;
+        eventKind == kAreaObjectEventMainLiftOutage ||
+        eventKind == kAreaObjectEventHelicopterPassengerStart;
 }
 // Scalar game-token/utility values retain their 32-byte validation bound.
 // Kiosk localization keys can be longer (for example the 41-byte Arboretum
@@ -915,23 +921,93 @@ struct HazardEventPacket
     float dz = 0.0f;
     float scalar = 0.0f;
 };
+constexpr size_t kDialogueConceptBytes = 96;
+constexpr size_t kDialogueQueryStringBytes = 64;
+constexpr size_t kMaxDialogueQueryFacts = 10;
+
+enum DialogueTriggerFlags : uint16_t
+{
+    kDialogueIgnoreVoiceRequirement = 1u << 0,
+    kDialogueLiveAudio              = 1u << 1,
+    kDialogueImportant              = 1u << 2,
+    kDialogueHasConcept             = 1u << 3,
+    kDialogueHasQuery               = 1u << 4,
+    kDialogueSpeakerPlayer          = 1u << 5,
+    kDialogueSpeakerSuit            = 1u << 6,
+    kDialogueSpeakerDiscRifle       = 1u << 7,
+    kDialogueSpeakerTranscribe      = 1u << 8,
+    kDialogueSpeakerPA              = 1u << 9,
+    kDialogueSpeakerVoiceIdentity   = 1u << 10,
+};
+
+constexpr uint16_t kDialogueSpecialSpeakerMask =
+    kDialogueSpeakerPlayer |
+    kDialogueSpeakerSuit |
+    kDialogueSpeakerDiscRifle |
+    kDialogueSpeakerTranscribe |
+    kDialogueSpeakerPA;
+
+struct DialogueQueryFactWire
+{
+    uint64_t key = 0;
+
+    // Raw ArkResponseValue::num bits. This preserves both integer and double
+    // query values without guessing the criterion's runtime value type.
+    uint64_t numberBits = 0;
+
+    uint16_t stringLength = 0;
+    uint16_t reserved16 = 0;
+    uint32_t reserved32 = 0;
+    char stringValue[kDialogueQueryStringBytes] = {};
+};
 
 struct DialogueLeasePacket
 {
     uint32_t magic = kPacketMagic;
     uint16_t version = kProtocolVersion;
     uint16_t type = static_cast<uint16_t>(PacketType::DialogueLease);
+
     uint32_t sequence = 0;
     uint32_t worldEpoch = 0;
+
+    // Unique for this Request/Grant/Deny/Activity/Release command.
     uint64_t eventId = 0;
+
+    // Stable for one native dialogue instance across all lease commands.
+    uint64_t triggerEventId = 0;
+
     uint64_t hostSaveKeyHash = 0;
     uint64_t areaId = 0;
+
+    // Sender of this command and optional unicast target.
     uint64_t sourcePeerHash = 0;
     uint64_t targetPeerHash = 0;
+
+    // Canonical dialogue identity and the peer whose local Vanilla trigger won.
     uint64_t dialogueId = 0;
+    uint64_t ownerPeerHash = 0;
+
+    // Stable receiver-side speaker identity.
+    uint64_t speakerEntityGuid = 0;
+    uint64_t speakerCharacterId = 0;
+
+    // Exact ArkSpeakerBase::TriggerRule input plus a diagnostic response result.
+    uint64_t ruleId = 0;
+    uint64_t expectedResponseId = 0;
+
     uint32_t leaseEpoch = 0;
     uint16_t command = static_cast<uint16_t>(DialogueLeaseCommand::Request);
     uint16_t flags = 0;
+
+    int32_t paChannel = 0;
+    int32_t priority = 0;
+
+    uint16_t queryFactCount = 0;
+    uint16_t reserved16 = 0;
+    uint32_t reserved32 = 0;
+
+    char conceptText[kDialogueConceptBytes] = {};
+    DialogueQueryFactWire queryFacts[kMaxDialogueQueryFacts] = {};
 };
 
 struct TimeDilationPacket
@@ -1158,6 +1234,16 @@ struct StoryEventPacket
     uint16_t flags = 0;
     uint32_t preVersion = 0;
     uint32_t postVersion = 0;
+
+    // Response-rule writebacks live in the triggering speaker's local memory,
+    // not in ArkResponseManager. Carry the same stable speaker identity used
+    // by dialogue replication so peers can apply that authored state too.
+    uint64_t contextEntityGuid = 0;
+    uint64_t contextCharacterId = 0;
+    int32_t contextChannel = -1;
+    uint16_t contextFlags = 0;
+    uint16_t contextReserved = 0;
+
     char textValue[kStoryTextValueCapacity] = {};
 };
 
@@ -1487,6 +1573,10 @@ static_assert(sizeof(CorpsePhantomRequestPacket) <= kReliablePayloadSize);
 static_assert(sizeof(SharedDropPacket) <= kReliablePayloadSize);
 static_assert(sizeof(SharedStoragePacket) <= kReliablePayloadSize);
 static_assert(sizeof(HazardEventPacket) <= kReliablePayloadSize);
+static_assert(std::is_standard_layout_v<DialogueQueryFactWire>);
+static_assert(std::is_trivially_copyable_v<DialogueQueryFactWire>);
+static_assert(std::is_standard_layout_v<DialogueLeasePacket>);
+static_assert(std::is_trivially_copyable_v<DialogueLeasePacket>);
 static_assert(sizeof(DialogueLeasePacket) <= kReliablePayloadSize);
 static_assert(sizeof(TimeDilationPacket) <= kReliablePayloadSize);
 static_assert(sizeof(PeerPresencePacket) <= kReliablePayloadSize);
