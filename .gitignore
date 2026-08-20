@@ -66,6 +66,7 @@ coop_config.xml
 # Private engineering workspace
 /WORKLOG.md
 /Working_plan/
+/_dissection/
 /_coop-fixtures/
 /coop-*
 /CoopPrototype/RE/

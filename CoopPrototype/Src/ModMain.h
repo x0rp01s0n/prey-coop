@@ -754,6 +754,7 @@ public:
     void OnAnimationQueueLogLine(const char* text, bool newLine);
     void OnPhysicalWorldGetEntitiesInBoxHook(const Vec3& ptmin, const Vec3& ptmax, int objtypes, int szListPrealloc);
     std::string BuildCrashBreadcrumbs() const;
+    std::string GetLastAreaObjectEvent() const;
     bool ShouldSuppressNativeSpawnInstrumentation() const noexcept;
     bool ShouldTraceNativeNpcSpawn() const;
 

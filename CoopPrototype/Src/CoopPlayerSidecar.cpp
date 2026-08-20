@@ -2,6 +2,7 @@
 #include "CoopRuntimeConfig.h"
 #include "CoopRuntimeLog.h"
 #include "CoopItemClassification.h"
+#include "CoopPtrHygiene.h"
 #include "CoopNativeFragmentPayload.h"
 #include "CoopRuntimeGuards.h"
 
@@ -2599,6 +2600,11 @@ bool ModMain::SaveLocalPlayerSidecar(const char* reason)
 
     if (player.m_helmet.m_pOxygenComponent)
     {
+        if (CoopPtrHygiene::Enabled())
+        {
+            CoopPtrHygiene::LogPtr("player_oxygen_save", player.m_helmet.m_pOxygenComponent.get());
+            CoopPtrHygiene::CheckAbove32("player_oxygen_save", player.m_helmet.m_pOxygenComponent.get());
+        }
         ArkPlayerOxygenComponent& oxygen = *player.m_helmet.m_pOxygenComponent;
         output << "oxygen=" << oxygen.m_oxygen << ' ' << oxygen.GetMaxOxygen() << ' '
             << (oxygen.m_bConsumingOxygen ? 1 : 0) << "\n";
@@ -3641,6 +3647,11 @@ bool ModMain::ApplyLocalPlayerSidecar(const PlayerSidecarState& state, const cha
     if (applyVitals && state.hasOxygen && player.m_helmet.m_pOxygenComponent)
     {
         ArkPlayerOxygenComponent* oxygen = player.m_helmet.m_pOxygenComponent.get();
+        if (CoopPtrHygiene::Enabled())
+        {
+            CoopPtrHygiene::LogPtr("player_oxygen_apply", oxygen);
+            CoopPtrHygiene::CheckAbove32("player_oxygen_apply", oxygen);
+        }
         std::string oxygenReason;
         TryGuardedVoidCall(
             "apply player sidecar oxygen",
