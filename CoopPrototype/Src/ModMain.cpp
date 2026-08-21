@@ -4,6 +4,7 @@
 #include "CoopSerialSequence.h"
 #include "CoopRuntimeLog.h"
 #include "CoopRuntimeConfig.h"
+#include "CoopPtrHygiene.h"
 #include "CoopDamagePolicy.h"
 #include "CoopCampaignAreaFacts.generated.h"
 #include "CoopCampaignStoryFacts.generated.h"
@@ -1418,6 +1419,8 @@ bool ShouldTraceCrashException(DWORD code)
     case EXCEPTION_PRIV_INSTRUCTION:
     case EXCEPTION_STACK_OVERFLOW:
     case EXCEPTION_DATATYPE_MISALIGNMENT:
+    case 0xE0667422:  // C++ EH (uncaught exception / abort raised by game code)
+    case 0xC0000602:  // STATUS_FAST_FAIL_EXCEPTION (ucrtbase abort path)
         return true;
     default:
         return false;
@@ -1660,6 +1663,21 @@ void AppendCurrentStack(std::ostringstream& out)
         out << "  #" << i << " " << DescribeRuntimeAddress(frames[i]) << "\n";
 }
 
+// Appended to the end of every crash trace. The ring buffer is lock-free, so
+// this is safe to run on a faulting thread; m_lastAreaObjectEvent is read
+// best-effort, exactly like the other breadcrumb fields above.
+void AppendCrashTraceHygieneSections(std::ostringstream& out)
+{
+    if (gMod)
+        out << "last_area_object_event=" << gMod->GetLastAreaObjectEvent() << "\n";
+    const std::string recent = CoopRuntimeLog::RecentLines(150);
+    out << "recent_mod_log:\n";
+    if (recent.empty())
+        out << "  (empty)\n";
+    else
+        out << recent;
+}
+
 std::string WideTraceString(const wchar_t* text)
 {
     if (!text || !text[0])
@@ -1723,6 +1741,8 @@ void __cdecl CoopInvalidParameterTraceHandler(
 
     AppendCurrentStack(out);
 
+    AppendCrashTraceHygieneSections(out);
+
     const std::string path = BuildInvalidParameterTracePath(traceIndex);
     WriteCrashTraceFile(path, out.str());
 
@@ -1769,6 +1789,8 @@ void __cdecl CoopPurecallTraceHandler()
 
     AppendCurrentStack(out);
 
+    AppendCrashTraceHygieneSections(out);
+
     const std::string path = BuildPurecallTracePath(traceIndex);
     WriteCrashTraceFile(path, out.str());
 
@@ -1786,7 +1808,14 @@ LONG WINAPI CoopCrashVectoredExceptionHandler(EXCEPTION_POINTERS* pointers)
     if (!ShouldTraceCrashException(record.ExceptionCode))
         return EXCEPTION_CONTINUE_SEARCH;
 
-    if (CoopRuntimeGuards::IsGuardedCallbackActive())
+    const bool guardedCallbackActive = CoopRuntimeGuards::IsGuardedCallbackActive();
+    const bool abortExceptionCode =
+        record.ExceptionCode == 0xE0667422 ||  // C++ EH abort
+        record.ExceptionCode == 0xC0000602;    // STATUS_FAST_FAIL_EXCEPTION
+    // The game's variant-based process abort (GetDamagePosition et al.) raises
+    // these codes while a guarded callback is still on the stack; a guarded
+    // callback cannot catch them, so write the trace for abort codes anyway.
+    if (guardedCallbackActive && !abortExceptionCode)
         return EXCEPTION_CONTINUE_SEARCH;
 
     const LONG traceIndex = InterlockedIncrement(&g_crashTraceCount);
@@ -1826,12 +1855,18 @@ LONG WINAPI CoopCrashVectoredExceptionHandler(EXCEPTION_POINTERS* pointers)
         << " reason=" << guard.lastReason
         << "\n";
 
+    if (guardedCallbackActive)
+        out << "abort_in_guarded_callback code=" << Hex32(record.ExceptionCode)
+            << " op=" << guard.lastOperation << "\n";
+
     if (gMod)
         out << gMod->BuildCrashBreadcrumbs();
     else
         out << "coop_breadcrumbs unavailable: gMod=null\n";
 
     AppendFaultStack(out, pointers);
+
+    AppendCrashTraceHygieneSections(out);
 
     const std::string path = BuildCrashTracePath(traceIndex);
     WriteCrashTraceFile(path, out.str());
@@ -8464,6 +8499,15 @@ static void* GetArkInteractiveObjectExtensionFromEntity(IEntity* entity)
             extension,
             &reason) && extension)
     {
+        if (CoopPtrHygiene::Enabled())
+        {
+            char extra[96];
+            std::snprintf(extra, sizeof(extra), "gameObject=0x%016llX",
+                static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(gameObject)));
+            CoopPtrHygiene::LogPtrWith("interactive_ext", extension, extra);
+            CoopPtrHygiene::CheckAbove32("interactive_ext", extension);
+            CoopPtrHygiene::CheckAbove32("interactive_ext_gameobject", gameObject);
+        }
         return extension;
     }
 
@@ -8474,6 +8518,15 @@ static void* GetArkInteractiveObjectExtensionFromEntity(IEntity* entity)
             extension,
             &reason) && extension)
     {
+        if (CoopPtrHygiene::Enabled())
+        {
+            char extra[96];
+            std::snprintf(extra, sizeof(extra), "gameObject=0x%016llX",
+                static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(gameObject)));
+            CoopPtrHygiene::LogPtrWith("interactive_ext", extension, extra);
+            CoopPtrHygiene::CheckAbove32("interactive_ext", extension);
+            CoopPtrHygiene::CheckAbove32("interactive_ext_gameobject", gameObject);
+        }
         return extension;
     }
     return nullptr;
@@ -13443,13 +13496,28 @@ static bool IsLocalPlayerSurfaceHazardSignalRequest(
         return true;
     }
 
-    unsigned instigatorId = INVALID_ENTITYID;
-    return TryGuardedCall(
-               "ArkSurfaceHazard::OnReceiveSignal GetDamageInstigatorId",
-               [&package]() { return package.m_context.GetDamageInstigatorId(); },
-               instigatorId,
-               nullptr) &&
-        instigatorId == localPlayerId;
+    // The native GetDamageInstigatorId() aborts the process when the context
+    // variant does not hold a HitInfo const*, so read the payload directly:
+    // variant index 1 with a readable HitInfo, else instigator stays 0.
+    {
+        const ArkSignalSystem::CArkSignalContext& context = package.m_context;
+        const uint8_t* base = reinterpret_cast<const uint8_t*>(&context);
+        int32_t variantIndex = -1;
+        const void* payload = nullptr;
+        if (TryReadRuntimeValue(
+                reinterpret_cast<const int32_t const*>(base), variantIndex) &&
+            variantIndex == 1 &&
+            TryReadRuntimeValue(
+                reinterpret_cast<const void* const*>(base + 8), payload) &&
+            IsReadableRuntimePointer(payload, sizeof(HitInfo)))
+        {
+            const HitInfo* variantHitInfo = static_cast<const HitInfo*>(payload);
+            unsigned instigatorId = 0;
+            if (TryReadRuntimeValue(&variantHitInfo->shooterId, instigatorId))
+                return instigatorId == localPlayerId;
+        }
+    }
+    return false;
 }
 
 static void ArkSurfaceHazard_OnReceiveSignal_Hook(
@@ -19032,7 +19100,16 @@ static thread_local CArkItem* s_activeSharedDropClone = nullptr;
 
 static CArkItem& CArkItem_Clone_Hook(const CArkItem* item, int count)
 {
+    if (CoopPtrHygiene::Enabled())
+    {
+        char extra[64];
+        std::snprintf(extra, sizeof(extra), "count=%d", count);
+        CoopPtrHygiene::LogPtrWith("item_clone", item, extra);
+        CoopPtrHygiene::CheckAbove32("item_clone", item);
+    }
     CArkItem& clone = s_hookCArkItemClone.InvokeOrig(item, count);
+    if (CoopPtrHygiene::Enabled())
+        CoopPtrHygiene::LogPtr("item_clone_result", &clone);
     if (item && item == s_activeSharedDropSource)
         s_activeSharedDropClone = &clone;
     return clone;
@@ -19040,6 +19117,13 @@ static CArkItem& CArkItem_Clone_Hook(const CArkItem* item, int count)
 
 static void CArkItem_Drop_Hook(CArkItem* item, int dropCount, const Vec3* altPosition)
 {
+    if (CoopPtrHygiene::Enabled())
+    {
+        char extra[64];
+        std::snprintf(extra, sizeof(extra), "count=%d", dropCount);
+        CoopPtrHygiene::LogPtrWith("item_drop", item, extra);
+        CoopPtrHygiene::CheckAbove32("item_drop", item);
+    }
     const EntityId localPlayerId = ArkPlayer::GetInstancePtr()
         ? ArkPlayer::GetInstance().GetEntityId()
         : INVALID_ENTITYID;
@@ -19078,6 +19162,13 @@ static void CArkItem_Drop_Hook(CArkItem* item, int dropCount, const Vec3* altPos
 
 static bool CArkItem_PickUp_Hook(CArkItem* item, const unsigned pickerId, bool scaleOnLerp)
 {
+    if (CoopPtrHygiene::Enabled())
+    {
+        char extra[64];
+        std::snprintf(extra, sizeof(extra), "picker=%u", pickerId);
+        CoopPtrHygiene::LogPtrWith("item_pickup", item, extra);
+        CoopPtrHygiene::CheckAbove32("item_pickup", item);
+    }
     const EntityId itemEntityId = item ? item->GetEntityId() : INVALID_ENTITYID;
     if (gMod && gMod->ShouldDeferNativeSharedItemPickup(item, pickerId, "CArkItem::PickUp"))
         return false;
@@ -19090,6 +19181,13 @@ static bool CArkItem_PickUp_Hook(CArkItem* item, const unsigned pickerId, bool s
 
 static void CArkItem_ResetCount_Hook(CArkItem* item, int count)
 {
+    if (CoopPtrHygiene::Enabled())
+    {
+        char extra[64];
+        std::snprintf(extra, sizeof(extra), "count=%d", count);
+        CoopPtrHygiene::LogPtrWith("item_resetcount", item, extra);
+        CoopPtrHygiene::CheckAbove32("item_resetcount", item);
+    }
     s_hookCArkItemResetCount.InvokeOrig(item, count);
     if (gMod)
         gMod->OnArkItemResetCountHook(item, count);
@@ -19710,6 +19808,15 @@ static bool TryReadArkKeycardReaderLocked(ArkKeycardReader* reader, bool& locked
 
 static void ArkInteractiveObject_Activate_Hook(void* interactiveObject, bool active, bool force, bool playerInitiated)
 {
+    if (CoopPtrHygiene::Enabled())
+    {
+        char extra[96];
+        std::snprintf(extra, sizeof(extra), "active=%d force=%d playerInitiated=%d",
+            active ? 1 : 0, force ? 1 : 0, playerInitiated ? 1 : 0);
+        CoopPtrHygiene::LogPtrWith("interactive_activate", interactiveObject, extra);
+        CoopPtrHygiene::CheckAbove32("interactive_activate", interactiveObject);
+    }
+
     bool before = false;
     bool after = active;
     std::string reason;
@@ -19724,6 +19831,11 @@ static void ArkInteractiveObject_Activate_Hook(void* interactiveObject, bool act
     {
         IEntity* entity = TryGetArkInteractiveObjectEntity(
             interactiveObject, "area object interactive active entity", &reason);
+        if (CoopPtrHygiene::Enabled())
+        {
+            CoopPtrHygiene::LogPtr("interactive_activate_entity", entity);
+            CoopPtrHygiene::CheckAbove32("interactive_activate_entity", entity);
+        }
         gMod->OnLocalAreaObjectInteractiveObjectStateChanged(
             entity,
             CoopProtocol::kAreaObjectEventInteractiveObjectActive,
@@ -19735,6 +19847,15 @@ static void ArkInteractiveObject_Activate_Hook(void* interactiveObject, bool act
 
 static void ArkInteractiveObject_Disable_Hook(void* interactiveObject, bool disabled, bool force)
 {
+    if (CoopPtrHygiene::Enabled())
+    {
+        char extra[96];
+        std::snprintf(extra, sizeof(extra), "disabled=%d force=%d",
+            disabled ? 1 : 0, force ? 1 : 0);
+        CoopPtrHygiene::LogPtrWith("interactive_disable", interactiveObject, extra);
+        CoopPtrHygiene::CheckAbove32("interactive_disable", interactiveObject);
+    }
+
     bool before = false;
     bool after = disabled;
     std::string reason;
@@ -19749,6 +19870,11 @@ static void ArkInteractiveObject_Disable_Hook(void* interactiveObject, bool disa
     {
         IEntity* entity = TryGetArkInteractiveObjectEntity(
             interactiveObject, "area object interactive disabled entity", &reason);
+        if (CoopPtrHygiene::Enabled())
+        {
+            CoopPtrHygiene::LogPtr("interactive_disable_entity", entity);
+            CoopPtrHygiene::CheckAbove32("interactive_disable_entity", entity);
+        }
         gMod->OnLocalAreaObjectInteractiveObjectStateChanged(
             entity,
             CoopProtocol::kAreaObjectEventInteractiveObjectDisabled,
@@ -21055,11 +21181,28 @@ static void ArkPlayer_Ragdollize_Hook(ArkPlayer* player, const float verticalSpe
 
 static void ArkPlayerHealth_SetHealth_Hook(ArkPlayerHealthComponent* healthComponent, const float health, const bool damagedByRecyclerGrenade)
 {
+    if (CoopPtrHygiene::Enabled())
+    {
+        char extra[96];
+        std::snprintf(extra, sizeof(extra), "health=%.3f recycler=%d",
+            health, damagedByRecyclerGrenade ? 1 : 0);
+        CoopPtrHygiene::LogPtrWith("player_health_set", healthComponent, extra);
+        CoopPtrHygiene::CheckAbove32("player_health_set", healthComponent);
+    }
+
     if (gMod && healthComponent)
         gMod->OnArkPlayerHealthDropObserved(healthComponent, health, damagedByRecyclerGrenade ? "health_set_recycler" : "health_set");
 
     if (gMod && healthComponent && gMod->ShouldSuppressArkPlayerHealthSet(healthComponent, health, damagedByRecyclerGrenade))
     {
+        if (CoopPtrHygiene::Enabled())
+        {
+            char line[128];
+            std::snprintf(line, sizeof(line),
+                "ptr_hygiene tag=player_health_set_suppressed health=%.3f recycler=%d",
+                health, damagedByRecyclerGrenade ? 1 : 0);
+            LogCoop(line);
+        }
         gMod->OnArkPlayerHealthSetSuppressed(healthComponent, health, damagedByRecyclerGrenade);
         return;
     }
@@ -30264,6 +30407,11 @@ std::string ModMain::BuildCrashBreadcrumbs() const
     return out.str();
 }
 
+std::string ModMain::GetLastAreaObjectEvent() const
+{
+    return m_lastAreaObjectEvent;
+}
+
 void ModMain::AppendSpatialEntityTraceDetails(std::ostringstream& out, const char* logLine) const
 {
     GetEntitiesInBoxWarning warning;
@@ -30698,6 +30846,7 @@ void ModMain::UnregisterCoopRenderListener()
 
 void ModMain::OnCoopRenderEndFrame()
 {
+    CoopPtrHygiene::Tick();
     ++m_coopRenderEndFrameCalls;
 
     const float now = gEnv && gEnv->pTimer ? gEnv->pTimer->GetAsyncCurTime() : 0.0f;
@@ -31196,6 +31345,7 @@ void ModMain::InitHooks()
 void ModMain::InitSystem(const ModInitInfo& initInfo, ModDllInfo& dllInfo)
 {
     BaseClass::InitSystem(initInfo, dllInfo);
+    CoopPtrHygiene::Initialize();
     LoadPersistentConfig();
     InstallCrashExceptionHandler();
     RegisterSystemEventListener();
@@ -50880,6 +51030,36 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
         m_networkStatus = "queued runtime unstuck";
         action = "unstuck_to_remote";
     }
+    else if (command == "coop_ptr_hygiene")
+    {
+        const std::string mode = args.empty() ? std::string("status") : ToLowerAscii(args.front());
+        if (mode == "on")
+        {
+            CoopPtrHygiene::SetEnabled(true);
+            action = "ptr_hygiene_on";
+            m_networkStatus = "ptr_hygiene tracing enabled";
+            LogCoop("ptr_hygiene enabled via runtime command");
+        }
+        else if (mode == "off")
+        {
+            CoopPtrHygiene::SetEnabled(false);
+            action = "ptr_hygiene_off";
+            m_networkStatus = "ptr_hygiene tracing disabled";
+            LogCoop("ptr_hygiene disabled via runtime command");
+        }
+        else if (mode == "status")
+        {
+            action = "ptr_hygiene_status";
+            commandDetail = CoopPtrHygiene::StatusReport();
+            m_networkStatus = "ptr_hygiene status";
+        }
+        else
+        {
+            ok = false;
+            action = "ptr_hygiene_usage";
+            m_networkStatus = "usage coop_ptr_hygiene on|off|status";
+        }
+    }
     else
     {
         ok = false;
@@ -58966,6 +59146,13 @@ void ModMain::OnLocalAreaObjectInteractiveObjectStateChanged(
             "_reason_" + StatusToken(guardReason.empty() ? std::string("-") : guardReason);
         return;
     }
+    if (CoopPtrHygiene::Enabled())
+    {
+        char extra[96];
+        std::snprintf(extra, sizeof(extra), "guid=%llu kind=%u value=%d",
+            static_cast<unsigned long long>(guid), static_cast<unsigned>(eventKind), value ? 1 : 0);
+        CoopPtrHygiene::LogPtrWith("area_interactive_state_changed", entity, extra);
+    }
     QueueLocalAreaObjectEventForHook(eventKind, guid, value ? 1u : 0u, 0, reason);
 }
 
@@ -61394,6 +61581,31 @@ bool ModMain::QueueLocalAreaObjectEventForHook(
         "_save_" + std::to_string(packet.hostSaveKeyHash) +
         "_reason_" + StatusToken(reason && reason[0] ? std::string(reason) : std::string("-"));
     LogCoop(m_lastAreaObjectEvent);
+    if (CoopPtrHygiene::Enabled() &&
+        (packet.eventKind == CoopProtocol::kAreaObjectEventInteractiveObjectActive ||
+            packet.eventKind == CoopProtocol::kAreaObjectEventInteractiveObjectDisabled))
+    {
+        // Full packet field dump for the suspect interactive-object kinds:
+        // 64-bit fields in 16-hex so a truncated value is visible.
+        char line[512];
+        std::snprintf(line, sizeof(line),
+            "ptr_hygiene tag=area_object_event_sent kind=%u value=%u flags=%u count=%d event=0x%016llX areaRevision=%u worldEpoch=%u hostSaveKeyHash=0x%016llX levelId=0x%016llX sourcePeerHash=0x%016llX targetGuid=0x%016llX targetClassHash=0x%016llX preVersion=%u postVersion=%u",
+            static_cast<unsigned>(packet.eventKind),
+            static_cast<unsigned>(packet.value),
+            static_cast<unsigned>(packet.flags),
+            packet.count,
+            static_cast<unsigned long long>(packet.eventId),
+            static_cast<unsigned>(packet.areaRevision),
+            static_cast<unsigned>(packet.worldEpoch),
+            static_cast<unsigned long long>(packet.hostSaveKeyHash),
+            static_cast<unsigned long long>(packet.levelId),
+            static_cast<unsigned long long>(packet.sourcePeerHash),
+            static_cast<unsigned long long>(packet.targetGuid),
+            static_cast<unsigned long long>(packet.targetClassHash),
+            static_cast<unsigned>(packet.preVersion),
+            static_cast<unsigned>(packet.postVersion));
+        LogCoop(line);
+    }
     return true;
 }
 
@@ -63672,6 +63884,13 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
         packet.eventKind == CoopProtocol::kAreaObjectEventInteractiveObjectDisabled)
     {
         void* interactiveObject = GetArkInteractiveObjectExtensionFromEntity(entity);
+        if (CoopPtrHygiene::Enabled())
+        {
+            CoopPtrHygiene::LogPtr("area_apply_interactive_entity", entity);
+            CoopPtrHygiene::CheckAbove32("area_apply_interactive_entity", entity);
+            CoopPtrHygiene::LogPtr("area_apply_interactive_ext", interactiveObject);
+            CoopPtrHygiene::CheckAbove32("area_apply_interactive_ext", interactiveObject);
+        }
         if (!interactiveObject)
         {
             detail = "missing_arkinteractiveobject_extension_guid_" + std::to_string(packet.targetGuid);
@@ -63712,6 +63931,18 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
             after,
             activeState ? "area object apply interactive active after" : "area object apply interactive disabled after",
             &reason);
+        if (CoopPtrHygiene::Enabled())
+        {
+            char extra[128];
+            std::snprintf(extra, sizeof(extra),
+                "kind=%u guid=%llu desired=%d before=%d after=%d",
+                static_cast<unsigned>(packet.eventKind),
+                static_cast<unsigned long long>(packet.targetGuid),
+                desired ? 1 : 0,
+                before ? 1 : 0,
+                after ? 1 : 0);
+            CoopPtrHygiene::LogPtrWith("area_apply_interactive_state", interactiveObject, extra);
+        }
         detail = callOk && after == desired
             ? (std::string("applied_interactive_object_") + (activeState ? "active_" : "disabled_") +
                 std::to_string(desired ? 1 : 0) + "_id_" + std::to_string(entityId))

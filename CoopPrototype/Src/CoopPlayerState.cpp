@@ -1,6 +1,7 @@
 #include "ModMain.h"
 #include "CoopRuntimeLog.h"
 #include "CoopRuntimeGuards.h"
+#include "CoopPtrHygiene.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -15,6 +16,8 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstddef>
+#include <cstdio>
 #include <cstdint>
 #include <cstdlib>
 #include <string>
@@ -128,7 +131,17 @@ bool IsLocalPlayerHealthComponent(const ArkPlayerHealthComponent* healthComponen
     if (!healthComponent || !ArkPlayer::GetInstancePtr())
         return false;
 
-    return healthComponent == &ArkPlayer::GetInstance().m_playerComponent.GetHealthComponent();
+    ArkPlayerHealthComponent* localComponent = &ArkPlayer::GetInstance().m_playerComponent.GetHealthComponent();
+    if (healthComponent != localComponent && CoopPtrHygiene::Enabled())
+    {
+        char line[160];
+        std::snprintf(line, sizeof(line),
+            "ptr_hygiene tag=local_player_health_mismatch got=0x%016llX expected=0x%016llX",
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(healthComponent)),
+            static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(localComponent)));
+        CoopRuntimeLog::WriteRateLimited("local_player_health_mismatch", line, 1.0, 3);
+    }
+    return healthComponent == localComponent;
 }
 
 void NormalizeHealthFeedbackAfterRestore(ArkPlayerHealthComponent& healthComponent, float health)
@@ -791,6 +804,40 @@ void ModMain::OnArkPlayerSignalHitObserved(const HitInfo& hitInfo, uint64_t pack
         " target=" + std::to_string(resolved.targetId);
 }
 
+// CArkSignalContext is a 16-byte { int32 variant discriminant, 8-byte payload }:
+//   0 = boost::blank, 1 = HitInfo const*, 2 = SExplosionContainer*.
+// The native GetDamage*/GetHitInfo() accessors abort the entire process (SEH
+// cannot catch it) whenever the variant does not hold a HitInfo const*, so
+// inspect the payload directly instead of calling them.
+static bool TryGetSignalContextHitInfo(
+    const ArkSignalSystem::CArkSignalContext& context,
+    const HitInfo** outHitInfo,
+    int* outVariantIndex)
+{
+    const uint8_t* base = reinterpret_cast<const uint8_t*>(&context);
+    int32_t index = -1;
+    if (!CoopRuntimeGuards::TryReadRuntimeValue(
+            reinterpret_cast<const int32_t const*>(base), index))
+    {
+        return false;
+    }
+    const void* payload = nullptr;
+    if (!CoopRuntimeGuards::TryReadRuntimeValue(
+            reinterpret_cast<const void* const*>(base + 8), payload))
+    {
+        return false;
+    }
+    if (outVariantIndex)
+        *outVariantIndex = index;
+    if (index != 1 ||
+        !CoopRuntimeGuards::IsReadableRuntimePointer(payload, sizeof(HitInfo)))
+    {
+        return false;
+    }
+    *outHitInfo = static_cast<const HitInfo*>(payload);
+    return true;
+}
+
 void ModMain::OnArkSignalPackageObserved(
     EntityId targetEntityId,
     EntityId senderEntityId,
@@ -837,12 +884,9 @@ void ModMain::OnArkSignalPackageObserved(
     pending.position = playerEntity->GetWorldPos();
 
     const HitInfo* hitInfo = nullptr;
-    if (TryGuardedCall(
-        "signal package context GetHitInfo",
-        [&context]() -> const HitInfo* { return context.GetHitInfo(); },
-        hitInfo,
-        nullptr) &&
-        hitInfo)
+    int variantIndex = -1;
+    TryGetSignalContextHitInfo(context, &hitInfo, &variantIndex);
+    if (hitInfo)
     {
         if (hitInfo->shooterId != INVALID_ENTITYID && hitInfo->shooterId != 0)
             pending.instigatorId = hitInfo->shooterId;
@@ -869,52 +913,15 @@ void ModMain::OnArkSignalPackageObserved(
     }
     else
     {
-        EntityId contextInstigator = INVALID_ENTITYID;
-        EntityId contextWeapon = INVALID_ENTITYID;
-        Vec3 contextPosition = ZERO;
-        Vec3 contextDirection = ZERO;
-        if (TryGuardedCall(
-            "signal package context instigator",
-            [&context]() -> unsigned { return context.GetDamageInstigatorId(); },
-            contextInstigator,
-            nullptr) &&
-            contextInstigator != INVALID_ENTITYID &&
-            contextInstigator != 0)
-        {
-            pending.instigatorId = contextInstigator;
-        }
-        if (TryGuardedCall(
-            "signal package context weapon",
-            [&context]() -> unsigned { return context.GetDamageWeaponId(); },
-            contextWeapon,
-            nullptr) &&
-            contextWeapon != INVALID_ENTITYID &&
-            contextWeapon != 0)
-        {
-            pending.weaponId = contextWeapon;
-        }
-        if (TryGuardedCall(
-            "signal package context position",
-            [&context]() -> Vec3 { return context.GetDamagePosition(); },
-            contextPosition,
-            nullptr) &&
-            std::isfinite(contextPosition.x) &&
-            std::isfinite(contextPosition.y) &&
-            std::isfinite(contextPosition.z) &&
-            (std::abs(contextPosition.x) > 0.001f ||
-                std::abs(contextPosition.y) > 0.001f ||
-                std::abs(contextPosition.z) > 0.001f))
-        {
-            pending.position = contextPosition;
-        }
-        if (TryGuardedCall(
-            "signal package context direction",
-            [&context]() -> Vec3 { return context.GetDamageDirection(); },
-            contextDirection,
-            nullptr))
-        {
-            pending.direction = contextDirection;
-        }
+        // The context variant does not hold a HitInfo const* (blank or
+        // explosion context, e.g. healing/water/sink signal packages). The
+        // native damage getters abort the process on such contexts, so the
+        // pending fields stay at the fallback values set above and only a
+        // breadcrumb is written.
+        const std::string breadcrumb =
+            "signal_ctx_no_hit pkg=" + std::to_string(packageId) +
+            " variant=" + std::to_string(variantIndex);
+        CoopRuntimeLog::WriteRateLimited("signal_ctx_no_hit", breadcrumb, 1.0, 3);
     }
 
     if ((pending.sourceId == INVALID_ENTITYID || pending.sourceId == 0) &&
@@ -946,11 +953,22 @@ void ModMain::OnArkSignalPackageObserved(
         nullptr);
 
     EntityId instigatorEntityId = package.m_sourceId;
-    TryGuardedCall(
-        "signal package context instigator outer",
-        [&package]() -> unsigned { return package.m_context.GetDamageInstigatorId(); },
-        instigatorEntityId,
-        nullptr);
+    // The native GetDamageInstigatorId() aborts the process when the context
+    // variant does not hold a HitInfo const*, so read the payload directly.
+    {
+        const HitInfo* contextHitInfo = nullptr;
+        if (TryGetSignalContextHitInfo(package.m_context, &contextHitInfo, nullptr))
+        {
+            unsigned contextInstigator = 0;
+            if (CoopRuntimeGuards::TryReadRuntimeValue(
+                    &contextHitInfo->shooterId, contextInstigator) &&
+                contextInstigator != INVALID_ENTITYID &&
+                contextInstigator != 0)
+            {
+                instigatorEntityId = contextInstigator;
+            }
+        }
+    }
 
     OnArkSignalPackageObserved(
         targetEntityId,
@@ -1665,6 +1683,12 @@ bool ModMain::SetLocalPlayerHealthSafe(float health, const char* reason)
     try
     {
         ArkPlayer& player = ArkPlayer::GetInstance();
+        if (CoopPtrHygiene::Enabled())
+        {
+            char extra[64];
+            std::snprintf(extra, sizeof(extra), "health=%.3f", health);
+            CoopPtrHygiene::LogPtrWith("player_health_write", &player.m_playerComponent.GetHealthComponent(), extra);
+        }
         const float currentHealth = player.GetHealth();
         if (std::isfinite(currentHealth) &&
             std::isfinite(health) &&
@@ -1954,6 +1978,12 @@ void ModMain::ReviveLocalPlayer(float health, bool sendStatus)
     if (!ArkPlayer::GetInstancePtr())
         return;
 
+    if (CoopPtrHygiene::Enabled())
+    {
+        char extra[64];
+        std::snprintf(extra, sizeof(extra), "health=%.3f", health);
+        CoopPtrHygiene::LogPtrWith("player_revive", &ArkPlayer::GetInstance().m_playerComponent.GetHealthComponent(), extra);
+    }
     m_localPlayerDowned = false;
     m_teamWipe = false;
     m_localReviveSuppressDownedStatusSeconds = kPostReviveDownedGraceSeconds;

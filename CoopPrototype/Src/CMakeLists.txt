@@ -74,6 +74,8 @@ set(SOURCE_FILES
 	NullUi.cpp
 	NullUi.h
     CoopPlayerSidecar.cpp
+    CoopPtrHygiene.cpp
+    CoopPtrHygiene.h
     CoopSharedDropSync.cpp
     CoopSharedStorageSync.cpp
 	CoopPlayerState.cpp
