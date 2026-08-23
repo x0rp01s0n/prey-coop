@@ -48,10 +48,11 @@ podman run --rm --security-opt label=disable \
 set -euo pipefail
 ulimit -s unlimited
 
+target=x86_64-pc-windows-msvc
 toolchain=/root/.cache/cargo-xwin/cmake/clang-cl/x86_64-pc-windows-msvc-toolchain.cmake
 if [[ ! -f "$toolchain" ]] ||
    [[ ! -f /root/.cache/cargo-xwin/xwin/DONE ]]; then
-    /usr/local/cargo/bin/cargo-xwin cache xwin
+    /usr/local/cargo/bin/cargo-xwin env --target=$target >/dev/null
 fi
 
 if [[ ! -f _deps/detours-install/lib/detours.lib ]]; then
@@ -64,7 +65,7 @@ if [[ ! -f _deps/detours-install/lib/detours.lib ]]; then
     cp "$src/detours.h" "$src/detver.h" "$out/include/detours/"
 
     common=(
-        --target=x86_64-pc-windows-msvc
+        --target=$target
         -Wno-unused-command-line-argument
         -fuse-ld=lld-link
         /nologo /W4 /Zi /MD /Gy /O2
