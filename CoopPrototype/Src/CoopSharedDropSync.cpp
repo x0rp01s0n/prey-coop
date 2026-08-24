@@ -508,6 +508,12 @@ bool ModMain::RemoveSharedDropLocal(SharedDropRecord& record, bool grantToLocalP
             m_sharedDropByEntityId.erase(entityId);
             record.localEntityId = INVALID_ENTITYID;
         }
+        // The native PickUp stores the item in the player inventory, but the
+        // weapon-component registration (weapon wheel list, quickselect slot,
+        // acquired types) rides on inventory notifications that this grant path
+        // does not reliably produce. Repair idempotently, exactly like the
+        // sidecar inventory path does; no-op for non-weapon items.
+        EnsureLocalPlayerWeaponRegistered(entityId, "shared drop grant");
         detail =
             "granted_entity_" + std::to_string(entityId) +
             "_nativeImmediate_1" +

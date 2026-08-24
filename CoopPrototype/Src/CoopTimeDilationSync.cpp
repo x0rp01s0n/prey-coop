@@ -27,6 +27,13 @@ ArkTimeScaleManager* GetTimeScaleManager()
 {
     return g_pGame ? g_pGame->m_pArkTimeScaleManager.get() : nullptr;
 }
+
+// A remote peer's slow-motion (e.g. their weapon wheel) must only dilate the
+// shared WORLD (Game) timer: enemies, props and music slow for everyone, while
+// the receiver's local Player and UI time bases stay normal so they can move
+// and operate normally as if nothing happened.
+constexpr unsigned kRemoteDilationTimers =
+    static_cast<unsigned>(ArkTimeScaleManager::EArkTimerFlag::Game);
 }
 
 bool ModMain::BuildTimeDilationPacket(
@@ -154,10 +161,12 @@ void ModMain::HandleTimeDilation(const CoopProtocol::TimeDilationPacket& packet)
             return;
         }
         ++m_timeDilationRevision;
+        const unsigned remoteTimers = packet.timers & kRemoteDilationTimers;
         ++m_timeDilationApplyDepth;
         if (m_timeDilationRemoteHandle >= 0)
             manager->ClearTimeScaleOverride(m_timeDilationRemoteHandle);
-        m_timeDilationRemoteHandle = manager->OverrideTimeScale(packet.timers, packet.scale);
+        m_timeDilationRemoteHandle =
+            remoteTimers != 0 ? manager->OverrideTimeScale(remoteTimers, packet.scale) : -1;
         --m_timeDilationApplyDepth;
         m_timeDilationOwnerHash = packet.sourcePeerHash;
         m_timeDilationTimers = packet.timers;
@@ -171,7 +180,9 @@ void ModMain::HandleTimeDilation(const CoopProtocol::TimeDilationPacket& packet)
             response.eventId = BuildTimeEventId(response.sourcePeerHash, response.sequence, response.revision, response.command);
             SendTimeDilationTo(response, m_remoteAddress, m_remotePort, "time dilation grant start failed");
         }
-        m_lastTimeDilationEvent = "host_applied_request_start";
+        m_lastTimeDilationEvent = remoteTimers != 0
+            ? "host_applied_request_start"
+            : "host_skipped_request_start_no_world_timers";
         return;
     }
 
@@ -185,10 +196,12 @@ void ModMain::HandleTimeDilation(const CoopProtocol::TimeDilationPacket& packet)
         m_timeDilationScale = packet.scale;
         if (packet.sourcePeerHash != localPeer)
         {
+            const unsigned remoteTimers = packet.timers & kRemoteDilationTimers;
             ++m_timeDilationApplyDepth;
             if (m_timeDilationRemoteHandle >= 0)
                 manager->ClearTimeScaleOverride(m_timeDilationRemoteHandle);
-            m_timeDilationRemoteHandle = manager->OverrideTimeScale(packet.timers, packet.scale);
+            m_timeDilationRemoteHandle =
+                remoteTimers != 0 ? manager->OverrideTimeScale(remoteTimers, packet.scale) : -1;
             --m_timeDilationApplyDepth;
         }
         ++m_timeDilationApplied;
