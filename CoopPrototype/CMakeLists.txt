@@ -15,8 +15,40 @@ find_package(Boost CONFIG REQUIRED)
 find_package(Detours MODULE REQUIRED)
 find_package(fmt CONFIG REQUIRED)
 
-# Common path
-set(CHAIRLOADER_COMMON_PATH "" CACHE PATH "Path to Chairloader/Common. See Common/README_ModSDK.txt.")
+# Chairloader SDK compatibility
+set(
+	CHAIRLOADER_COMMON_PATH
+	""
+	CACHE PATH
+	"Path to an unmodified upstream Chairloader/Common directory."
+)
+option(
+	COOP_ALLOW_UNSUPPORTED_CHAIRLOADER
+	"Allow a non-pinned or locally modified Chairloader Common tree (the compatibility patch must still apply)."
+	OFF
+)
+set(
+	COOP_CHAIRLOADER_SOURCE_REVISION
+	""
+	CACHE STRING
+	"Chairloader Git HEAD reported by an outer build wrapper when the checkout metadata is not mounted."
+)
+set(
+	COOP_CHAIRLOADER_SOURCE_DIRTY
+	""
+	CACHE STRING
+	"Chairloader Common dirty state reported by an outer build wrapper (ON, OFF, or UNKNOWN)."
+)
+mark_as_advanced(
+	COOP_CHAIRLOADER_SOURCE_REVISION
+	COOP_CHAIRLOADER_SOURCE_DIRTY
+)
+
+include(CMake/PrepareChairloaderCommon.cmake)
+coop_prepare_chairloader_common(
+	"${CHAIRLOADER_COMMON_PATH}"
+	COOP_CHAIRLOADER_COMMON_PATH
+)
 
 # Third-party libraries
 # add_subdirectory(ThirdParty/ExampleLibrary)

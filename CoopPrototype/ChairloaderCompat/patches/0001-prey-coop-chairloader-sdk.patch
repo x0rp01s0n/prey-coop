@@ -1,0 +1,65 @@
+--- a/Common/Prey/GameDll/ark/turret/ArkTurret.h
++++ b/Common/Prey/GameDll/ark/turret/ArkTurret.h
+@@ -2,6 +2,7 @@
+ 
+ #pragma once
+ #include <Prey/Ark/ArkAudioUtil.h>
++#include <Prey/ArkCommon/ArkUnanimous.h>
+ #include <Prey/CryAction/IGameObject.h>
+ #include <Prey/CryNetwork/ISerialize.h>
+ #include <Prey/GameDll/ark/ArkCharacterEffectsManager.h>
+@@ -15,6 +16,7 @@
+ #include <Prey/GameDll/ark/player/IArkEtherDuplicateListener.h>
+ #include <Prey/GameDll/ark/player/IArkPlayerInteractionListener.h>
+ #include <Prey/GameDll/ark/spatial/arkspatialmanagerentry.h>
++#include <Prey/GameDll/ark/spatial/arkspatialmanagerentry_turret.h>
+ #include <Prey/GameDll/ark/turret/ArkTurretDialogSpeaker.h>
+ #include <Prey/GameDll/ark/turret/ArkTurretFsm.h>
+ #include <Prey/GameDll/ark/turret/ArkTurretSignalReceiver.h>
+@@ -30,6 +32,7 @@
+ struct HitInfo;
+ class IAction;
+ class IActionController;
++class IAnimationOperatorQueue;
+ class IAnimationDatabase;
+ class ICrySizer;
+ struct IEntity;
+--- a/Common/Prey/GameDll/ark/signalsystem/arksignalmanager.h
++++ b/Common/Prey/GameDll/ark/signalsystem/arksignalmanager.h
+@@ -55,6 +55,9 @@
+ 	unsigned m_sourceId;
+ 	ArkSignalSystem::CArkSignalContext m_context;
+ 	
++	// Local reconstruction path for already-materialized network packages.
++	// Callers must fill id/source/context/values before SendToReceiver.
++	Package() = default;
+ 	Package(ArkSignalSystem::Data::PackageData const &_packageData, float _scale, ArkSignalSystem::CArkSignalContext _context, unsigned _sourceId);
+ 	void ApplyRules(std::vector<ArkSignalSystem::Data::ModifierData::RuleData> const &_rules) { FApplyRules(this,_rules); }
+ 	HitInfo const *GetHitInfo() const { return FGetHitInfo(this); }
+@@ -309,4 +312,3 @@
+ };
+ 
+ } // namespace ArkSignalSystem
+-
+--- a/Common/Prey/CryMovie/IMovieSystem.h
++++ b/Common/Prey/CryMovie/IMovieSystem.h
+@@ -4,6 +4,19 @@
+ struct IAnimSequence;
+ struct SCameraParams;
+ 
++struct IMovieListener
++{
++	enum EMovieEvent
++	{
++		eMovieEvent_Started = 0,
++		eMovieEvent_Stopped = 1,
++		eMovieEvent_Aborted = 2,
++	};
++
++	virtual ~IMovieListener() {}
++	virtual void OnMovieEvent(EMovieEvent event, IAnimSequence* pSequence) = 0;
++};
++
+ // IMovieUser
+ // Header:  _unknown/IMovieUser.h
+ // Include: Prey/CryMovie/IMovieSystem.h

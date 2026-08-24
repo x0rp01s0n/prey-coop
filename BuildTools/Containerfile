@@ -1,7 +1,7 @@
 FROM ghcr.io/rust-cross/cargo-xwin:latest
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends clang-tools-19 lld-19 libboost-dev libfmt-dev \
+    && apt-get install -y --no-install-recommends clang-tools-19 git lld-19 libboost-dev libfmt-dev \
     && ln -sf /usr/bin/clang-cl-19 /usr/local/bin/clang-cl \
     && ln -sf /usr/bin/lld-link-19 /usr/local/bin/lld-link \
     && ln -sf /usr/bin/llvm-lib-19 /usr/local/bin/llvm-lib \

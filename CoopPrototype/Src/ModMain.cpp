@@ -25,7 +25,7 @@
 #include "CoopPreloadSaveMerge.h"
 #include "CoopSaveStoreDecoder.h"
 #include "CoopSerializerTrace.h"
-#include "VTableHook.h"
+#include "CoopVTableHook.h"
 
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -7982,7 +7982,8 @@ static auto s_hookArkNpcAnimActionBaseConstruct = s_funcArkNpcAnimActionBaseCons
 
 using PhysicalWorldGetEntitiesInBoxFn = int (*)(IPhysicalWorld* world, Vec3 ptmin, Vec3 ptmax, IPhysicalEntity**& pList, int objtypes, int szListPrealloc);
 constexpr size_t kIPhysicalWorldGetEntitiesInBoxVtableIndex = 34;
-static VTableHook s_physicalWorldVTableHook;
+static_assert(kIPhysicalWorldGetEntitiesInBoxVtableIndex < CoopVTableHook::kHookableMethodCount);
+static CoopVTableHook s_physicalWorldVTableHook;
 static IPhysicalWorld* s_hookedPhysicalWorld = nullptr;
 static PhysicalWorldGetEntitiesInBoxFn s_originalPhysicalWorldGetEntitiesInBox = nullptr;
 
@@ -30713,11 +30714,29 @@ void ModMain::RegisterPhysicalWorldBoxQueryHook()
         return;
     }
 
-    s_physicalWorldVTableHook.HookObject(gEnv->pPhysicalWorld);
+    if (!s_physicalWorldVTableHook.HookObject(gEnv->pPhysicalWorld))
+    {
+        m_lastPhysicalWorldBoxHookEvent =
+            "physicalworld_get_entities_in_box_hook_failed_clone";
+        LogCoop(m_lastPhysicalWorldBoxHookEvent);
+        return;
+    }
+
     s_originalPhysicalWorldGetEntitiesInBox =
         s_physicalWorldVTableHook.HookMethod(
             kIPhysicalWorldGetEntitiesInBoxVtableIndex,
             &PhysicalWorld_GetEntitiesInBox_Hook);
+    if (!s_originalPhysicalWorldGetEntitiesInBox)
+    {
+        const bool restored = s_physicalWorldVTableHook.UnhookObject();
+        m_lastPhysicalWorldBoxHookEvent =
+            restored
+                ? "physicalworld_get_entities_in_box_hook_failed_method"
+                : "physicalworld_get_entities_in_box_hook_failed_method_restore";
+        LogCoop(m_lastPhysicalWorldBoxHookEvent);
+        return;
+    }
+
     s_hookedPhysicalWorld = gEnv->pPhysicalWorld;
     m_lastPhysicalWorldBoxHookEvent =
         "physicalworld_get_entities_in_box_hook_installed"
@@ -30730,10 +30749,18 @@ void ModMain::UnregisterPhysicalWorldBoxQueryHook()
     if (!s_hookedPhysicalWorld)
         return;
 
-    s_physicalWorldVTableHook.UnhookObject();
+    if (!s_physicalWorldVTableHook.UnhookObject())
+    {
+        m_lastPhysicalWorldBoxHookEvent =
+            "physicalworld_get_entities_in_box_hook_remove_deferred_vtable_changed";
+        LogCoop(m_lastPhysicalWorldBoxHookEvent);
+        return;
+    }
+
     s_hookedPhysicalWorld = nullptr;
     s_originalPhysicalWorldGetEntitiesInBox = nullptr;
     m_lastPhysicalWorldBoxHookEvent = "physicalworld_get_entities_in_box_hook_removed";
+    LogCoop(m_lastPhysicalWorldBoxHookEvent);
 }
 
 void ModMain::InstallCrashExceptionHandler()

@@ -24,6 +24,32 @@ engineering notes are deliberately not tracked.
 The mod needs a Chairloader checkout because it compiles Chairloader's `Common`
 sources as a static dependency.
 
+### Chairloader SDK compatibility
+
+The supported upstream Chairloader revision is
+`97899fbd86ab183a08ed579d6f95ed40262c7e15`. The checkout must be clean by
+default. During CMake configuration, its `Common/` directory is copied to
+`${CMAKE_BINARY_DIR}/_deps/chairloader-sdk/Common`, supplemented with the small
+compatibility overlay in this repository, and patched only inside that private
+build tree. The supplied Chairloader checkout is never modified.
+
+The Linux wrapper reports the source checkout's Git HEAD and `Common/` dirty
+state before mounting `Common/` read-only in the build container. Native CMake
+builds inspect the checkout directly. A revision mismatch, local SDK changes,
+overlay collision, or patch applicability failure stops configuration.
+
+For deliberate forward-compatibility testing, revision and cleanliness checks
+can be relaxed while retaining overlay and patch validation:
+
+```bash
+COOP_ALLOW_UNSUPPORTED_CHAIRLOADER=ON \
+CHAIRLOADER_COMMON_PATH=/path/to/Chairloader/Common \
+./build-msvc.sh
+```
+
+The `CoopAbiSmokeTest` executable is compiled and linked before the mod DLL and
+asserts the restored `ArkTurret` ABI, including `sizeof(ArkTurret) == 3720`.
+
 On Linux with Podman:
 
 ```bash
@@ -46,7 +72,9 @@ the current `ModMain.cpp` translation unit is large. Set
 
 For a native Windows build, configure `CoopPrototype/` with CMake 3.25 or newer,
 the repository's `CoopPrototype/vcpkg.json` manifest and
-`-DCHAIRLOADER_COMMON_PATH=C:/path/to/Chairloader/Common`.
+`-DCHAIRLOADER_COMMON_PATH=C:/path/to/Chairloader/Common`. Use
+`-DCOOP_ALLOW_UNSUPPORTED_CHAIRLOADER=ON` only for intentional compatibility
+testing against another revision.
 
 ## License
 

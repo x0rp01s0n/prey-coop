@@ -6,6 +6,9 @@ IMAGE="${COOP_BUILD_IMAGE:-prey-msvc-buildtools}"
 BUILD_JOBS="${BUILD_JOBS:-1}"
 COMMON_PATH="${CHAIRLOADER_COMMON_PATH:-}"
 DETOURS_TAG="${DETOURS_TAG:-v4.0.1}"
+ALLOW_UNSUPPORTED_CHAIRLOADER="${COOP_ALLOW_UNSUPPORTED_CHAIRLOADER:-OFF}"
+CHAIRLOADER_SOURCE_REVISION=""
+CHAIRLOADER_SOURCE_DIRTY="UNKNOWN"
 
 if [[ -z "$COMMON_PATH" ]]; then
     printf 'CHAIRLOADER_COMMON_PATH must point to Chairloader/Common.\n' >&2
@@ -21,10 +24,23 @@ fi
 command -v podman >/dev/null ||
     { printf 'podman is required.\n' >&2; exit 2; }
 command -v git >/dev/null ||
-    { printf 'git is required to fetch Microsoft Detours.\n' >&2; exit 2; }
+    { printf 'git is required to inspect Chairloader and fetch Microsoft Detours.\n' >&2; exit 2; }
+
+if CHAIRLOADER_REPO_ROOT="$(git -C "$COMMON_PATH" rev-parse --show-toplevel 2>/dev/null)"; then
+    CHAIRLOADER_REPO_ROOT="$(realpath "$CHAIRLOADER_REPO_ROOT")"
+    COMMON_RELATIVE_PATH="$(realpath --relative-to="$CHAIRLOADER_REPO_ROOT" "$COMMON_PATH")"
+    CHAIRLOADER_SOURCE_REVISION="$(git -C "$CHAIRLOADER_REPO_ROOT" rev-parse HEAD)"
+    if [[ -n "$(git -C "$CHAIRLOADER_REPO_ROOT" \
+        status --porcelain --untracked-files=all -- "$COMMON_RELATIVE_PATH")" ]]; then
+        CHAIRLOADER_SOURCE_DIRTY="ON"
+    else
+        CHAIRLOADER_SOURCE_DIRTY="OFF"
+    fi
+fi
 
 if [[ "${COOP_REBUILD_IMAGE:-0}" == "1" ]] ||
-   ! podman image exists "$IMAGE"; then
+   ! podman image exists "$IMAGE" ||
+   ! podman run --rm "$IMAGE" git --version >/dev/null 2>&1; then
     podman build -t "$IMAGE" -f "$ROOT/BuildTools/Containerfile" \
         "$ROOT/BuildTools"
 fi
@@ -43,6 +59,9 @@ podman run --rm --security-opt label=disable \
     -v "$ROOT/_xwin-cache:/root/.cache/cargo-xwin" \
     -w /work \
     -e "BUILD_JOBS=$BUILD_JOBS" \
+    -e "COOP_ALLOW_UNSUPPORTED_CHAIRLOADER=$ALLOW_UNSUPPORTED_CHAIRLOADER" \
+    -e "COOP_CHAIRLOADER_SOURCE_REVISION=$CHAIRLOADER_SOURCE_REVISION" \
+    -e "COOP_CHAIRLOADER_SOURCE_DIRTY=$CHAIRLOADER_SOURCE_DIRTY" \
     "$IMAGE" \
     bash -lc '
 set -euo pipefail
@@ -95,6 +114,9 @@ cmake -S CoopPrototype -B _build/coop-xwin -G Ninja \
     -Dfmt_DIR=/work/BuildTools/cmake \
     -DCMAKE_PREFIX_PATH=/work/_deps/detours-install \
     -DCHAIRLOADER_COMMON_PATH=/chairloader-common \
+    -DCOOP_ALLOW_UNSUPPORTED_CHAIRLOADER="$COOP_ALLOW_UNSUPPORTED_CHAIRLOADER" \
+    -DCOOP_CHAIRLOADER_SOURCE_REVISION="$COOP_CHAIRLOADER_SOURCE_REVISION" \
+    -DCOOP_CHAIRLOADER_SOURCE_DIRTY="$COOP_CHAIRLOADER_SOURCE_DIRTY" \
     -DMOD_DLL_PATH=/work/CoopPrototype \
     -DCMAKE_SHARED_LINKER_FLAGS=/defaultlib:advapi32.lib
 
