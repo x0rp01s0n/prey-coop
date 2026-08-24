@@ -96,6 +96,7 @@ set(SOURCE_FILES
 	CoopEventRouter.cpp
 	CoopEventRouter.h
 	CoopProtocol.h
+	CoopVTableHook.h
 	ModMain.cpp
 	ModMain.h
 	pch.h
@@ -112,6 +113,15 @@ target_precompile_headers(${MOD_NAME} PRIVATE pch.h)
 mod_output_dir(${MOD_NAME} MOD)
 
 source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${SOURCE_FILES})
+
+# Compile and link a tiny executable that validates the engine-facing turret ABI.
+# Keeping it outside SOURCE_FILES prevents main() from entering the mod DLL.
+add_executable(CoopAbiSmokeTest EXCLUDE_FROM_ALL CoopAbiSmokeTest.cpp)
+target_link_libraries(CoopAbiSmokeTest PRIVATE CommonMod advapi32)
+set_target_properties(CoopAbiSmokeTest PROPERTIES
+	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/abi-smoke"
+)
+add_dependencies(${MOD_NAME} CoopAbiSmokeTest)
 
 add_executable(CoopWineFocusCtl CoopWineFocusCtl.cpp)
 target_link_libraries(CoopWineFocusCtl user32 gdi32)
