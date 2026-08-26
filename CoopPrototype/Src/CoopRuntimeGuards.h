@@ -46,6 +46,16 @@ std::string GetRuntimeModulePath(const void* pointer);
 std::string ReadRuntimeCString(const char* pointer, size_t maxLength);
 bool RuntimeCStringEquals(const char* pointer, const char* expected, size_t maxLength);
 RuntimeGuardSnapshot GetRuntimeGuardSnapshot();
+
+// Self-profiling totals (lock-free): cumulative time inside guarded callbacks
+// (including VirtualQuery preflight reads) and the number of VirtualQuery
+// calls made by the guard layer. Windows-only cost centers — see RESULTS.md.
+struct GuardTelemetryTotals
+{
+    uint64_t guardedCallTotalNs = 0;
+    uint64_t virtualQueryCalls = 0;
+};
+GuardTelemetryTotals GetGuardTelemetryTotals();
 bool IsGuardedCallbackActive();
 
 using RuntimeGuardCallback = bool (*)(void* context);

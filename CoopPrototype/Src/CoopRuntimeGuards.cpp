@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <chrono>
 #include <mutex>
 
 namespace CoopRuntimeGuards
@@ -53,6 +54,20 @@ RuntimeGuardState& GetGuardState()
     return state;
 }
 
+// Self-profiling: total guarded-call time and VirtualQuery calls. These are
+// the Windows-only hot-path costs (under Wine/Proton VirtualQuery is a
+// user-space walk; on native Windows it is a kernel syscall per call), so we
+// track them to quantify platform-specific overhead from telemetry alone.
+std::atomic<uint64_t> g_guardedCallTotalNs{0};
+std::atomic<uint64_t> g_virtualQueryCalls{0};
+
+uint64_t GuardTelemetryNowNs()
+{
+    using namespace std::chrono;
+    return static_cast<uint64_t>(
+        duration_cast<nanoseconds>(steady_clock::now().time_since_epoch()).count());
+}
+
 const char* AccessName(RuntimeAccess access)
 {
     switch (access)
@@ -87,6 +102,7 @@ bool QueryRuntimeMemory(const void* pointer, size_t minBytes, RuntimeMemoryQuery
     const auto value = reinterpret_cast<std::uintptr_t>(pointer);
     outQuery = {};
     outQuery.value = value;
+    g_virtualQueryCalls.fetch_add(1, std::memory_order_relaxed);
 
     if (value < 0x10000 || value == ~std::uintptr_t{ 0 })
     {
@@ -221,6 +237,7 @@ bool TryRunGuardedCallbackRaw(RuntimeGuardCallback callback, void* context, SehC
     if (!callback)
         return false;
 
+    const uint64_t startNs = GuardTelemetryNowNs();
     ++g_guardedCallbackDepth;
     bool result = false;
 #if defined(_MSC_VER) || defined(__clang__)
@@ -237,6 +254,7 @@ bool TryRunGuardedCallbackRaw(RuntimeGuardCallback callback, void* context, SehC
 #endif
 
     --g_guardedCallbackDepth;
+    g_guardedCallTotalNs.fetch_add(GuardTelemetryNowNs() - startNs, std::memory_order_relaxed);
     return result;
 }
 }
@@ -409,6 +427,14 @@ bool RuntimeCStringEquals(const char* pointer, const char* expected, size_t maxL
     }
 
     return false;
+}
+
+GuardTelemetryTotals GetGuardTelemetryTotals()
+{
+    GuardTelemetryTotals totals;
+    totals.guardedCallTotalNs = g_guardedCallTotalNs.load(std::memory_order_relaxed);
+    totals.virtualQueryCalls = g_virtualQueryCalls.load(std::memory_order_relaxed);
+    return totals;
 }
 
 RuntimeGuardSnapshot GetRuntimeGuardSnapshot()
