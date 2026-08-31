@@ -945,6 +945,15 @@ void ModMain::OnArkSignalPackageObserved(
     const ArkSignalSystem::Package& package,
     const char* stage)
 {
+    // Cheap pre-check before any guarded (VirtualQuery-backed) reads below:
+    // the forwarded overload early-outs on these same conditions, so in
+    // offline / disabled states every guarded call here was pure overhead.
+    // This hook fires for EVERY signal package delivered to ANY receiver
+    // (lights, doors, physics props), so keep the offline path allocation-
+    // and syscall-free.
+    if (!m_damageDedupeEnabled || m_networkMode == CoopNetworkMode::Off)
+        return;
+
     uint64_t packageId = package.m_id;
     TryGuardedCall(
         "signal package GetId",

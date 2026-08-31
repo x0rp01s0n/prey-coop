@@ -1,5 +1,6 @@
 #include "ModMain.h"
 #include "CoopRuntimeGuards.h"
+#include "CoopHookStats.h"
 #include "CoopWorkstationSync.h"
 #include "CoopSerialSequence.h"
 #include "CoopRuntimeLog.h"
@@ -7218,6 +7219,17 @@ std::string ModMain::BuildRuntimeCostReport() const
         << ",boxHuge=" << m_physicalWorldBoxHookHugeQueries
         << ",mannequin=" << m_npcMannequinConstructTraceCount
         << ",semantic=" << m_npcSemanticTraceCount;
+
+    // Windows-only cost centers: guarded callbacks (SEH + VirtualQuery) and
+    // per-hook self-profiling. See the issue #2 investigation notes.
+    const CoopRuntimeGuards::GuardTelemetryTotals guardTotals =
+        CoopRuntimeGuards::GetGuardTelemetryTotals();
+    out << ",guardCallsNs=" << guardTotals.guardedCallTotalNs
+        << ",virtualQueries=" << guardTotals.virtualQueryCalls;
+
+    const std::string hookStats = CoopHookStats::BuildReport();
+    if (!hookStats.empty())
+        out << ",hookStats=" << hookStats;
     return out.str();
 }
 
@@ -16667,8 +16679,10 @@ static void ArkOperatorLaserHelper_DoDamage_Hook(
     s_hookArkOperatorLaserDamage.InvokeOrig(helper, npc, frameTime, collision);
 }
 
+static CoopHookStats::Slot* s_hookStatMannequinStoreAction = CoopHookStats::Register("Mannequin::StoreAction");
 static void ArkNpcBodyState_StoreAction_Hook(void* stateSlot, void* transitionPayload)
 {
+    CoopHookStats::Scoped hookStatScope(s_hookStatMannequinStoreAction);
     const std::string callChain = CaptureMannequinCallChainTrace("ArkNpcBodyState::StoreAction");
     if (gMod)
         gMod->RecordNpcMannequinStoreAction(
@@ -16685,6 +16699,7 @@ static void ArkNpcBodyState_StoreAction_Hook(void* stateSlot, void* transitionPa
             callChain.c_str());
 }
 
+static CoopHookStats::Slot* s_hookStatSetPosRotScale = CoopHookStats::Register("CEntity::SetPosRotScale");
 static void CEntity_SetPosRotScale_RemoteEnemyTransform_Hook(
     CEntity* entity,
     Vec3 const& position,
@@ -16692,6 +16707,7 @@ static void CEntity_SetPosRotScale_RemoteEnemyTransform_Hook(
     Vec3 const& scale,
     int whyFlags)
 {
+    CoopHookStats::Scoped hookStatScope(s_hookStatSetPosRotScale);
     TracePostLoadNativeHook("CEntity::SetPosRotScale");
     if (gMod)
         gMod->RecordRuntimeTransformHook(false);
@@ -16737,11 +16753,13 @@ static void CEntity_SetPosRotScale_RemoteEnemyTransform_Hook(
     invokeOrig(position, rotation);
 }
 
+static CoopHookStats::Slot* s_hookStatSetWorldTM = CoopHookStats::Register("CEntity::SetWorldTM");
 static void CEntity_SetWorldTM_RemoteEnemyTransform_Hook(
     CEntity* entity,
     Matrix34 const& tm,
     int whyFlags)
 {
+    CoopHookStats::Scoped hookStatScope(s_hookStatSetWorldTM);
     TracePostLoadNativeHook("CEntity::SetWorldTM");
     if (gMod)
         gMod->RecordRuntimeTransformHook(false);
@@ -16798,6 +16816,7 @@ static void CEntity_SetWorldTM_RemoteEnemyTransform_Hook(
     invokeOrig(tm);
 }
 
+static CoopHookStats::Slot* s_hookStatSetPos = CoopHookStats::Register("CEntity::SetPos");
 static void CEntity_SetPos_RemoteEnemyTransform_Hook(
     CEntity* entity,
     Vec3 const& position,
@@ -16805,6 +16824,7 @@ static void CEntity_SetPos_RemoteEnemyTransform_Hook(
     bool recalcPhysicsBounds,
     bool force)
 {
+    CoopHookStats::Scoped hookStatScope(s_hookStatSetPos);
     TracePostLoadNativeHook("CEntity::SetPos");
     if (gMod)
         gMod->RecordRuntimeTransformHook(false);
@@ -16850,11 +16870,13 @@ static void CEntity_SetPos_RemoteEnemyTransform_Hook(
     invokeOrig(position);
 }
 
+static CoopHookStats::Slot* s_hookStatSetRotation = CoopHookStats::Register("CEntity::SetRotation");
 static void CEntity_SetRotation_RemoteEnemyTransform_Hook(
     CEntity* entity,
     Quat const& rotation,
     int whyFlags)
 {
+    CoopHookStats::Scoped hookStatScope(s_hookStatSetRotation);
     TracePostLoadNativeHook("CEntity::SetRotation");
     if (gMod)
         gMod->RecordRuntimeTransformHook(false);
@@ -20996,6 +21018,7 @@ static bool ArkKeycardReader_SetLocked_Hook(ArkKeycardReader* reader, bool locke
     return result;
 }
 
+static CoopHookStats::Slot* s_hookStatSignalSendPackage = CoopHookStats::Register("Signal::SendPackage");
 static void ArkSignalManager_SendPackage_Hook(
     ArkSignalSystem::Manager* manager,
     unsigned targetEntityId,
@@ -21008,6 +21031,7 @@ static void ArkSignalManager_SendPackage_Hook(
     float repeatTime,
     bool delayFirstSend)
 {
+    CoopHookStats::Scoped hookStatScope(s_hookStatSignalSendPackage);
     if (gMod && manager)
     {
         gMod->OnArkEnemySignalPackageObserved(
@@ -21072,11 +21096,13 @@ static void ArkSignalManager_SendPackage_Hook(
         delayFirstSend);
 }
 
+static CoopHookStats::Slot* s_hookStatSignalSendToReceiver = CoopHookStats::Register("Signal::SendToReceiver");
 static void ArkSignalManager_SendToReceiver_Hook(
     ArkSignalSystem::Manager* manager,
     const unsigned targetEntityId,
     const ArkSignalSystem::Package& package)
 {
+    CoopHookStats::Scoped hookStatScope(s_hookStatSignalSendToReceiver);
     bool suppressEnemyReceiver = false;
     if (gMod && manager)
     {
@@ -34834,6 +34860,34 @@ void ModMain::OnArkSaveLoadSerializePersistentStateHook(
 void ModMain::MainUpdate(unsigned updateFlags)
 {
     const float frameTime = gEnv && gEnv->pTimer ? gEnv->pTimer->GetFrameTime() : 0.0f;
+
+    // Periodic self-profiling dump (issue #2): hook cost breakdown + guarded
+    // call / VirtualQuery totals straight into Game.log, independent of the
+    // extractor status writer. Once per ~10 s at 60 fps (600 frames).
+    {
+        static std::atomic<uint32_t> s_hookStatFrameCounter{0};
+        static std::atomic<uint64_t> s_lastDumpGuardNs{0};
+        static std::atomic<uint64_t> s_lastDumpVq{0};
+        if ((s_hookStatFrameCounter.fetch_add(1, std::memory_order_relaxed) % 600u) == 0u)
+        {
+            const CoopRuntimeGuards::GuardTelemetryTotals totals =
+                CoopRuntimeGuards::GetGuardTelemetryTotals();
+            const uint64_t guardDeltaNs =
+                totals.guardedCallTotalNs - s_lastDumpGuardNs.exchange(totals.guardedCallTotalNs);
+            const uint64_t vqDelta = totals.virtualQueryCalls - s_lastDumpVq.exchange(totals.virtualQueryCalls);
+            std::ostringstream out;
+            out << "hookstats windowFrames=600"
+                << " guardTotalNs=" << totals.guardedCallTotalNs
+                << " guardWindowNs=" << guardDeltaNs
+                << " virtualQueries=" << totals.virtualQueryCalls
+                << " vqWindow=" << vqDelta;
+            const std::string hooks = CoopHookStats::BuildReport();
+            if (!hooks.empty())
+                out << " hooks=" << hooks;
+            CoopRuntimeLog::Write(out.str());
+            CoopHookStats::ResetAll();
+        }
+    }
     using XInputGetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
     static XInputGetStateFn getXInputState = []() -> XInputGetStateFn
     {
