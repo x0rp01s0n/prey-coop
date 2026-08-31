@@ -5,6 +5,7 @@
 #include "CoopSerialSequence.h"
 #include "CoopRuntimeLog.h"
 #include "CoopRuntimeConfig.h"
+#include "CoopFilesystem.h"
 #include "CoopPtrHygiene.h"
 #include "CoopDamagePolicy.h"
 #include "CoopCampaignAreaFacts.generated.h"
@@ -3285,7 +3286,7 @@ uint32_t UpdateFnv1a(uint32_t checksum, const uint8_t* data, size_t size)
 
 bool GetFileSizeBytes(const std::string& path, uint32_t& outSize)
 {
-    std::ifstream stream(path, std::ios::binary | std::ios::ate);
+    std::ifstream stream(CoopFilesystem::FromUtf8(path), std::ios::binary | std::ios::ate);
     if (!stream)
         return false;
 
@@ -3299,7 +3300,7 @@ bool GetFileSizeBytes(const std::string& path, uint32_t& outSize)
 
 bool ComputeFileChecksum(const std::string& path, uint32_t& outChecksum)
 {
-    std::ifstream stream(path, std::ios::binary);
+    std::ifstream stream(CoopFilesystem::FromUtf8(path), std::ios::binary);
     if (!stream)
         return false;
 
@@ -3343,7 +3344,7 @@ bool ReadBinaryFileLimited(
         return false;
 
     std::error_code error;
-    const std::filesystem::path fsPath(path);
+    const std::filesystem::path fsPath = CoopFilesystem::FromUtf8(path);
     if (!std::filesystem::is_regular_file(fsPath, error) || error)
         return false;
 
@@ -3493,7 +3494,8 @@ bool ValidatePlayerStateIntegrityFile(
 
 bool WriteTextFileWithIntegrityHash(const std::filesystem::path& path, const std::string& payload)
 {
-    const std::filesystem::path tempPath = path.string() + ".tmp";
+    std::filesystem::path tempPath = path;
+    tempPath += ".tmp";
     std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
     if (!output)
         return false;
@@ -3540,11 +3542,10 @@ bool ReadBinaryValue(std::istream& stream, T& value)
 
 std::filesystem::path GetPreyProfileRoot()
 {
-    const char* userProfile = std::getenv("USERPROFILE");
-    if (!userProfile || !userProfile[0])
+    std::filesystem::path root = CoopFilesystem::EnvironmentPath("USERPROFILE");
+    if (root.empty())
         return {};
 
-    std::filesystem::path root(userProfile);
     root /= "Saved Games";
     root /= "Arkane Studios";
     root /= "Prey";
@@ -3669,45 +3670,35 @@ std::string BuildCoopReceivedSavePath(uint32_t transferId)
         std::error_code error;
         std::filesystem::create_directories(slotPath, error);
         if (!error)
-            return (slotPath / "save.CSF").string();
+            return CoopFilesystem::ToUtf8(slotPath / "save.CSF");
     }
 
-    const char* tempRoot = std::getenv("TEMP");
-    if (!tempRoot || !tempRoot[0])
-        tempRoot = std::getenv("TMP");
+    std::filesystem::path tempRoot = CoopFilesystem::EnvironmentPath("TEMP");
+    if (tempRoot.empty())
+        tempRoot = CoopFilesystem::EnvironmentPath("TMP");
 
     char fileName[64] = {};
     std::snprintf(fileName, sizeof(fileName), "PreyCoopHostWorld_%08X.sav", transferId);
 
-    if (!tempRoot || !tempRoot[0])
+    if (tempRoot.empty())
         return std::string(fileName);
 
-    std::string path = tempRoot;
-    const char last = path.empty() ? '\0' : path.back();
-    if (last != '\\' && last != '/')
-        path += "\\";
-    path += fileName;
-    return path;
+    return CoopFilesystem::ToUtf8(tempRoot / fileName);
 }
 
 std::string BuildCoopReceivedSavePackagePath(uint32_t transferId)
 {
-    const char* tempRoot = std::getenv("TEMP");
-    if (!tempRoot || !tempRoot[0])
-        tempRoot = std::getenv("TMP");
+    std::filesystem::path tempRoot = CoopFilesystem::EnvironmentPath("TEMP");
+    if (tempRoot.empty())
+        tempRoot = CoopFilesystem::EnvironmentPath("TMP");
 
     char fileName[64] = {};
     std::snprintf(fileName, sizeof(fileName), "PreyCoopHostWorld_%08X.cspkg", transferId);
 
-    if (!tempRoot || !tempRoot[0])
+    if (tempRoot.empty())
         return std::string(fileName);
 
-    std::string path = tempRoot;
-    const char last = path.empty() ? '\0' : path.back();
-    if (last != '\\' && last != '/')
-        path += "\\";
-    path += fileName;
-    return path;
+    return CoopFilesystem::ToUtf8(tempRoot / fileName);
 }
 
 std::filesystem::path BuildCoopClientSaveQuarantineRoot()
@@ -5178,7 +5169,7 @@ bool TryReadableSaveCandidate(const std::filesystem::path& path, std::string& ou
     uint32_t ignoredSize = 0;
     if (IsReadableFile(path, &ignoredSize))
     {
-        outPath = NormalizeNativeWindowsPath(path.string());
+        outPath = NormalizeNativeWindowsPath(CoopFilesystem::ToUtf8(path));
         return true;
     }
 
@@ -5188,7 +5179,7 @@ bool TryReadableSaveCandidate(const std::filesystem::path& path, std::string& ou
         const std::filesystem::path saveCsf = path / "save.CSF";
         if (IsReadableFile(saveCsf, &ignoredSize))
         {
-            outPath = NormalizeNativeWindowsPath(saveCsf.string());
+            outPath = NormalizeNativeWindowsPath(CoopFilesystem::ToUtf8(saveCsf));
             return true;
         }
     }
@@ -5201,14 +5192,14 @@ bool ResolveReadableSaveFile(const std::string& savePathOrName, std::string& out
     if (savePathOrName.empty() || savePathOrName == "-")
         return false;
 
-    if (TryReadableSaveCandidate(std::filesystem::path(savePathOrName), outPath))
+    if (TryReadableSaveCandidate(CoopFilesystem::FromUtf8(savePathOrName), outPath))
         return true;
 
     const std::filesystem::path saveRoot = GetPreySaveGamesRoot();
     if (saveRoot.empty())
         return false;
 
-    if (TryReadableSaveCandidate(saveRoot / savePathOrName, outPath))
+    if (TryReadableSaveCandidate(saveRoot / CoopFilesystem::FromUtf8(savePathOrName), outPath))
         return true;
 
     // Save/load hooks commonly expose only a rotating slot name such as
@@ -5221,7 +5212,9 @@ bool ResolveReadableSaveFile(const std::string& savePathOrName, std::string& out
     {
         char campaignName[32] = {};
         std::snprintf(campaignName, sizeof(campaignName), "Campaign%d", campaignSlot);
-        if (TryReadableSaveCandidate(saveRoot / campaignName / savePathOrName, outPath))
+        if (TryReadableSaveCandidate(
+                saveRoot / CoopFilesystem::FromUtf8(campaignName) / CoopFilesystem::FromUtf8(savePathOrName),
+                outPath))
             return true;
     }
 
@@ -5236,7 +5229,7 @@ bool ResolveReadableSaveFile(const std::string& savePathOrName, std::string& out
         if (!campaignEntry.is_directory(error) || error)
             continue;
 
-        if (TryReadableSaveCandidate(campaignEntry.path() / savePathOrName, outPath))
+        if (TryReadableSaveCandidate(campaignEntry.path() / CoopFilesystem::FromUtf8(savePathOrName), outPath))
             return true;
     }
 
@@ -5249,7 +5242,7 @@ void RemoveResolvedSaveSlot(const std::string& savePathOrName, const char* reaso
     if (!ResolveReadableSaveFile(savePathOrName, resolvedPath))
         return;
 
-    std::filesystem::path path(resolvedPath);
+    const std::filesystem::path path = CoopFilesystem::FromUtf8(resolvedPath);
     std::filesystem::path slotDirectory = path.parent_path();
     if (slotDirectory.empty())
         return;
@@ -5261,7 +5254,7 @@ void RemoveResolvedSaveSlot(const std::string& savePathOrName, const char* reaso
         LogCoop(
             std::string("client snapshot cleanup failed") +
             (reason && reason[0] ? ": " + std::string(reason) : "") +
-            " path=" + slotDirectory.string() +
+            " path=" + CoopFilesystem::ToUtf8(slotDirectory) +
             " error=" + error.message());
         return;
     }
@@ -5269,7 +5262,7 @@ void RemoveResolvedSaveSlot(const std::string& savePathOrName, const char* reaso
     LogCoop(
         std::string("client snapshot cleanup removed") +
         (reason && reason[0] ? ": " + std::string(reason) : "") +
-        " path=" + slotDirectory.string());
+        " path=" + CoopFilesystem::ToUtf8(slotDirectory));
 }
 
 bool FindNewestSaveCsf(std::string& outPath)
@@ -5310,7 +5303,7 @@ bool FindNewestSaveCsf(std::string& outPath)
     if (newestPath.empty())
         return false;
 
-    outPath = NormalizeNativeWindowsPath(newestPath.string());
+    outPath = NormalizeNativeWindowsPath(CoopFilesystem::ToUtf8(newestPath));
     return true;
 }
 
@@ -5424,14 +5417,14 @@ bool CopyRegularFilesFlat(
     std::error_code error;
     if (!std::filesystem::is_directory(sourceDirectory, error) || error)
     {
-        summary.detail = "source missing: " + sourceDirectory.string();
+        summary.detail = "source missing: " + CoopFilesystem::ToUtf8(sourceDirectory);
         return false;
     }
 
     std::filesystem::create_directories(targetDirectory, error);
     if (error)
     {
-        summary.detail = "target mkdir failed: " + targetDirectory.string();
+        summary.detail = "target mkdir failed: " + CoopFilesystem::ToUtf8(targetDirectory);
         return false;
     }
 
@@ -5439,7 +5432,7 @@ bool CopyRegularFilesFlat(
     {
         if (error)
         {
-            summary.detail = "source iterate failed: " + sourceDirectory.string();
+            summary.detail = "source iterate failed: " + CoopFilesystem::ToUtf8(sourceDirectory);
             return false;
         }
 
@@ -5450,7 +5443,7 @@ bool CopyRegularFilesFlat(
             continue;
         }
 
-        const std::string name = entry.path().filename().string();
+        const std::string name = CoopFilesystem::ToUtf8(entry.path().filename());
         if (!IsSafeCoopSavePackageFileName(name) ||
             name == kCoopClientLevelStateBridgeMarker ||
             (skipSaveCsf && name == "save.CSF") ||
@@ -5469,7 +5462,7 @@ bool CopyRegularFilesFlat(
 
         std::filesystem::copy_file(
             entry.path(),
-            targetDirectory / name,
+            targetDirectory / CoopFilesystem::FromUtf8(name),
             std::filesystem::copy_options::overwrite_existing,
             fileError);
         if (fileError)
@@ -5527,7 +5520,7 @@ bool BuildCoopSavePackageFromSlot(const std::string& saveCsfPath, uint32_t trans
     outPackagePath.clear();
     outSummary.clear();
 
-    const std::filesystem::path savePath(saveCsfPath);
+    const std::filesystem::path savePath = CoopFilesystem::FromUtf8(saveCsfPath);
     const std::filesystem::path slotDir = savePath.parent_path();
     if (slotDir.empty())
     {
@@ -5551,7 +5544,7 @@ bool BuildCoopSavePackageFromSlot(const std::string& saveCsfPath, uint32_t trans
         if (!entry.is_regular_file(error) || error)
             continue;
 
-        const std::string name = entry.path().filename().string();
+        const std::string name = CoopFilesystem::ToUtf8(entry.path().filename());
         if (!IsSafeCoopSavePackageFileName(name))
             continue;
 
@@ -5560,7 +5553,7 @@ bool BuildCoopSavePackageFromSlot(const std::string& saveCsfPath, uint32_t trans
             continue;
 
         uint32_t checksum = 0;
-        if (!ComputeFileChecksum(entry.path().string(), checksum))
+        if (!ComputeFileChecksum(CoopFilesystem::ToUtf8(entry.path()), checksum))
             continue;
 
         totalBytes += static_cast<uint64_t>(fileSize);
@@ -5598,7 +5591,7 @@ bool BuildCoopSavePackageFromSlot(const std::string& saveCsfPath, uint32_t trans
     }
 
     const std::string packagePath = BuildCoopReceivedSavePackagePath(transferId);
-    std::ofstream package(packagePath, std::ios::binary | std::ios::trunc);
+    std::ofstream package(CoopFilesystem::FromUtf8(packagePath), std::ios::binary | std::ios::trunc);
     if (!package)
     {
         outSummary = "package open failed";
@@ -5672,7 +5665,7 @@ bool ExtractCoopSavePackageToSlot(const std::string& packagePath, uint32_t trans
     outSavePath.clear();
     outSummary.clear();
 
-    std::ifstream package(packagePath, std::ios::binary);
+    std::ifstream package(CoopFilesystem::FromUtf8(packagePath), std::ios::binary);
     if (!package)
     {
         outSummary = "package open failed";
@@ -5755,7 +5748,7 @@ bool ExtractCoopSavePackageToSlot(const std::string& packagePath, uint32_t trans
             return false;
         }
 
-        const std::filesystem::path outputPath = slotDir / name;
+        const std::filesystem::path outputPath = slotDir / CoopFilesystem::FromUtf8(name);
         std::ofstream output(outputPath, std::ios::binary | std::ios::trunc);
         if (!output)
         {
@@ -5804,7 +5797,7 @@ bool ExtractCoopSavePackageToSlot(const std::string& packagePath, uint32_t trans
         return false;
     }
 
-    outSavePath = savePath.string();
+    outSavePath = CoopFilesystem::ToUtf8(savePath);
     outSummary =
         "extracted native save slot entries=" + std::to_string(entryCount) +
         " bytes=" + std::to_string(totalBytes);
@@ -5813,44 +5806,34 @@ bool ExtractCoopSavePackageToSlot(const std::string& packagePath, uint32_t trans
 
 std::string BuildCoopTempPlayerStatePath(uint32_t transferId, const std::string& username)
 {
-    const char* tempRoot = std::getenv("TEMP");
-    if (!tempRoot || !tempRoot[0])
-        tempRoot = std::getenv("TMP");
+    std::filesystem::path tempRoot = CoopFilesystem::EnvironmentPath("TEMP");
+    if (tempRoot.empty())
+        tempRoot = CoopFilesystem::EnvironmentPath("TMP");
 
     char fileName[128] = {};
     const std::string safeUsername = SanitizePathComponent(username.empty() ? std::string("Player") : username);
     std::snprintf(fileName, sizeof(fileName), "PreyCoopPlayerState_%08X_%s.state", transferId, safeUsername.c_str());
 
-    if (!tempRoot || !tempRoot[0])
+    if (tempRoot.empty())
         return std::string(fileName);
 
-    std::string path = tempRoot;
-    const char last = path.empty() ? '\0' : path.back();
-    if (last != '\\' && last != '/')
-        path += "\\";
-    path += fileName;
-    return path;
+    return CoopFilesystem::ToUtf8(tempRoot / fileName);
 }
 
 std::string BuildCoopTempAreaJournalPath(uint32_t transferId, const std::string& levelName)
 {
-    const char* tempRoot = std::getenv("TEMP");
-    if (!tempRoot || !tempRoot[0])
-        tempRoot = std::getenv("TMP");
+    std::filesystem::path tempRoot = CoopFilesystem::EnvironmentPath("TEMP");
+    if (tempRoot.empty())
+        tempRoot = CoopFilesystem::EnvironmentPath("TMP");
 
     char fileName[192] = {};
     const std::string safeLevel = SanitizePathComponent(levelName.empty() ? std::string("unknown") : levelName);
     std::snprintf(fileName, sizeof(fileName), "PreyCoopAreaJournal_%08X_%s.jsonl", transferId, safeLevel.c_str());
 
-    if (!tempRoot || !tempRoot[0])
+    if (tempRoot.empty())
         return std::string(fileName);
 
-    std::string path = tempRoot;
-    const char last = path.empty() ? '\0' : path.back();
-    if (last != '\\' && last != '/')
-        path += "\\";
-    path += fileName;
-    return path;
+    return CoopFilesystem::ToUtf8(tempRoot / fileName);
 }
 
 std::string ToLowerAscii(std::string value)
@@ -26937,14 +26920,15 @@ void ModMain::FlushNativeFinalStreamCapture(const char* phase, bool result)
         partial +
         ".bin";
     const std::filesystem::path path = root / fileName;
-    const std::filesystem::path tempPath = path.string() + ".tmp";
+    std::filesystem::path tempPath = path;
+    tempPath += ".tmp";
 
     {
         std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
         if (!output)
         {
             ++m_nativeFinalStreamGuards;
-            m_lastNativeFinalStreamEvent = "final_stream dump_failed open path=" + StatusToken(path.string());
+            m_lastNativeFinalStreamEvent = "final_stream dump_failed open path=" + StatusToken(CoopFilesystem::ToUtf8(path));
             return;
         }
 
@@ -26954,7 +26938,7 @@ void ModMain::FlushNativeFinalStreamCapture(const char* phase, bool result)
         if (!output)
         {
             ++m_nativeFinalStreamGuards;
-            m_lastNativeFinalStreamEvent = "final_stream dump_failed write path=" + StatusToken(path.string());
+            m_lastNativeFinalStreamEvent = "final_stream dump_failed write path=" + StatusToken(CoopFilesystem::ToUtf8(path));
             return;
         }
     }
@@ -26971,12 +26955,13 @@ void ModMain::FlushNativeFinalStreamCapture(const char* phase, bool result)
             ++m_nativeFinalStreamGuards;
             m_lastNativeFinalStreamEvent =
                 "final_stream dump_failed commit " + StatusToken(error.message()) +
-                " path=" + StatusToken(path.string());
+                " path=" + StatusToken(CoopFilesystem::ToUtf8(path));
             return;
         }
     }
 
-    const std::filesystem::path metaPath = path.string() + ".txt";
+    std::filesystem::path metaPath = path;
+    metaPath += ".txt";
     std::ofstream meta(metaPath, std::ios::binary | std::ios::trunc);
     if (meta)
     {
@@ -27005,9 +26990,9 @@ void ModMain::FlushNativeFinalStreamCapture(const char* phase, bool result)
     }
 
     ++m_nativeFinalStreamDumpWrites;
-    m_lastNativeFinalStreamDumpPath = path.string();
+    m_lastNativeFinalStreamDumpPath = CoopFilesystem::ToUtf8(path);
     m_lastNativeFinalStreamEvent =
-        "final_stream dump_ok path=" + StatusToken(path.string()) +
+        "final_stream dump_ok path=" + StatusToken(CoopFilesystem::ToUtf8(path)) +
         " bytes=" + std::to_string(m_nativeFinalStreamBufferedBytes) +
         " dropped=" + std::to_string(m_nativeFinalStreamDroppedBytes) +
         " checksum=" + Hex32(m_nativeFinalStreamChecksum);
@@ -29201,7 +29186,7 @@ bool ModMain::WriteNativeSaveLoadXmlDiagnostics(const char* phase, const char* r
     if (!output)
     {
         ++m_nativePlayerXmlPatchFailures;
-        m_lastNativePlayerXmlPatchEvent = "xml diag failed: cannot open " + skeletonPath.string();
+        m_lastNativePlayerXmlPatchEvent = "xml diag failed: cannot open " + CoopFilesystem::ToUtf8(skeletonPath);
         return false;
     }
     output << skeleton.str();
@@ -29268,7 +29253,7 @@ bool ModMain::WriteNativeSaveLoadXmlDiagnostics(const char* phase, const char* r
 
     ++m_nativePlayerXmlDiagnosticsWrites;
     m_lastNativePlayerXmlPatchEvent =
-        "xml diag wrote " + skeletonPath.string() +
+        "xml diag wrote " + CoopFilesystem::ToUtf8(skeletonPath) +
         " nodes=" + std::to_string(visited) +
         " index=" + std::to_string(indexResult.written ? 1 : 0) +
         " indexNodes=" + std::to_string(indexResult.nodes) +
@@ -29647,7 +29632,7 @@ void ModMain::ActivateClientCoopSaveSlot(const std::string& savePath, uint32_t t
     if (m_networkMode != CoopNetworkMode::Client || savePath.empty())
         return;
 
-    const std::filesystem::path saveFile(savePath);
+    const std::filesystem::path saveFile = CoopFilesystem::FromUtf8(savePath);
     const std::filesystem::path slotDirectory = saveFile.parent_path();
     const std::filesystem::path tempDirectory = BuildCoopClientSessionTempDirectory();
     if (slotDirectory.empty() || tempDirectory.empty())
@@ -29658,8 +29643,8 @@ void ModMain::ActivateClientCoopSaveSlot(const std::string& savePath, uint32_t t
         return;
     }
 
-    m_activeClientCoopSaveSlotDirectory = slotDirectory.string();
-    m_activeClientCoopLevelStateDirectory = tempDirectory.string();
+    m_activeClientCoopSaveSlotDirectory = CoopFilesystem::ToUtf8(slotDirectory);
+    m_activeClientCoopLevelStateDirectory = CoopFilesystem::ToUtf8(tempDirectory);
     m_activeClientCoopSaveTransferId = transferId;
     m_clientCoopArkTempBridgeActive = false;
     m_clientCoopArkTempBridgeNeedsCleanup = false;
@@ -29683,8 +29668,8 @@ bool ModMain::SeedClientCoopLevelStateFromSaveSlot(const char* reason)
 
     CoopDirectoryCopySummary summary;
     if (!CopyRegularFilesFlat(
-            std::filesystem::path(m_activeClientCoopSaveSlotDirectory),
-            std::filesystem::path(m_activeClientCoopLevelStateDirectory),
+            CoopFilesystem::FromUtf8(m_activeClientCoopSaveSlotDirectory),
+            CoopFilesystem::FromUtf8(m_activeClientCoopLevelStateDirectory),
             true,
             false,
             summary))
@@ -29728,7 +29713,7 @@ bool ModMain::PrepareClientCoopLevelStateBridge(ArkSaveLoadSystem* saveLoadSyste
     if (m_networkMode != CoopNetworkMode::Client || m_activeClientCoopLevelStateDirectory.empty())
         return false;
 
-    const std::filesystem::path coopTempDirectory(m_activeClientCoopLevelStateDirectory);
+    const std::filesystem::path coopTempDirectory = CoopFilesystem::FromUtf8(m_activeClientCoopLevelStateDirectory);
     if (!DirectoryHasRegularFiles(coopTempDirectory) && !SeedClientCoopLevelStateFromSaveSlot(reason))
         return false;
 
@@ -29744,7 +29729,7 @@ bool ModMain::PrepareClientCoopLevelStateBridge(ArkSaveLoadSystem* saveLoadSyste
 
     if (m_clientCoopArkTempBridgeActive &&
         !m_clientCoopArkTempBridgePath.empty() &&
-        std::filesystem::path(m_clientCoopArkTempBridgePath) == arkTempDirectory &&
+        CoopFilesystem::FromUtf8(m_clientCoopArkTempBridgePath) == arkTempDirectory &&
         HasCoopClientLevelStateBridgeMarker(arkTempDirectory))
     {
         m_lastClientLevelStateBridgeEvent =
@@ -29775,7 +29760,7 @@ bool ModMain::PrepareClientCoopLevelStateBridge(ArkSaveLoadSystem* saveLoadSyste
     }
 
     ++m_clientLevelStateBridgeSyncs;
-    m_clientCoopArkTempBridgePath = arkTempDirectory.string();
+    m_clientCoopArkTempBridgePath = CoopFilesystem::ToUtf8(arkTempDirectory);
     m_clientCoopArkTempBridgeActive = true;
     m_clientCoopArkTempBridgeNeedsCleanup = true;
     m_lastClientLevelStateBridgeEvent =
@@ -29795,7 +29780,7 @@ bool ModMain::SyncClientCoopLevelStateBridgeFromArkTemp(const char* reason)
         return false;
     }
 
-    const std::filesystem::path arkTempDirectory(m_clientCoopArkTempBridgePath);
+    const std::filesystem::path arkTempDirectory = CoopFilesystem::FromUtf8(m_clientCoopArkTempBridgePath);
     if (!HasCoopClientLevelStateBridgeMarker(arkTempDirectory))
     {
         m_lastClientLevelStateBridgeEvent =
@@ -29807,7 +29792,7 @@ bool ModMain::SyncClientCoopLevelStateBridgeFromArkTemp(const char* reason)
     CoopDirectoryCopySummary summary;
     if (!CopyRegularFilesFlat(
             arkTempDirectory,
-            std::filesystem::path(m_activeClientCoopLevelStateDirectory),
+            CoopFilesystem::FromUtf8(m_activeClientCoopLevelStateDirectory),
             true,
             true,
             summary))
@@ -29833,7 +29818,7 @@ void ModMain::CleanupClientCoopLevelStateBridge(const char* reason)
     if (m_clientCoopArkTempBridgePath.empty())
         return;
 
-    const std::filesystem::path arkTempDirectory(m_clientCoopArkTempBridgePath);
+    const std::filesystem::path arkTempDirectory = CoopFilesystem::FromUtf8(m_clientCoopArkTempBridgePath);
     const bool marked = HasCoopClientLevelStateBridgeMarker(arkTempDirectory);
     if (marked && !SyncClientCoopLevelStateBridgeFromArkTemp(reason))
     {
@@ -30812,7 +30797,7 @@ void ModMain::InstallCrashExceptionHandler()
         std::error_code error;
         std::filesystem::create_directories(crashDir, error);
         if (!error)
-            g_crashTraceDirectory = crashDir.string();
+            g_crashTraceDirectory = CoopFilesystem::ToUtf8(crashDir);
     }
 
     if (!g_purecallTraceHandlerInstalled)
@@ -34123,10 +34108,10 @@ bool ModMain::TryExportNativeFragmentPayload(const char* reason)
     m_nativeFragmentPayloadExportBytes = static_cast<uint32_t>(payload.bytes.size());
     m_lastNativeFragmentPayloadSchemaHash = payload.schemaHash;
     m_lastNativeFragmentPayloadContentHash = payload.contentHash;
-    m_lastNativeFragmentPayloadPath = path.string();
+    m_lastNativeFragmentPayloadPath = CoopFilesystem::ToUtf8(path);
     m_lastNativeFragmentPayloadEvent =
         "payload exported " + CoopNativeFragmentPayload::BuildStatus(payload) +
-        " path=" + path.string() +
+        " path=" + CoopFilesystem::ToUtf8(path) +
         (reason && reason[0] ? " reason=" + std::string(reason) : "");
     LogCoop(m_lastNativeFragmentPayloadEvent);
     return true;
@@ -37797,7 +37782,7 @@ bool ModMain::DebugExportLocalInventoryJsonl(std::string& detail)
         return false;
     }
 
-    const std::filesystem::path exportPath(m_runtimeExtractor.GetLatestExportPath());
+    const std::filesystem::path exportPath = CoopFilesystem::FromUtf8(m_runtimeExtractor.GetLatestExportPath());
     std::error_code error;
     std::filesystem::create_directories(exportPath.parent_path(), error);
     if (error)
@@ -37950,7 +37935,7 @@ bool ModMain::DebugExportLocalInventoryJsonl(std::string& detail)
         ++exportedItems;
     }
 
-    detail = "inventory dump exported " + std::to_string(exportedItems) + " items to " + exportPath.string();
+    detail = "inventory dump exported " + std::to_string(exportedItems) + " items to " + CoopFilesystem::ToUtf8(exportPath);
     m_lastDebugInventoryEvent = detail;
     LogCoop(detail);
     return true;
@@ -37976,7 +37961,7 @@ bool ModMain::DebugExportLocalPlayerJsonl(std::string& detail)
         return false;
     }
 
-    const std::filesystem::path exportPath(m_runtimeExtractor.GetLatestExportPath());
+    const std::filesystem::path exportPath = CoopFilesystem::FromUtf8(m_runtimeExtractor.GetLatestExportPath());
     std::error_code error;
     std::filesystem::create_directories(exportPath.parent_path(), error);
     if (error)
@@ -38349,7 +38334,7 @@ bool ModMain::DebugExportLocalPlayerJsonl(std::string& detail)
             << "}\n";
     }
 
-    detail = "player dump exported to " + exportPath.string();
+    detail = "player dump exported to " + CoopFilesystem::ToUtf8(exportPath);
     m_lastDebugInventoryEvent = detail;
     LogCoop(detail);
     return true;
@@ -38377,7 +38362,7 @@ bool ModMain::DebugExportLocalEquipmentJsonl(std::string& detail)
         return false;
     }
 
-    const std::filesystem::path exportPath(m_runtimeExtractor.GetLatestExportPath());
+    const std::filesystem::path exportPath = CoopFilesystem::FromUtf8(m_runtimeExtractor.GetLatestExportPath());
     std::error_code error;
     std::filesystem::create_directories(exportPath.parent_path(), error);
     if (error)
@@ -38923,7 +38908,7 @@ bool ModMain::DebugExportLocalEquipmentJsonl(std::string& detail)
         }
     }
 
-    detail = "equipment dump exported " + std::to_string(exportedWeapons) + " weapons and " + std::to_string(exportedMods) + " mods to " + exportPath.string();
+    detail = "equipment dump exported " + std::to_string(exportedWeapons) + " weapons and " + std::to_string(exportedMods) + " mods to " + CoopFilesystem::ToUtf8(exportPath);
     m_lastDebugInventoryEvent = detail;
     LogCoop(detail);
     return true;
@@ -38933,7 +38918,7 @@ bool ModMain::DebugExportAreaJournalJsonl(std::string& detail)
 {
     detail.clear();
 
-    const std::filesystem::path exportPath(m_runtimeExtractor.GetLatestExportPath());
+    const std::filesystem::path exportPath = CoopFilesystem::FromUtf8(m_runtimeExtractor.GetLatestExportPath());
     std::error_code error;
     std::filesystem::create_directories(exportPath.parent_path(), error);
     if (error)
@@ -38960,7 +38945,7 @@ bool ModMain::DebugExportAreaJournalJsonl(std::string& detail)
         return false;
     }
 
-    detail = "area journal dump exported to " + exportPath.string();
+    detail = "area journal dump exported to " + CoopFilesystem::ToUtf8(exportPath);
     m_lastAreaAuthorityEvent = detail;
     LogCoop(detail);
     return true;
@@ -38977,7 +38962,7 @@ bool ModMain::DebugExportEnemyRegistryJsonl(std::string& detail)
         return false;
     }
 
-    const std::filesystem::path exportPath(m_runtimeExtractor.GetLatestExportPath());
+    const std::filesystem::path exportPath = CoopFilesystem::FromUtf8(m_runtimeExtractor.GetLatestExportPath());
     std::error_code error;
     std::filesystem::create_directories(exportPath.parent_path(), error);
     if (error)
@@ -39764,7 +39749,7 @@ bool ModMain::DebugExportEnemyRegistryJsonl(std::string& detail)
         " cullEligible=" + std::to_string(cullEligibleCount) +
         " auth=" + std::to_string(m_enemyAuthorities.size()) +
         " puppets=" + std::to_string(m_enemyPuppets.size()) +
-        " to " + exportPath.string();
+        " to " + CoopFilesystem::ToUtf8(exportPath);
     m_lastAreaAuthorityEvent = detail;
     LogCoop(detail);
     return true;
@@ -39781,7 +39766,7 @@ bool ModMain::DebugExportTurretRegistryJsonl(std::string& detail)
         return false;
     }
 
-    const std::filesystem::path exportPath(m_runtimeExtractor.GetLatestExportPath());
+    const std::filesystem::path exportPath = CoopFilesystem::FromUtf8(m_runtimeExtractor.GetLatestExportPath());
     std::error_code error;
     std::filesystem::create_directories(exportPath.parent_path(), error);
     if (error)
@@ -40063,7 +40048,7 @@ bool ModMain::DebugExportTurretRegistryJsonl(std::string& detail)
         " enemyNetMapped=" + std::to_string(enemyNetMappedCount) +
         " firing=" + std::to_string(firingCount) +
         " broken=" + std::to_string(brokenCount) +
-        " to " + exportPath.string();
+        " to " + CoopFilesystem::ToUtf8(exportPath);
     m_lastAreaAuthorityEvent = detail;
     LogCoop(detail);
     return true;
@@ -43051,7 +43036,7 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
             " friendlyFireLocal=" + std::to_string(m_identityConfig.Data().friendlyFire ? 1 : 0) +
             " friendlyFireEffective=" + std::to_string(IsSessionFriendlyFireEnabled() ? 1 : 0) +
             " protocol=" + std::to_string(CoopProtocol::kProtocolVersion) +
-            " config=" + StatusToken(m_identityConfig.Path().string()) +
+            " config=" + StatusToken(CoopFilesystem::ToUtf8(m_identityConfig.Path())) +
             " status=" + StatusToken(m_identityConfig.Status());
     }
     else if (command == "coop_identity_selftest")
@@ -43067,7 +43052,7 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
     {
         constexpr uint32_t transferId = 0xFFFFFFFEu;
         const std::string packagePath = BuildCoopReceivedSavePackagePath(transferId);
-        std::ofstream package(packagePath, std::ios::binary | std::ios::trunc);
+        std::ofstream package(CoopFilesystem::FromUtf8(packagePath), std::ios::binary | std::ios::trunc);
         package.write("CORRUPT", 7);
         package.close();
 
@@ -43079,7 +43064,7 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
             extractedPath,
             detail);
         std::error_code removeError;
-        std::filesystem::remove(packagePath, removeError);
+        std::filesystem::remove(CoopFilesystem::FromUtf8(packagePath), removeError);
 
         ok = rejected && detail == "package magic mismatch" && extractedPath.empty();
         action = ok ? "corrupt_save_package_selftest_ok" : "corrupt_save_package_selftest_failed";
@@ -72130,15 +72115,15 @@ bool ModMain::StartHostSaveTransferFromFile(const std::string& sourcePath, uint3
         return false;
     }
 
-    const std::filesystem::path sourceSlotDir = std::filesystem::path(sourcePath).parent_path();
+    const std::filesystem::path sourceSlotDir = CoopFilesystem::FromUtf8(sourcePath).parent_path();
     if (!sourceSlotDir.empty() && sourceSlotDir.filename() == "CoopHostSnapshot")
     {
         std::error_code cleanupError;
         std::filesystem::remove_all(sourceSlotDir, cleanupError);
         if (cleanupError)
-            LogCoop("internal host snapshot cleanup failed: " + sourceSlotDir.string());
+            LogCoop("internal host snapshot cleanup failed: " + CoopFilesystem::ToUtf8(sourceSlotDir));
         else
-            LogCoop("internal host snapshot slot removed: " + sourceSlotDir.string());
+            LogCoop("internal host snapshot slot removed: " + CoopFilesystem::ToUtf8(sourceSlotDir));
     }
 
     uint32_t fileSize = 0;
@@ -72210,7 +72195,7 @@ bool ModMain::QueueNextHostSaveTransferPacket()
         return true;
     }
 
-    std::ifstream stream(m_saveTransferSourcePath, std::ios::binary);
+    std::ifstream stream(CoopFilesystem::FromUtf8(m_saveTransferSourcePath), std::ios::binary);
     if (!stream)
     {
         m_lastSaveTransferEvent = "host save chunk open failed";
@@ -72410,7 +72395,7 @@ std::string ModMain::GetHostPlayerStatePathForUsername(const std::string& userna
     if (safeUsername.empty())
         safeUsername = "Player";
 
-    return (root / ("player_" + SanitizePathComponent(safeUsername) + ".state")).string();
+    return CoopFilesystem::ToUtf8(root / ("player_" + SanitizePathComponent(safeUsername) + ".state"));
 }
 
 std::string ModMain::GetHostPlayerStatePathForUsernameAndSave(const std::string& username, const std::string& saveKey) const
@@ -72424,7 +72409,7 @@ std::string ModMain::GetHostPlayerStatePathForUsernameAndSave(const std::string&
         safeUsername = "Player";
 
     const std::string safeSaveKey = SanitizePathComponent(saveKey.empty() ? std::string("unknown_save") : saveKey);
-    return (saveStateRoot / safeSaveKey / ("player_" + SanitizePathComponent(safeUsername) + ".state")).string();
+    return CoopFilesystem::ToUtf8(saveStateRoot / safeSaveKey / ("player_" + SanitizePathComponent(safeUsername) + ".state"));
 }
 
 std::string ModMain::GetHostPlayerStatePathForAccount(uint64_t accountToken) const
@@ -72432,7 +72417,7 @@ std::string ModMain::GetHostPlayerStatePathForAccount(uint64_t accountToken) con
     const std::filesystem::path root = GetCoopServerPlayerStateRoot();
     if (root.empty() || accountToken == 0)
         return {};
-    return (root / ("player_account_" + Hex64(accountToken) + ".state")).string();
+    return CoopFilesystem::ToUtf8(root / ("player_account_" + Hex64(accountToken) + ".state"));
 }
 
 std::string ModMain::GetHostPlayerStatePathForAccountAndSave(uint64_t accountToken, const std::string& saveKey) const
@@ -72441,7 +72426,7 @@ std::string ModMain::GetHostPlayerStatePathForAccountAndSave(uint64_t accountTok
     if (root.empty() || accountToken == 0)
         return {};
     const std::string safeSaveKey = SanitizePathComponent(saveKey.empty() ? std::string("unknown_save") : saveKey);
-    return (root / safeSaveKey / ("player_account_" + Hex64(accountToken) + ".state")).string();
+    return CoopFilesystem::ToUtf8(root / safeSaveKey / ("player_account_" + Hex64(accountToken) + ".state"));
 }
 
 std::string ModMain::BuildHostSaveStateKey(const std::string& savePathOrName) const
@@ -72541,7 +72526,7 @@ bool ModMain::WriteDefaultHostPlayerStateFile(const std::string& path, const std
     if (path.empty())
         return false;
 
-    const std::filesystem::path filePath(path);
+    const std::filesystem::path filePath = CoopFilesystem::FromUtf8(path);
     std::error_code error;
     std::filesystem::create_directories(filePath.parent_path(), error);
     if (error)
@@ -72674,7 +72659,7 @@ uint32_t ModMain::SnapshotLatestHostPlayerStatesForSave(const std::string& saveK
         if (!std::filesystem::is_regular_file(sourcePath, fileError) || fileError)
             continue;
 
-        const std::string fileName = sourcePath.filename().string();
+        const std::string fileName = CoopFilesystem::ToUtf8(sourcePath.filename());
         if (fileName.rfind("player_", 0) != 0 || sourcePath.extension() != ".state")
             continue;
 
@@ -72753,14 +72738,16 @@ bool ModMain::BeginHostPlayerStateTransfer(const char* reason, const std::string
     {
         if (legacyPath.empty() || accountPath.empty())
             return;
+        const std::filesystem::path legacyFsPath = CoopFilesystem::FromUtf8(legacyPath);
+        const std::filesystem::path accountFsPath = CoopFilesystem::FromUtf8(accountPath);
         std::error_code error;
-        if (std::filesystem::exists(accountPath, error) || error || !std::filesystem::is_regular_file(legacyPath, error))
+        if (std::filesystem::exists(accountFsPath, error) || error || !std::filesystem::is_regular_file(legacyFsPath, error))
             return;
         error.clear();
-        std::filesystem::create_directories(std::filesystem::path(accountPath).parent_path(), error);
+        std::filesystem::create_directories(accountFsPath.parent_path(), error);
         if (error)
             return;
-        std::filesystem::copy_file(legacyPath, accountPath, std::filesystem::copy_options::overwrite_existing, error);
+        std::filesystem::copy_file(legacyFsPath, accountFsPath, std::filesystem::copy_options::overwrite_existing, error);
     };
     migrateLegacyState(previousFormatAccountPath, saveScopedPath);
     // Username-keyed state predates persistent PlayerAccountId and cannot be
@@ -72777,14 +72764,14 @@ bool ModMain::BeginHostPlayerStateTransfer(const char* reason, const std::string
     const bool hasSaveScopedState =
         !saveScopedPath.empty() &&
         ValidatePlayerStateIntegrityFile(
-            std::filesystem::path(saveScopedPath),
+            CoopFilesystem::FromUtf8(saveScopedPath),
             &fileSize,
             &saveScopedHasHash,
             &saveScopedIntegrityReason);
     const bool hasLatestState =
         !latestPath.empty() &&
         ValidatePlayerStateIntegrityFile(
-            std::filesystem::path(latestPath),
+            CoopFilesystem::FromUtf8(latestPath),
             &latestFileSize,
             &latestHasHash,
             &latestIntegrityReason);
@@ -72792,7 +72779,7 @@ bool ModMain::BeginHostPlayerStateTransfer(const char* reason, const std::string
     std::error_code saveScopedStatusError;
     const std::filesystem::file_status saveScopedStatus =
         saveScopedPath.empty() ? std::filesystem::file_status() :
-        std::filesystem::symlink_status(std::filesystem::path(saveScopedPath), saveScopedStatusError);
+        std::filesystem::symlink_status(CoopFilesystem::FromUtf8(saveScopedPath), saveScopedStatusError);
     const bool saveScopedStatusFailed =
         saveScopedStatusError &&
         saveScopedStatusError != std::errc::no_such_file_or_directory;
@@ -72859,7 +72846,7 @@ bool ModMain::BeginHostPlayerStateTransfer(const char* reason, const std::string
     }
 
     uint32_t flags = CoopProtocol::kPlayerStateTransferFlagHostAuthoritative;
-    if (createDefaultState || !IsReadableFile(std::filesystem::path(sourcePath), &fileSize))
+    if (createDefaultState || !IsReadableFile(CoopFilesystem::FromUtf8(sourcePath), &fileSize))
     {
         if (!WriteDefaultHostPlayerStateFile(sourcePath, username))
             return false;
@@ -73627,7 +73614,7 @@ bool ModMain::PrepareReceivedHostSaveForNativePlayerMerge(const char* reason)
         return fail("missing_received_host_save_path");
 
     uint32_t saveSize = 0;
-    if (!IsReadableFile(std::filesystem::path(m_saveTransferReceivePath), &saveSize))
+    if (!IsReadableFile(CoopFilesystem::FromUtf8(m_saveTransferReceivePath), &saveSize))
         return fail("host_save_file_unreadable");
 
     uint32_t saveChecksum = 0;
@@ -73687,7 +73674,7 @@ bool ModMain::PrepareReceivedHostSaveForNativePlayerMerge(const char* reason)
             StatusToken(CoopPreloadSaveMerge::BuildStatus(mergeResult)));
     }
 
-    m_saveTransferReceivePath = mergeResult.mergedSavePath.string();
+    m_saveTransferReceivePath = CoopFilesystem::ToUtf8(mergeResult.mergedSavePath);
     m_nativePreloadSaveMergeOutputPath = m_saveTransferReceivePath;
     m_nativePreloadSaveMergePatched = mergeResult.patched ? 1u : 0u;
     m_lastNativeFragmentImportPayload = state.nativeCapture.nativeFragmentPayload;
@@ -73704,7 +73691,7 @@ bool ModMain::PrepareReceivedHostSaveForNativePlayerMerge(const char* reason)
         mergeResult.wroteNativeSnapshotSave &&
         !mergeResult.nativeSnapshotSavePath.empty()
             ? ProbeScratchNativeLoadStoreFromSave(
-                mergeResult.nativeSnapshotSavePath.string(),
+                CoopFilesystem::ToUtf8(mergeResult.nativeSnapshotSavePath),
                 "preload native player donor snapshot")
             : false;
 
@@ -73823,7 +73810,7 @@ bool ModMain::StartPlayerStateTransferFromFile(const std::string& sourcePath, co
     bool hasIntegrityHash = false;
     std::string integrityReason;
     if (!ValidatePlayerStateIntegrityFile(
-            std::filesystem::path(sourcePath),
+            CoopFilesystem::FromUtf8(sourcePath),
             &fileSize,
             &hasIntegrityHash,
             &integrityReason))
@@ -73934,7 +73921,7 @@ bool ModMain::QueueNextPlayerStateTransferPacket()
         return true;
     }
 
-    std::ifstream stream(m_playerStateTransferSourcePath, std::ios::binary);
+    std::ifstream stream(CoopFilesystem::FromUtf8(m_playerStateTransferSourcePath), std::ios::binary);
     if (!stream)
     {
         m_playerStateTransferSending = false;
@@ -74260,14 +74247,14 @@ bool ModMain::ExportAreaJournalTransferFile(const std::string& levelName, uint32
     outPath = BuildCoopTempAreaJournalPath(transferId, normalizedLevel);
 
     std::error_code error;
-    std::filesystem::create_directories(std::filesystem::path(outPath).parent_path(), error);
+    std::filesystem::create_directories(CoopFilesystem::FromUtf8(outPath).parent_path(), error);
     if (error)
     {
         m_lastAreaJournalTransferEvent = "area journal export mkdir failed";
         return false;
     }
 
-    std::ofstream output(outPath, std::ios::binary | std::ios::trunc);
+    std::ofstream output(CoopFilesystem::FromUtf8(outPath), std::ios::binary | std::ios::trunc);
     if (!output)
     {
         m_lastAreaJournalTransferEvent = "area journal export open failed";
@@ -74519,7 +74506,7 @@ bool ModMain::QueueNextAreaJournalTransferPacket()
         return true;
     }
 
-    std::ifstream stream(m_areaJournalTransferSourcePath, std::ios::binary);
+    std::ifstream stream(CoopFilesystem::FromUtf8(m_areaJournalTransferSourcePath), std::ios::binary);
     if (!stream)
     {
         m_areaJournalTransferSending = false;
@@ -74756,7 +74743,7 @@ bool ModMain::StoreReceivedAreaJournalTransfer(const char* reason)
 
     error.clear();
     std::filesystem::copy_file(
-        std::filesystem::path(m_areaJournalTransferReceivePath),
+        CoopFilesystem::FromUtf8(m_areaJournalTransferReceivePath),
         dest,
         std::filesystem::copy_options::overwrite_existing,
         error);
@@ -74797,7 +74784,7 @@ bool ModMain::StoreReceivedAreaJournalTransfer(const char* reason)
                 LogCoop("remote area handoff request satisfied by incoming area journal level=" + m_areaJournalTransferLevel);
             }
             MergeReceivedAreaJournalIntoServerState("same-level area handoff", true);
-            QueueAreaStateOverlayApply(m_areaJournalTransferLevel, dest.string(), "received same-level area handoff");
+            QueueAreaStateOverlayApply(m_areaJournalTransferLevel, CoopFilesystem::ToUtf8(dest), "received same-level area handoff");
         }
         else
         {
@@ -74819,7 +74806,7 @@ bool ModMain::StoreReceivedAreaJournalTransfer(const char* reason)
         }
         else
         {
-            QueueAreaStateOverlayApply(m_areaJournalTransferLevel, dest.string(), "received server area state");
+            QueueAreaStateOverlayApply(m_areaJournalTransferLevel, CoopFilesystem::ToUtf8(dest), "received server area state");
         }
     }
 
@@ -74859,13 +74846,13 @@ bool ModMain::MergeReceivedAreaJournalIntoServerState(const char* reason, bool a
             " remote=" + remoteLevelName);
     }
 
-    const std::filesystem::path source(m_areaJournalTransferReceivePath);
+    const std::filesystem::path source = CoopFilesystem::FromUtf8(m_areaJournalTransferReceivePath);
     uint32_t fileSize = 0;
     if (!IsReadableFile(source, &fileSize))
         return reject("server area merge rejected: unreadable receive file");
 
     uint32_t checksum = 0;
-    if (!ComputeFileChecksum(source.string(), checksum))
+    if (!ComputeFileChecksum(CoopFilesystem::ToUtf8(source), checksum))
         return reject("server area merge rejected: checksum failed");
 
     const std::filesystem::path root = GetCoopServerAreaStateRoot();
@@ -74967,7 +74954,7 @@ bool ModMain::BeginServerAreaStateTransfer(const std::string& requestedLevelName
     }
 
     const uint32_t transferId = ++m_areaJournalTransferId;
-    if (!StartAreaJournalTransferFromFile(source.string(), levelName, transferId))
+    if (!StartAreaJournalTransferFromFile(CoopFilesystem::ToUtf8(source), levelName, transferId))
     {
         ++m_serverAreaStateRejectCount;
         m_lastServerAreaStateEvent = "server area send rejected: transfer start failed level=" + levelName;
@@ -74995,7 +74982,7 @@ bool ModMain::QueueAreaStateOverlayApply(const std::string& levelName, const std
     }
 
     uint32_t fileSize = 0;
-    if (!IsReadableFile(std::filesystem::path(sourcePath), &fileSize))
+    if (!IsReadableFile(CoopFilesystem::FromUtf8(sourcePath), &fileSize))
     {
         ++m_areaOverlayApplyFailCount;
         m_lastAreaOverlayEvent = "area overlay queue rejected: unreadable file level=" + normalizedLevel;
@@ -75037,7 +75024,7 @@ bool ModMain::QueueServerAreaStateOverlayForLevel(const std::string& levelName, 
         return false;
     }
 
-    return QueueAreaStateOverlayApply(normalizedLevel, source.string(), reason && reason[0] ? reason : "server area state");
+    return QueueAreaStateOverlayApply(normalizedLevel, CoopFilesystem::ToUtf8(source), reason && reason[0] ? reason : "server area state");
 }
 
 bool ModMain::QueueReceivedAreaStateOverlayForLevel(const std::string& levelName, const char* reason)
@@ -75063,7 +75050,7 @@ bool ModMain::QueueReceivedAreaStateOverlayForLevel(const std::string& levelName
             break;
         if (!entry.is_regular_file(error) || error)
             continue;
-        const std::string fileName = entry.path().filename().string();
+        const std::string fileName = CoopFilesystem::ToUtf8(entry.path().filename());
         if (fileName.rfind("journal_", 0) != 0 || entry.path().extension() != ".jsonl")
             continue;
 
@@ -75087,7 +75074,7 @@ bool ModMain::QueueReceivedAreaStateOverlayForLevel(const std::string& levelName
         return false;
     }
 
-    return QueueAreaStateOverlayApply(normalizedLevel, newestPath.string(), reason && reason[0] ? reason : "received area state");
+    return QueueAreaStateOverlayApply(normalizedLevel, CoopFilesystem::ToUtf8(newestPath), reason && reason[0] ? reason : "received area state");
 }
 
 bool ModMain::TryApplyQueuedAreaStateOverlay(const char* reason)
@@ -75120,14 +75107,14 @@ bool ModMain::TryApplyQueuedAreaStateOverlay(const char* reason)
     std::vector<uint64_t> transformedGuids;
     m_areaOverlayApplyActive = true;
     bool ok = ApplyCoopAreaStateOverlayJsonl(
-        std::filesystem::path(m_pendingAreaOverlayApplyPath),
+        CoopFilesystem::FromUtf8(m_pendingAreaOverlayApplyPath),
         m_pendingAreaOverlayApplyLevel,
         stats,
         &transformedGuids);
 
     CoopAreaObjectJournal::ReplayStats objectStats;
     const bool objectOk = m_areaObjectJournal.ReplayLevelJsonl(
-        std::filesystem::path(m_pendingAreaOverlayApplyPath),
+        CoopFilesystem::FromUtf8(m_pendingAreaOverlayApplyPath),
         m_pendingAreaOverlayApplyLevel,
         [this](const CoopProtocol::AreaObjectEventPacket& packet, std::string& detail)
         {
@@ -75330,7 +75317,7 @@ void ModMain::HandleAreaJournalTransfer(const CoopProtocol::AreaJournalTransferP
         m_areaJournalTransferStarted = true;
         m_areaJournalTransferComplete = false;
 
-        std::ofstream output(m_areaJournalTransferReceivePath, std::ios::binary | std::ios::trunc);
+        std::ofstream output(CoopFilesystem::FromUtf8(m_areaJournalTransferReceivePath), std::ios::binary | std::ios::trunc);
         if (!output)
         {
             m_lastAreaJournalTransferEvent = "cannot create received area journal";
@@ -75377,7 +75364,7 @@ void ModMain::HandleAreaJournalTransfer(const CoopProtocol::AreaJournalTransferP
             return;
         }
 
-        std::ofstream output(m_areaJournalTransferReceivePath, std::ios::binary | std::ios::app);
+        std::ofstream output(CoopFilesystem::FromUtf8(m_areaJournalTransferReceivePath), std::ios::binary | std::ios::app);
         if (!output)
         {
             m_lastAreaJournalTransferEvent = "received area journal append failed";
@@ -75465,7 +75452,7 @@ void ModMain::HandleSaveTransfer(const CoopProtocol::SaveTransferPacket& packet)
         m_pendingHostWorldRequest = false;
         m_joinOverlayStageOverride = "Downloading map";
 
-        std::ofstream output(m_saveTransferReceivePath, std::ios::binary | std::ios::trunc);
+        std::ofstream output(CoopFilesystem::FromUtf8(m_saveTransferReceivePath), std::ios::binary | std::ios::trunc);
         if (!output)
         {
             m_lastSaveTransferEvent = "cannot create received save package";
@@ -75502,7 +75489,7 @@ void ModMain::HandleSaveTransfer(const CoopProtocol::SaveTransferPacket& packet)
             return;
         }
 
-        std::ofstream output(m_saveTransferReceivePath, std::ios::binary | std::ios::app);
+        std::ofstream output(CoopFilesystem::FromUtf8(m_saveTransferReceivePath), std::ios::binary | std::ios::app);
         if (!output)
         {
             m_lastSaveTransferEvent = "received save append failed";
@@ -75643,7 +75630,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
                 packet.transferId,
                 receive.username + "_" + Hex64(packet.accountToken));
 
-            std::ofstream output(receive.receivePath, std::ios::binary | std::ios::trunc);
+            std::ofstream output(CoopFilesystem::FromUtf8(receive.receivePath), std::ios::binary | std::ios::trunc);
             if (!output)
             {
                 failUpload(
@@ -75698,7 +75685,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
                 return;
             }
 
-            std::ofstream output(receive.receivePath, std::ios::binary | std::ios::app);
+            std::ofstream output(CoopFilesystem::FromUtf8(receive.receivePath), std::ios::binary | std::ios::app);
             if (!output)
             {
                 failUpload(
@@ -75757,7 +75744,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         const uint64_t accountToken = receive.accountToken;
         const std::string storedUsername = receive.username;
         const std::string storedSaveKey = receive.saveKey;
-        const std::filesystem::path receivePath(receive.receivePath);
+        const std::filesystem::path receivePath = CoopFilesystem::FromUtf8(receive.receivePath);
         const std::string latestPath = GetHostPlayerStatePathForAccount(accountToken);
         if (latestPath.empty())
         {
@@ -75766,7 +75753,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         }
 
         std::error_code error;
-        const std::filesystem::path latestDest(latestPath);
+        const std::filesystem::path latestDest = CoopFilesystem::FromUtf8(latestPath);
         std::filesystem::create_directories(latestDest.parent_path(), error);
         if (error)
         {
@@ -75794,7 +75781,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
                 return;
             }
 
-            const std::filesystem::path scopedDest(scopedPath);
+            const std::filesystem::path scopedDest = CoopFilesystem::FromUtf8(scopedPath);
             error.clear();
             std::filesystem::create_directories(scopedDest.parent_path(), error);
             if (error)
@@ -75870,7 +75857,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         m_pendingNativePlayerStateOverride = PlayerSidecarState();
         m_receivedPlayerStateMergedDuringNativeLoad = false;
 
-        std::ofstream output(m_playerStateTransferReceivePath, std::ios::binary | std::ios::trunc);
+        std::ofstream output(CoopFilesystem::FromUtf8(m_playerStateTransferReceivePath), std::ios::binary | std::ios::trunc);
         if (!output)
         {
             m_lastPlayerStateTransferEvent = "cannot create received player state";
@@ -75911,7 +75898,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             return;
         }
 
-        std::ofstream output(m_playerStateTransferReceivePath, std::ios::binary | std::ios::app);
+        std::ofstream output(CoopFilesystem::FromUtf8(m_playerStateTransferReceivePath), std::ios::binary | std::ios::app);
         if (!output)
         {
             m_lastPlayerStateTransferEvent = "received player state append failed";
@@ -75960,7 +75947,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
                 return;
             }
 
-            const std::filesystem::path dest(latestPath);
+            const std::filesystem::path dest = CoopFilesystem::FromUtf8(latestPath);
             std::error_code error;
             std::filesystem::create_directories(dest.parent_path(), error);
             if (error)
@@ -75970,7 +75957,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             }
 
             std::filesystem::copy_file(
-                std::filesystem::path(m_playerStateTransferReceivePath),
+                CoopFilesystem::FromUtf8(m_playerStateTransferReceivePath),
                 dest,
                 std::filesystem::copy_options::overwrite_existing,
                 error);
@@ -75985,14 +75972,14 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
                 const std::string scopedPath = GetHostPlayerStatePathForAccountAndSave(m_playerStateTransferAccountToken, m_playerStateTransferSaveKey);
                 if (!scopedPath.empty())
                 {
-                    const std::filesystem::path scopedDest(scopedPath);
+                    const std::filesystem::path scopedDest = CoopFilesystem::FromUtf8(scopedPath);
                     error.clear();
                     std::filesystem::create_directories(scopedDest.parent_path(), error);
                     if (!error)
                     {
                         error.clear();
                         std::filesystem::copy_file(
-                            std::filesystem::path(m_playerStateTransferReceivePath),
+                            CoopFilesystem::FromUtf8(m_playerStateTransferReceivePath),
                             scopedDest,
                             std::filesystem::copy_options::overwrite_existing,
                             error);

@@ -1,4 +1,5 @@
 #include "ModMain.h"
+#include "CoopFilesystem.h"
 #include "CoopRuntimeLog.h"
 
 #include <algorithm>
@@ -81,11 +82,10 @@ void LogAssetDump(const std::string& message)
 
 std::filesystem::path GetCoopAssetDumpRoot()
 {
-    const char* userProfile = std::getenv("USERPROFILE");
-    if (!userProfile || !userProfile[0])
+    std::filesystem::path root = CoopFilesystem::EnvironmentPath("USERPROFILE");
+    if (root.empty())
         return std::filesystem::path("CoopPrototype") / "AssetDump";
 
-    std::filesystem::path root(userProfile);
     root /= "Saved Games";
     root /= "Arkane Studios";
     root /= "Prey";
@@ -266,7 +266,7 @@ bool TryWriteDecodedCryXml(const std::vector<char>& data, const std::filesystem:
     if (!parseResult)
     {
         CoopRuntimeLog::Write(
-            "asset_extract CryXml decode failed out=" + outputPath.string() +
+            "asset_extract CryXml decode failed out=" + CoopFilesystem::ToUtf8(outputPath) +
             " reason=" + parseResult.description());
         return false;
     }
@@ -484,7 +484,7 @@ bool ModMain::DebugCryPakAssetCommand(const std::string& command, const std::vec
         " bytes=" + std::to_string(copiedBytes) +
         " manifest=" + std::to_string(manifestOk ? 1 : 0) +
         " opened=" + openNote +
-        " out=" + outputRoot.string() +
+        " out=" + CoopFilesystem::ToUtf8(outputRoot) +
         " sample=" + FirstAssetSample(entries);
     LogAssetDump(detail);
     return copiedFiles > 0 && copiedFiles == entries.size() && manifestOk;

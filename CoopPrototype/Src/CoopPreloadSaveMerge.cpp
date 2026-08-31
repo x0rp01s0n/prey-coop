@@ -1,5 +1,7 @@
 #include "CoopPreloadSaveMerge.h"
 
+#include "CoopFilesystem.h"
+
 #include <algorithm>
 #include <array>
 #include <fstream>
@@ -118,9 +120,9 @@ std::filesystem::path BuildMergedSlotPath(const std::filesystem::path& hostSaveP
     const std::filesystem::path mergeRoot = sourceRoot / "PreloadMerged";
 
     std::ostringstream name;
-    name << sourceSlot.filename().string() << "_merge_"
+    name << CoopFilesystem::ToUtf8(sourceSlot.filename()) << "_merge_"
          << std::hex << std::uppercase << std::setw(8) << std::setfill('0') << transferId;
-    return mergeRoot / name.str();
+    return mergeRoot / CoopFilesystem::FromUtf8(name.str());
 }
 
 bool CopySlotFiles(
@@ -156,7 +158,7 @@ bool CopySlotFiles(
         if (!entry.is_regular_file(fileError) || fileError)
             continue;
 
-        const std::string name = entry.path().filename().string();
+        const std::string name = CoopFilesystem::ToUtf8(entry.path().filename());
         if (!IsSafeSaveSlotFileName(name))
             continue;
 
@@ -172,7 +174,7 @@ bool CopySlotFiles(
 
         std::filesystem::copy_file(
             entry.path(),
-            targetSlot / name,
+            targetSlot / CoopFilesystem::FromUtf8(name),
             std::filesystem::copy_options::overwrite_existing,
             fileError);
         if (fileError)
@@ -264,10 +266,10 @@ bool WriteMergeMeta(
     meta << "mode=package_copy_pending_gamestate_rebuilder\n";
     meta << "patched=" << (result.patched ? 1 : 0) << "\n";
     meta << "transferId=" << input.transferId << "\n";
-    meta << "sourceSave=" << input.hostSavePath.string() << "\n";
+    meta << "sourceSave=" << CoopFilesystem::ToUtf8(input.hostSavePath) << "\n";
     meta << "hostSaveBytes=" << input.hostSaveBytes << "\n";
     meta << "hostSaveChecksum=" << Hex32(input.hostSaveChecksum) << "\n";
-    meta << "outputSave=" << result.mergedSavePath.string() << "\n";
+    meta << "outputSave=" << CoopFilesystem::ToUtf8(result.mergedSavePath) << "\n";
     meta << "outputSaveBytes=" << result.outputSaveBytes << "\n";
     meta << "outputSaveChecksum=" << Hex32(result.outputSaveChecksum) << "\n";
     meta << "nativeItems=" << input.nativeFragment.itemGroups << "\n";
@@ -275,7 +277,7 @@ bool WriteMergeMeta(
     meta << "nativeSchemaHash=" << Hex64(input.nativeFragment.schemaHash) << "\n";
     meta << "nativeContentHash=" << Hex64(input.nativeFragment.contentHash) << "\n";
     meta << "nativeSnapshotSave=" << (result.wroteNativeSnapshotSave ? 1 : 0) << "\n";
-    meta << "nativeSnapshotSavePath=" << result.nativeSnapshotSavePath.string() << "\n";
+    meta << "nativeSnapshotSavePath=" << CoopFilesystem::ToUtf8(result.nativeSnapshotSavePath) << "\n";
     meta << "nativeSnapshotSaveBytes=" << result.nativeSnapshotSaveBytes << "\n";
     meta << "nativeSnapshotSaveChecksum=" << Hex32(result.nativeSnapshotSaveChecksum) << "\n";
     meta << "nativeRewriteStatus=" << CoopNativeSavePackageRewriter::BuildStatus(result.rewritePlan) << "\n";
@@ -387,7 +389,7 @@ std::string BuildStatus(const MergeResult& result)
         << "/" << Hex32(result.nativeSnapshotSaveChecksum)
         << "/reason=" << StatusToken(result.reason)
         << "/rewrite=" << StatusToken(CoopNativeSavePackageRewriter::BuildStatus(result.rewritePlan))
-        << "/path=" << StatusToken(result.mergedSavePath.string());
+        << "/path=" << StatusToken(CoopFilesystem::ToUtf8(result.mergedSavePath));
     return out.str();
 }
 }

@@ -1,5 +1,7 @@
 #include "CoopNativeSavePackageRewriter.h"
 
+#include "CoopFilesystem.h"
+
 #include <array>
 #include <fstream>
 #include <iomanip>
@@ -292,7 +294,7 @@ bool WriteRewritePlanMeta(
 
     meta << "version=1\n";
     meta << "mode=native_gamestate_section_rewriter_plan\n";
-    meta << "packageSave=" << input.packageSavePath.string() << "\n";
+    meta << "packageSave=" << CoopFilesystem::ToUtf8(input.packageSavePath) << "\n";
     meta << "attempted=" << (plan.attempted ? 1 : 0) << "\n";
     meta << "ok=" << (plan.ok ? 1 : 0) << "\n";
     meta << "reason=" << plan.reason << "\n";
