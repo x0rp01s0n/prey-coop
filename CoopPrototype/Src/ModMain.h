@@ -1335,6 +1335,17 @@ private:
         std::string receivePath;
     };
 
+    struct RemotePeerPoseSmoothingState
+    {
+        Vec3 targetPosition = Vec3(ZERO);
+        Quat targetRotation = Quat::CreateIdentity();
+        Vec3 presentationVelocity = Vec3(ZERO);
+        float lastTargetTime = -1.0f;
+        uint32_t targetSequence = 0;
+        bool valid = false;
+        bool hardSnapPending = false;
+    };
+
     struct RemotePeerSession
     {
         uint64_t accountToken = 0;
@@ -1351,6 +1362,7 @@ private:
         std::string poseAnimationClip;
         Vec3 location = Vec3(ZERO);
         EntityId proxyEntityId = INVALID_ENTITYID;
+        RemotePeerPoseSmoothingState poseSmoothing;
         uint32_t lastPoseSequence = 0;
         uint32_t lastPlayerStatusSequence = 0;
         uint32_t lastDamageSequence = 0;
@@ -1395,6 +1407,8 @@ private:
         std::string pendingRemoteAreaHandoffRequestLevel;
         std::string lastAreaJournalTransferEvent = "-";
         float lastPacketTime = -1.0f;
+        float poseQuarantineUntil = -1.0f;
+        bool poseQuarantineActive = false;
         bool areaLeaseActive = false;
         bool areaLeaseDebugHoldReleased = false;
         bool areaLeaseLocalReady = false;
@@ -1860,6 +1874,19 @@ private:
     void RetireRemotePeerProxyForAreaChange(RemotePeerSession& peer, const char* reason);
     void RemoveRemotePeer(uint64_t accountToken, const char* reason, bool announce);
     void KickRemotePeer(uint64_t accountToken);
+    void ClearRemotePeerPoseSmoothing(RemotePeerSession& peer);
+    void BeginRemotePeerPoseQuarantine(RemotePeerSession& peer);
+    void ResetRemotePeerPoseSmoothing(
+        RemotePeerSession& peer,
+        const Vec3& position,
+        const Quat& rotation,
+        bool hardSnapPending);
+    bool UpdateRemotePeerPoseTarget(
+        RemotePeerSession& peer,
+        const CoopProtocol::PlayerPosePacket& packet,
+        bool forceHardSnap = false,
+        bool* hardSnapApplied = nullptr);
+    void TickRemotePlayerProxySmoothing(float frameTime);
     void ApplyAdditionalRemotePose(RemotePeerSession& peer, const CoopProtocol::PlayerPosePacket& packet);
     static uint64_t MakeEndpointKey(uint32_t address, uint16_t port);
     void HandleAreaLease(const CoopProtocol::AreaLeasePacket& packet);

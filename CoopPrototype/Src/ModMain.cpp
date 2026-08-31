@@ -604,8 +604,17 @@ constexpr float kPlayerPoseIdleHeartbeatSeconds = 1.0f;
 constexpr float kProxyForwardOffsetMeters = 2.0f;
 constexpr float kMimicForwardOffsetMeters = 5.0f;
 constexpr uint32_t kNativeInventoryTraceLogLimit = 600;
-constexpr float kRemoteProxySoftSnapDistance = 0.25f;
-constexpr float kRemoteProxyHardSnapDistance = 2.5f;
+// PlayerPose is the latest target state. The proxy follows the real received
+// position with a critically damped, bounded follower. Do not predict ahead
+// of the packet or feed packet velocity into the presentation transform.
+constexpr float kRemoteProxySmoothingTimeSeconds = 0.10f;
+constexpr float kRemoteProxySmoothingMaxCorrectionSpeed = 6.0f;
+// The 100 ms critically damped response reaches about 1.6 m/s on its first
+// 60 Hz step for a clipped 0.6 m target delta; this cap keeps that step while
+// preventing later burst-delivery corrections from becoming unbounded.
+constexpr float kRemoteProxySmoothingMaxCorrectionAcceleration = 96.0f;
+constexpr float kRemoteProxySmoothingRotationResponse = 14.0f;
+constexpr float kRemotePoseResetQuarantineSeconds = 0.35f;
 constexpr float kMimicPuppetSoftSnapDistance = 0.35f;
 constexpr float kMimicPuppetHardSnapDistance = 3.0f;
 constexpr float kEnemyMovementIntentSpeedThreshold = 0.75f;
@@ -848,6 +857,36 @@ bool NativeFinalStreamByteCaptureEnabled()
 {
     return EnvFlagEnabled("COOP_NATIVE_FINAL_STREAM_CAPTURE") ||
         EnvFlagEnabled("COOP_NATIVE_FINAL_STREAM_DUMP");
+}
+
+bool IsFiniteVec3(const Vec3& value)
+{
+    return std::isfinite(value.x) && std::isfinite(value.y) && std::isfinite(value.z);
+}
+
+bool IsFiniteTransform(const Vec3& position, const Quat& rotation)
+{
+    const float values[] = {
+        position.x, position.y, position.z,
+        rotation.w, rotation.v.x, rotation.v.y, rotation.v.z,
+    };
+    for (const float value : values)
+    {
+        if (!std::isfinite(value))
+            return false;
+    }
+
+    const float quaternionLengthSquared = rotation.w * rotation.w + rotation.v.GetLengthSquared();
+    return std::isfinite(quaternionLengthSquared) &&
+        quaternionLengthSquared > 0.000001f && quaternionLengthSquared < 4.0f;
+}
+
+bool IsFinitePlayerPosePacket(const CoopProtocol::PlayerPosePacket& packet)
+{
+    return IsFiniteTransform(
+            Vec3(packet.px, packet.py, packet.pz),
+            Quat(packet.qw, packet.qx, packet.qy, packet.qz)) &&
+        std::isfinite(packet.vx) && std::isfinite(packet.vy) && std::isfinite(packet.vz);
 }
 
 bool NativeSaveInstrumentationEnabled()
@@ -25104,6 +25143,7 @@ void ModMain::OnCoopRuntimeEntityRemoved(IEntity& entity)
             if (entry.second.proxyEntityId == removedEntityId)
             {
                 entry.second.proxyEntityId = INVALID_ENTITYID;
+                ClearRemotePeerPoseSmoothing(entry.second);
                 entry.second.poseAnimationClip.clear();
             }
         }
@@ -25501,6 +25541,7 @@ void ModMain::ResetRuntimeWorldRefsForLoad(const char* reason)
     for (auto& entry : m_remotePeers)
     {
         entry.second.proxyEntityId = INVALID_ENTITYID;
+        ClearRemotePeerPoseSmoothing(entry.second);
         entry.second.poseAnimationClip.clear();
     }
     ResetProxyLifecycleRuntimeState(reason);
@@ -35088,6 +35129,7 @@ void ModMain::MainUpdate(unsigned updateFlags)
     TickPendingRemoteCorpsePhantomResults();
 
     TickNetwork(frameTime);
+    TickRemotePlayerProxySmoothing(frameTime);
     TickRemoteDoorPowerConvergence(frameTime);
     TickArkElevatorTransitScan(frameTime);
     TickMainLiftOutageEvent(frameTime);
@@ -67592,6 +67634,7 @@ void ModMain::RetireRemotePeerProxyForAreaChange(RemotePeerSession& peer, const 
 {
     const EntityId proxyId = peer.proxyEntityId;
     peer.lastPoseSequence = 0;
+    ClearRemotePeerPoseSmoothing(peer);
     peer.poseAnimationClip.clear();
     peer.downed = false;
     if (proxyId == INVALID_ENTITYID)
@@ -68062,6 +68105,255 @@ bool ModMain::ResolveSessionHostEndpoint(uint32_t& address, uint16_t& port) cons
     return address != 0 && port != 0;
 }
 
+void ModMain::ClearRemotePeerPoseSmoothing(RemotePeerSession& peer)
+{
+    peer.poseSmoothing = RemotePeerPoseSmoothingState();
+    peer.poseQuarantineUntil = -1.0f;
+    peer.poseQuarantineActive = false;
+}
+
+void ModMain::BeginRemotePeerPoseQuarantine(RemotePeerSession& peer)
+{
+    const float now = GetNowSeconds();
+    if (!std::isfinite(now))
+        return;
+    // Protocol 242 has separate pose/status sequences, so a short local
+    // receive-time quarantine is the only safe way to keep a delayed pose
+    // from undoing an exact status teleport. It is intentionally bounded;
+    // protocol data cannot identify an arbitrarily late old pose.
+    peer.poseQuarantineUntil = now + kRemotePoseResetQuarantineSeconds;
+    peer.poseQuarantineActive = true;
+}
+
+void ModMain::ResetRemotePeerPoseSmoothing(
+    RemotePeerSession& peer,
+    const Vec3& position,
+    const Quat& rotation,
+    bool hardSnapPending)
+{
+    RemotePeerPoseSmoothingState& state = peer.poseSmoothing;
+    state.targetPosition = position;
+    state.targetRotation = rotation;
+    state.presentationVelocity = Vec3(ZERO);
+    const float now = GetNowSeconds();
+    state.lastTargetTime = std::isfinite(now) ? now : -1.0f;
+    state.targetSequence = 0;
+    state.valid = true;
+    state.hardSnapPending = hardSnapPending;
+}
+
+bool ModMain::UpdateRemotePeerPoseTarget(
+    RemotePeerSession& peer,
+    const CoopProtocol::PlayerPosePacket& packet,
+    bool forceHardSnap,
+    bool* hardSnapApplied)
+{
+    if (hardSnapApplied)
+        *hardSnapApplied = false;
+    if (!IsFinitePlayerPosePacket(packet))
+        return false;
+
+    RemotePeerPoseSmoothingState& state = peer.poseSmoothing;
+    const float now = GetNowSeconds();
+    if (!std::isfinite(now))
+        return false;
+    if (peer.poseQuarantineActive)
+    {
+        if (now < peer.poseQuarantineUntil)
+            return false;
+        peer.poseQuarantineActive = false;
+        peer.poseQuarantineUntil = -1.0f;
+    }
+    const Vec3 targetPosition(packet.px, packet.py, packet.pz);
+    const Quat targetRotation = Quat(packet.qw, packet.qx, packet.qy, packet.qz).GetNormalized();
+    // Do not infer a teleport from a large packet-to-packet delta. Loss and
+    // burst delivery create exactly that shape; explicit status/area resets
+    // are the only hard-snap signals after initialization.
+    const bool hardSnap = forceHardSnap || !state.valid;
+
+    state.targetPosition = targetPosition;
+    state.targetRotation = targetRotation;
+    state.lastTargetTime = now;
+    state.targetSequence = packet.sequence;
+    state.valid = true;
+    state.hardSnapPending = state.hardSnapPending || hardSnap;
+    if (hardSnap)
+        state.presentationVelocity = Vec3(ZERO);
+    if (hardSnapApplied)
+        *hardSnapApplied = hardSnap;
+    return true;
+}
+
+void ModMain::TickRemotePlayerProxySmoothing(float frameTime)
+{
+    if (EnvFlagEnabled("COOP_DISABLE_REMOTE_PLAYER_PROXY") ||
+        !IsGameReady() || m_saveLoadGuardActive || m_pendingPostLoadResync ||
+        m_arkLevelTransitionLoadActive || m_runtimeTransitionCleanupPrepared)
+    {
+        return;
+    }
+
+    if (!std::isfinite(frameTime))
+        return;
+    const float dt = std::clamp(frameTime, 0.0f, 0.1f);
+    if (dt <= 0.0f || !gEnv || !gEnv->pEntitySystem)
+        return;
+
+    for (auto& entry : m_remotePeers)
+    {
+        RemotePeerSession& peer = entry.second;
+        RemotePeerPoseSmoothingState& state = peer.poseSmoothing;
+        if (!state.valid || peer.proxyEntityId == INVALID_ENTITYID)
+            continue;
+
+        IEntity* entity = gEnv->pEntitySystem->GetEntity(peer.proxyEntityId);
+        if (!entity)
+        {
+            peer.proxyEntityId = INVALID_ENTITYID;
+            ClearRemotePeerPoseSmoothing(peer);
+            continue;
+        }
+
+        Vec3 currentPosition(ZERO);
+        std::string positionReason;
+        if (!TryGuardedCall(
+                "remote pose smoothing GetWorldPos",
+                [entity]() { return entity->GetWorldPos(); },
+                currentPosition,
+                &positionReason))
+        {
+            continue;
+        }
+        if (!IsFiniteVec3(currentPosition))
+            continue;
+
+        if (state.hardSnapPending)
+        {
+            ApplyProxyNoPropCollision(*entity, "remote pose hard snap");
+            std::string transformReason;
+            if (ApplyRemoteProxyTransform(
+                    *entity,
+                    state.targetPosition,
+                    state.targetRotation,
+                    "remote pose hard snap",
+                    &transformReason))
+            {
+                state.presentationVelocity = Vec3(ZERO);
+                state.hardSnapPending = false;
+            }
+            continue;
+        }
+
+        // Unity-style SmoothDamp integration: the received packet position is
+        // the only target. Packet velocity and a forward prediction would let
+        // a low-latency target be crossed, then pulled back on the next frame.
+        // The max correction speed deliberately permits visible lag rather
+        // than hiding packet timing with a catch-up burst.
+        const float smoothTime = std::max(0.08f, kRemoteProxySmoothingTimeSeconds);
+        const float omega = 2.0f / smoothTime;
+        const float omegaDt = omega * dt;
+        const float omegaDtSquared = omegaDt * omegaDt;
+        const float exp = 1.0f / (1.0f + omegaDt + 0.48f * omegaDtSquared +
+            0.235f * omegaDtSquared * omegaDt);
+        const Vec3 originalTarget = state.targetPosition;
+        Vec3 change = currentPosition - originalTarget;
+        const float maxChange = kRemoteProxySmoothingMaxCorrectionSpeed * smoothTime;
+        const float changeLength = change.GetLength();
+        if (std::isfinite(changeLength) && changeLength > maxChange)
+            change *= maxChange / changeLength;
+
+        const Vec3 temp = (state.presentationVelocity + change * omega) * dt;
+        Vec3 smoothPosition = (currentPosition - change) + (change + temp) * exp;
+
+        // Keep the real packet target only for this crossing check. A burst
+        // can make the clipped trajectory appear past it even though the
+        // adjusted-target integration itself remains bounded.
+        const Vec3 toTargetBefore = originalTarget - currentPosition;
+        const Vec3 pastTarget = smoothPosition - originalTarget;
+        if (toTargetBefore.GetLengthSquared() > 0.000001f &&
+            toTargetBefore.Dot(pastTarget) > 0.0f)
+        {
+            smoothPosition = originalTarget;
+        }
+
+        const float maximumDisplacement = kRemoteProxySmoothingMaxCorrectionSpeed * dt;
+        Vec3 desiredDisplacement = smoothPosition - currentPosition;
+        const float desiredDisplacementLength = desiredDisplacement.GetLength();
+        if (std::isfinite(desiredDisplacementLength) &&
+            desiredDisplacementLength > maximumDisplacement)
+        {
+            desiredDisplacement *= maximumDisplacement / desiredDisplacementLength;
+        }
+        Vec3 desiredVelocity = desiredDisplacement * (1.0f / dt);
+        Vec3 nextVelocity = desiredVelocity;
+        const Vec3 velocityDelta = nextVelocity - state.presentationVelocity;
+        const float maxVelocityChange = kRemoteProxySmoothingMaxCorrectionAcceleration * dt;
+        const float velocityDeltaLength = velocityDelta.GetLength();
+        if (std::isfinite(velocityDeltaLength) && velocityDeltaLength > maxVelocityChange)
+            nextVelocity = state.presentationVelocity + velocityDelta *
+                (maxVelocityChange / velocityDeltaLength);
+        const float nextVelocityLength = nextVelocity.GetLength();
+        if (std::isfinite(nextVelocityLength) &&
+            nextVelocityLength > kRemoteProxySmoothingMaxCorrectionSpeed)
+        {
+            nextVelocity *= kRemoteProxySmoothingMaxCorrectionSpeed / nextVelocityLength;
+        }
+        Vec3 nextPosition = currentPosition + nextVelocity * dt;
+        if (toTargetBefore.GetLengthSquared() <= 0.000001f)
+        {
+            // A target held for multiple packets must not let residual
+            // numerical velocity drift the proxy to the far side.
+            nextPosition = originalTarget;
+            nextVelocity = Vec3(ZERO);
+        }
+
+        // Never cross the latest real target after acceleration limiting. The
+        // final correction is at most one bounded frame step.
+        const Vec3 integratedPastTarget = nextPosition - originalTarget;
+        if (toTargetBefore.GetLengthSquared() > 0.000001f &&
+            toTargetBefore.Dot(integratedPastTarget) > 0.0f)
+        {
+            const float targetDistance = toTargetBefore.GetLength();
+            if (std::isfinite(targetDistance) && targetDistance <= maximumDisplacement)
+            {
+                nextPosition = originalTarget;
+                nextVelocity = toTargetBefore * (1.0f / dt);
+            }
+            else
+            {
+                nextPosition = currentPosition + toTargetBefore *
+                    (maximumDisplacement / targetDistance);
+                nextVelocity = (nextPosition - currentPosition) * (1.0f / dt);
+            }
+        }
+        state.presentationVelocity = nextVelocity;
+
+        Quat currentRotation = state.targetRotation;
+        std::string rotationReason;
+        TryGuardedCall(
+            "remote pose smoothing GetWorldRotation",
+            [entity]() { return entity->GetWorldRotation(); },
+            currentRotation,
+            &rotationReason);
+        if (!IsFiniteTransform(Vec3(ZERO), currentRotation))
+            currentRotation = state.targetRotation;
+        const float rotationAlpha = 1.0f - std::exp(-kRemoteProxySmoothingRotationResponse * dt);
+        const Quat nextRotation = Quat::CreateNlerp(currentRotation, state.targetRotation, rotationAlpha);
+
+        std::string transformReason;
+        if (!ApplyRemoteProxyTransform(
+                *entity,
+                nextPosition,
+                nextRotation,
+                "remote pose smoothing frame",
+                &transformReason))
+        {
+            continue;
+        }
+
+    }
+}
+
 void ModMain::ApplyAdditionalRemotePose(
     RemotePeerSession& peer,
     const CoopProtocol::PlayerPosePacket& packet)
@@ -68073,6 +68365,9 @@ void ModMain::ApplyAdditionalRemotePose(
     CoopSerialSequence::Observe(packet.sequence, peer.lastPoseSequence);
     peer.location = Vec3(packet.px, packet.py, packet.pz);
 
+    bool hardSnap = false;
+    if (!UpdateRemotePeerPoseTarget(peer, packet, false, &hardSnap))
+        return;
     IEntity* entity = peer.proxyEntityId != INVALID_ENTITYID && gEnv && gEnv->pEntitySystem
         ? gEnv->pEntitySystem->GetEntity(peer.proxyEntityId)
         : nullptr;
@@ -68125,16 +68420,24 @@ void ModMain::ApplyAdditionalRemotePose(
         }
     }
 
-    // Disable response before the teleport as well as after it. SetPosRotScale
-    // can otherwise resolve one frame of overlap against a nearby rigid prop.
-    ApplyProxyNoPropCollision(*entity, "additional remote pose pre-transform");
-    std::string reason;
-    ApplyRemoteProxyTransform(
-        *entity,
-        position,
-        rotation,
-        "additional remote pose SetPosRotScale",
-        &reason);
+    // Normal poses only update the target. The frame tick below owns the
+    // presentation transform; a spawn or explicit status reset remains an
+    // explicit hard snap so level changes and real teleports cannot trail.
+    if (spawned || hardSnap || peer.poseSmoothing.hardSnapPending)
+    {
+        ApplyProxyNoPropCollision(*entity, "additional remote pose hard snap");
+        std::string reason;
+        if (ApplyRemoteProxyTransform(
+                *entity,
+                position,
+                rotation,
+                "additional remote pose hard snap",
+                &reason))
+        {
+            peer.poseSmoothing.presentationVelocity = Vec3(ZERO);
+            peer.poseSmoothing.hardSnapPending = false;
+        }
+    }
     ForceEntityRenderable(*entity);
     ApplyProxyNoPropCollision(*entity, "additional remote pose");
 
@@ -68745,6 +69048,8 @@ void ModMain::TickReceivePackets(const char* failurePrefix)
             {
                 continue;
             }
+            if (!IsFinitePlayerPosePacket(packet))
+                continue;
             auto sourceIt = m_remotePeers.find(packet.sourceAccountToken);
             if (sourceIt == m_remotePeers.end())
             {
@@ -68761,7 +69066,17 @@ void ModMain::TickReceivePackets(const char* failurePrefix)
                 sourceIt = m_remotePeers.find(packet.sourceAccountToken);
             }
             RemotePeerSession& sourcePeer = sourceIt->second;
-            sourcePeer.lastPacketTime = GetNowSeconds();
+            const float poseReceiveTime = GetNowSeconds();
+            if (!std::isfinite(poseReceiveTime))
+                continue;
+            if (sourcePeer.poseQuarantineActive)
+            {
+                if (poseReceiveTime < sourcePeer.poseQuarantineUntil)
+                    continue;
+                sourcePeer.poseQuarantineActive = false;
+                sourcePeer.poseQuarantineUntil = -1.0f;
+            }
+            sourcePeer.lastPacketTime = poseReceiveTime;
             const bool poseMatchesKnownPeerArea =
                 sourcePeer.worldEpoch != 0 && sourcePeer.levelEpoch != 0 && sourcePeer.levelId != 0 &&
                 packet.worldEpoch == sourcePeer.worldEpoch &&
@@ -69055,6 +69370,13 @@ void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
             existingIt->second,
             "session peer area changed");
     }
+    else if (!newPeer &&
+        (remoteWorldChanged || remoteLevelChanged || remoteNamedAreaChanged || remoteBecameUnavailable))
+    {
+        // A retired entity may already have been removed by the native load;
+        // clear its trajectory even when there is no proxy id left to retire.
+        ClearRemotePeerPoseSmoothing(existingIt->second);
+    }
 
     RemotePeerSession& peer = m_remotePeers[packet.accountToken];
     peer.accountToken = packet.accountToken;
@@ -69113,6 +69435,7 @@ void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
         else
         {
             peer.lastPoseSequence = 0;
+            ClearRemotePeerPoseSmoothing(peer);
             ReliableEndpointState& endpointState =
                 m_reliableEndpointStates[MakeEndpointKey(fromAddress, fromPort)];
             endpointState.recvSequence = 0;
@@ -69405,6 +69728,11 @@ void ModMain::HandlePlayerStatus(const CoopProtocol::PlayerStatusPacket& packet)
     const bool targetLocalPlayer = (packet.flags & CoopProtocol::kPlayerStatusFlagTargetLocalPlayer) != 0;
     const Vec3 position(packet.px, packet.py, packet.pz);
     const Quat rotation(packet.qw, packet.qx, packet.qy, packet.qz);
+    if (!IsFiniteTransform(position, rotation))
+    {
+        m_networkStatus = "ignored invalid remote player status transform";
+        return;
+    }
 
     CoopSerialSequence::Observe(packet.sequence, m_lastPlayerStatusSequence);
     ++m_receivedPlayerStatusPackets;
@@ -69443,15 +69771,37 @@ void ModMain::HandlePlayerStatus(const CoopProtocol::PlayerStatusPacket& packet)
         m_remotePlayerLocation = position;
         const auto peerIt = m_remotePeers.find(m_activeRemotePeerToken);
         if (peerIt != m_remotePeers.end())
+        {
             peerIt->second.location = position;
+            ResetRemotePeerPoseSmoothing(peerIt->second, position, rotation, true);
+            peerIt->second.poseSmoothing.targetSequence = packet.sequence;
+            BeginRemotePeerPoseQuarantine(peerIt->second);
+        }
         if (IEntity* proxyEntity = GetProxyEntity())
         {
-            ApplyRemoteProxyTransform(
+            const bool transformApplied = ApplyRemoteProxyTransform(
                 *proxyEntity,
                 position,
                 rotation,
                 "remote player status teleport");
+            if (transformApplied && peerIt != m_remotePeers.end())
+            {
+                peerIt->second.poseSmoothing.hardSnapPending = false;
+            }
             ResetProxyHealthBaseline();
+        }
+    }
+    else if (downed || revived)
+    {
+        // Down/revive is a presentation reset as well as an animation edge;
+        // do not carry the prior locomotion velocity through that transition.
+        const auto peerIt = m_remotePeers.find(m_activeRemotePeerToken);
+        if (peerIt != m_remotePeers.end())
+        {
+            peerIt->second.location = position;
+            ResetRemotePeerPoseSmoothing(peerIt->second, position, rotation, true);
+            peerIt->second.poseSmoothing.targetSequence = packet.sequence;
+            BeginRemotePeerPoseQuarantine(peerIt->second);
         }
     }
 
@@ -82187,6 +82537,11 @@ void ModMain::RemoveProxyOnly()
     }
 
     m_proxyEntityId = INVALID_ENTITYID;
+    if (const auto activePeerIt = m_remotePeers.find(m_activeRemotePeerToken);
+        activePeerIt != m_remotePeers.end())
+    {
+        ClearRemotePeerPoseSmoothing(activePeerIt->second);
+    }
     m_proxyWasConfigured = false;
     m_remoteProxySlotVisualStateValid = false;
     m_remoteProxySlotVisualEntityId = INVALID_ENTITYID;
@@ -82322,6 +82677,17 @@ void ModMain::ApplyRemotePoseToProxy(const CoopProtocol::PlayerPosePacket& packe
 
     const Vec3 targetPosition(packet.px, packet.py, packet.pz);
     const Quat targetRotation(packet.qw, packet.qx, packet.qy, packet.qz);
+    RemotePeerSession* smoothingPeer = nullptr;
+    const auto smoothingPeerIt = m_remotePeers.find(m_activeRemotePeerToken);
+    if (smoothingPeerIt != m_remotePeers.end())
+        smoothingPeer = &smoothingPeerIt->second;
+    // A primary proxy without a peer record has no identity/reset context.
+    // Do not fall back to the old packet-immediate transform in that case.
+    if (!smoothingPeer)
+        return;
+    bool hardSnap = false;
+    if (!UpdateRemotePeerPoseTarget(*smoothingPeer, packet, false, &hardSnap))
+        return;
 
     bool spawnedProxyForPose = false;
     if (!GetProxyEntity())
@@ -82362,6 +82728,8 @@ void ModMain::ApplyRemotePoseToProxy(const CoopProtocol::PlayerPosePacket& packe
             RemoveProxyOnly();
             proxyEntity = SpawnProxyOnly(targetPosition, targetRotation);
             spawnedProxyForPose = true;
+            if (smoothingPeer)
+                UpdateRemotePeerPoseTarget(*smoothingPeer, packet, true, &hardSnap);
             TraceProxyLifecycle("remote pose respawned dead proxy returned");
             if (!proxyEntity)
                 return;
@@ -82463,33 +82831,43 @@ void ModMain::ApplyRemotePoseToProxy(const CoopProtocol::PlayerPosePacket& packe
 
     if (spawnedProxyForPose)
         TraceProxyLifecycle("remote pose transform compute begin");
-    const Vec3 currentPosition = proxyEntity->GetWorldPos();
-    const Vec3 delta = targetPosition - currentPosition;
-    const float deltaSq = delta.GetLengthSquared();
     Vec3 appliedPosition = targetPosition;
-    if (deltaSq < kRemoteProxyHardSnapDistance * kRemoteProxyHardSnapDistance &&
-        deltaSq > kRemoteProxySoftSnapDistance * kRemoteProxySoftSnapDistance)
+    if (!smoothingPeer || hardSnap || smoothingPeer->poseSmoothing.hardSnapPending)
     {
-        appliedPosition = currentPosition + delta * 0.65f;
+        // Spawning already establishes the initial transform. Explicit status
+        // resets use the same guarded hard-snap path; ordinary packets are
+        // consumed by TickRemotePlayerProxySmoothing.
+        if (!spawnedProxyForPose)
+        {
+            ApplyProxyNoPropCollision(*proxyEntity, "remote pose hard snap");
+            std::string transformReason;
+            const bool transformOk = ApplyRemoteProxyTransform(
+                *proxyEntity,
+                targetPosition,
+                targetRotation,
+                "remote pose hard snap",
+                &transformReason);
+            if (!transformOk)
+            {
+                LogCoop("remote pose hard snap guarded fail reason=" + (transformReason.empty() ? std::string("-") : transformReason));
+                return;
+            }
+        }
+        if (smoothingPeer)
+        {
+            smoothingPeer->poseSmoothing.presentationVelocity = Vec3(ZERO);
+            smoothingPeer->poseSmoothing.hardSnapPending = false;
+        }
+        appliedPosition = targetPosition;
     }
-
-    // Remote pose velocity is presentation data, not a physical impulse source.
-    // Make the body non-responsive before moving it so it cannot sweep props.
-    ApplyProxyNoPropCollision(*proxyEntity, "remote pose pre-transform");
-    if (spawnedProxyForPose)
-        TraceProxyLifecycle("remote pose set transform begin");
-    std::string transformReason;
-    const bool transformOk = ApplyRemoteProxyTransform(
-        *proxyEntity,
-        appliedPosition,
-        targetRotation,
-        "remote pose proxy SetPosRotScale",
-        &transformReason);
-    if (!transformOk)
+    else
     {
-        if (spawnedProxyForPose)
-            LogCoop("remote pose set transform guarded fail reason=" + (transformReason.empty() ? std::string("-") : transformReason));
-        return;
+        std::string actualPositionReason;
+        TryGuardedCall(
+            "remote pose smoothing current position",
+            [proxyEntity]() { return proxyEntity->GetWorldPos(); },
+            appliedPosition,
+            &actualPositionReason);
     }
     if (spawnedProxyForPose)
         TraceProxyLifecycle("remote pose set transform end");
