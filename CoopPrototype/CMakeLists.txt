@@ -58,3 +58,14 @@ add_subdirectory(CommonMod)
 
 # Mods
 add_subdirectory(Src)
+
+# Hardware faults must reach the SEH filters used by runtime reads. Keep /EHa
+# and the matching PCH exclusion scoped to the guard implementation only.
+set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/Src/CoopRuntimeGuards.cpp"
+	TARGET_DIRECTORY CoopPrototype
+	APPEND PROPERTY COMPILE_OPTIONS /EHa
+)
+set_property(SOURCE "${CMAKE_CURRENT_SOURCE_DIR}/Src/CoopRuntimeGuards.cpp"
+	TARGET_DIRECTORY CoopPrototype
+	PROPERTY SKIP_PRECOMPILE_HEADERS ON
+)
