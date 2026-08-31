@@ -678,6 +678,7 @@ constexpr float kHostSnapshotRetrySeconds = 2.0f;
 constexpr float kClientPlayerSnapshotUploadTimeoutSeconds = 3.0f;
 constexpr float kClientPlayerSnapshotMinIntervalSeconds = 5.0f;
 constexpr float kClientPlayerSnapshotReadyRetrySeconds = 0.25f;
+constexpr float kClientDisconnectPlayerStateFlushTimeoutSeconds = 5.0f;
 constexpr float kHostPlayerStateInitialApplyDelaySeconds = 2.0f;
 constexpr float kHostPlayerStateRetryApplyDelaySeconds = 1.0f;
 constexpr uint32_t kFnv1aOffsetBasis = 2166136261u;
@@ -34922,10 +34923,14 @@ void ModMain::MainUpdate(unsigned updateFlags)
         const CoopNetworkMode leavingMode = m_networkMode;
         CloseMultiplayerUi("leave session");
         if (leavingMode == CoopNetworkMode::Client)
-            DisconnectRemotePeer("left session");
+        {
+            if (!BeginClientIntentionalDisconnect("left session"))
+                DisconnectRemotePeer("left session");
+        }
         else if (leavingMode == CoopNetworkMode::Host)
             StopNetwork();
     }
+    TickClientIntentionalDisconnect(frameTime);
     if (m_multiplayerKickRequestedToken != 0)
     {
         const uint64_t accountToken = m_multiplayerKickRequestedToken;
@@ -37175,6 +37180,12 @@ std::string ModMain::BuildRuntimeControlStatus() const
         << " playerStatePendingHost=" << (m_pendingHostPlayerStateSend ? 1 : 0)
         << " playerStatePendingUpload=" << (m_pendingClientPlayerStateUpload ? 1 : 0)
         << " playerStateAwaitHost=" << (m_clientAwaitingHostPlayerState ? 1 : 0)
+        << " playerStateDisconnectFlush="
+            << (m_clientDisconnectFlushPending ? 1 : 0)
+            << "/" << (m_clientDisconnectFlushAwaitingStoredAck ? 1 : 0)
+            << "/" << (m_clientDisconnectFlushStoredAckReceived ? 1 : 0)
+            << "/" << m_clientDisconnectFlushTransferId
+            << "/" << m_clientDisconnectFlushRemainingSeconds
         << " playerStatePreload=" << (m_pendingHostWorldLoadAfterPlayerState ? 1 : 0) << "/" << (m_receivedPlayerStateInventoryPreparedForNativeLoad ? 1 : 0) << "/" << (m_skipNextHostAuthoritativeInventoryApply ? 1 : 0) << "/" << (m_hostPlayerStatePreloadSent ? 1 : 0)
         << " playerStateNativeMerge=" << m_playerStateNativeLoadMerges << "/" << m_playerStateNativeLoadMergeFailures << "/" << (m_receivedPlayerStateMergedDuringNativeLoad ? 1 : 0) << "/" << (m_pendingNativePlayerStateOverrideValid ? 1 : 0)
         << " playerStateChunks=" << (m_playerStateTransferSending ? m_playerStateTransferNextChunk : m_playerStateTransferReceivedChunks) << "/" << m_playerStateTransferChunkCount
@@ -43110,8 +43121,16 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
     }
     else if (command == "coop_stop_network")
     {
-        StopNetwork();
-        action = "stop_network";
+        if (m_networkMode == CoopNetworkMode::Client &&
+            BeginClientIntentionalDisconnect("runtime stop network"))
+        {
+            action = "stop_network_deferred_for_player_state";
+        }
+        else
+        {
+            StopNetwork();
+            action = "stop_network";
+        }
     }
     else if (command == "coop_host_access")
     {
@@ -43210,8 +43229,16 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
             const std::string reason = args.empty()
                 ? std::string("runtime disconnect acceptance")
                 : JoinArgs(args, 0);
-            DisconnectRemotePeer(reason.c_str());
-            action = "disconnect_peer";
+            if (m_networkMode == CoopNetworkMode::Client &&
+                BeginClientIntentionalDisconnect(reason.c_str()))
+            {
+                action = "disconnect_peer_deferred_for_player_state";
+            }
+            else
+            {
+                DisconnectRemotePeer(reason.c_str());
+                action = "disconnect_peer";
+            }
         }
     }
     else if (command == "coop_peer_timeout_now")
@@ -51238,6 +51265,29 @@ void ModMain::ResetSaveTransferState(const char* lastEvent)
 
 void ModMain::ResetPlayerStateTransferState(const char* lastEvent)
 {
+    // World/transfer resets can run while an intentional client disconnect is
+    // waiting for the host's commit acknowledgement. Keep that request alive
+    // and let the next tick retry the immutable snapshot rather than leaving
+    // the player connected with the flush silently discarded. StopNetwork()
+    // explicitly cancels this state for real connection loss/replacement.
+    const bool preserveClientDisconnectFlush =
+        m_networkMode == CoopNetworkMode::Client && m_clientDisconnectFlushPending;
+    const std::string preservedDisconnectSourcePath = m_clientDisconnectTransferSourcePath;
+    const bool preservedDisconnectAck = m_clientDisconnectFlushStoredAckReceived;
+    const uint32_t preservedDisconnectTransferId = m_clientDisconnectFlushTransferId;
+    const uint32_t preservedDisconnectChecksum = m_clientDisconnectFlushChecksum;
+    const float preservedDisconnectRemainingSeconds = m_clientDisconnectFlushRemainingSeconds;
+    const std::string preservedDisconnectReason = m_clientDisconnectFlushReason;
+    const std::string preservedDisconnectSaveKey = m_clientDisconnectFlushSaveKey;
+
+    if (!preserveClientDisconnectFlush && !m_clientDisconnectTransferSourcePath.empty())
+    {
+        std::error_code error;
+        std::filesystem::remove(
+            CoopFilesystem::FromUtf8(m_clientDisconnectTransferSourcePath),
+            error);
+    }
+
     m_playerStateTransferSequence = 0;
     m_playerStateTransferId = 0;
     m_playerStateTransferTotalBytes = 0;
@@ -51258,6 +51308,9 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent)
     m_hostPlayerStateUploadReceives.clear();
     m_pendingHostPlayerStateUploadRequests.clear();
     m_playerStateTransferSourcePath.clear();
+    m_clientDisconnectTransferSourcePath = preserveClientDisconnectFlush
+        ? preservedDisconnectSourcePath
+        : std::string();
     m_playerStateTransferReceivePath.clear();
     m_playerStateTransferUsername.clear();
     m_playerStateTransferAccountToken = 0;
@@ -51272,6 +51325,22 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent)
     m_pendingHostPlayerStateSaveKey.clear();
     m_pendingClientPlayerStateUploadReason.clear();
     m_pendingClientPlayerStateUploadSaveKey.clear();
+    m_clientDisconnectFlushPending = preserveClientDisconnectFlush;
+    // The transfer itself was reset, so it is safe to retry it. An already
+    // received StoredAck remains terminal and is consumed on the next tick.
+    m_clientDisconnectFlushAwaitingStoredAck = false;
+    m_clientDisconnectFlushStoredAckReceived = preserveClientDisconnectFlush && preservedDisconnectAck;
+    m_clientDisconnectFlushTransferId = preserveClientDisconnectFlush ? preservedDisconnectTransferId : 0;
+    m_clientDisconnectFlushChecksum = preserveClientDisconnectFlush ? preservedDisconnectChecksum : 0;
+    m_clientDisconnectFlushRemainingSeconds = preserveClientDisconnectFlush
+        ? preservedDisconnectRemainingSeconds
+        : 0.0f;
+    m_clientDisconnectFlushReason = preserveClientDisconnectFlush
+        ? preservedDisconnectReason
+        : std::string();
+    m_clientDisconnectFlushSaveKey = preserveClientDisconnectFlush
+        ? preservedDisconnectSaveKey
+        : std::string();
     m_clientPlayerSnapshotForUploadPending = false;
     m_clientPlayerSnapshotCooldownSeconds = 0.0f;
     m_clientPlayerSnapshotForUploadWaitSeconds = 0.0f;
@@ -52336,6 +52405,22 @@ void ModMain::StartClient()
 
 void ModMain::StopNetwork()
 {
+    if (m_clientDisconnectFlushPending)
+    {
+        // StopNetwork is the connection-loss/replacement path. It must not
+        // defer that teardown or leave a stale disconnect request armed after
+        // the socket is gone; ResetPlayerStateTransferState then removes the
+        // immutable temporary snapshot normally.
+        LogCoop("intentional disconnect flush cancelled by network stop");
+        m_clientDisconnectFlushPending = false;
+        m_clientDisconnectFlushAwaitingStoredAck = false;
+        m_clientDisconnectFlushStoredAckReceived = false;
+        m_clientDisconnectFlushTransferId = 0;
+        m_clientDisconnectFlushChecksum = 0;
+        m_clientDisconnectFlushRemainingSeconds = 0.0f;
+        m_clientDisconnectFlushReason.clear();
+        m_clientDisconnectFlushSaveKey.clear();
+    }
     m_debugPlayerFollowEnemyNetId = 0;
     m_pendingDebugEnemyAbilityNetId = 0;
     m_pendingDebugEnemyAbilityContextId = 0;
@@ -73239,6 +73324,171 @@ bool ModMain::BeginClientPlayerStateUpload(const char* reason, const std::string
     return started;
 }
 
+bool ModMain::BeginClientIntentionalDisconnect(const char* reason)
+{
+    if (m_networkMode != CoopNetworkMode::Client ||
+        m_socket == kInvalidNetworkSocket ||
+        !m_hasRemoteSession ||
+        m_clientAwaitingHostPlayerState ||
+        m_pendingHostWorldLoadAfterPlayerState)
+    {
+        return false;
+    }
+
+    // The caller may be reached again while the UI/console command is still
+    // unwinding. Keep the first request authoritative and never recurse into
+    // DisconnectRemotePeer from this entry point.
+    if (m_clientDisconnectFlushPending)
+        return true;
+
+    m_clientDisconnectFlushPending = true;
+    m_clientDisconnectFlushAwaitingStoredAck = false;
+    m_clientDisconnectFlushStoredAckReceived = false;
+    m_clientDisconnectFlushTransferId = 0;
+    m_clientDisconnectFlushChecksum = 0;
+    m_clientDisconnectFlushRemainingSeconds = kClientDisconnectPlayerStateFlushTimeoutSeconds;
+    m_clientDisconnectFlushReason = reason && reason[0] ? reason : "intentional client disconnect";
+    m_clientDisconnectFlushSaveKey = !m_currentHostSaveStateKey.empty()
+        ? m_currentHostSaveStateKey
+        : BuildHostSaveStateKey(m_lastSaveLoadPath);
+    m_clientDisconnectTransferSourcePath.clear();
+
+    m_lastPlayerStateTransferEvent =
+        "intentional disconnect: capturing live player sidecar saveKey=" +
+        (m_clientDisconnectFlushSaveKey.empty() ? std::string("-") : m_clientDisconnectFlushSaveKey);
+    LogCoop(m_lastPlayerStateTransferEvent);
+
+    if (!IsGameReady() || !SaveLocalPlayerSidecar("intentional disconnect live sidecar"))
+    {
+        // Keep the five-second bounded state alive. A sidecar written by an
+        // earlier save remains the local fallback if the live capture is not
+        // available during a transition or native save guard.
+        m_lastPlayerStateTransferEvent =
+            "intentional disconnect: live sidecar capture unavailable; local fallback armed";
+        LogCoop(m_lastPlayerStateTransferEvent);
+        return true;
+    }
+
+    const uint32_t transferId =
+        m_playerStateTransferId == std::numeric_limits<uint32_t>::max()
+            ? 1u
+            : m_playerStateTransferId + 1u;
+    const std::string sourcePath = BuildCoopTempPlayerStatePath(
+        transferId,
+        GetLocalUsername() + "_disconnect_snapshot");
+    if (sourcePath.empty())
+    {
+        m_lastPlayerStateTransferEvent =
+            "intentional disconnect: immutable sidecar snapshot path unavailable; local fallback armed";
+        LogCoop(m_lastPlayerStateTransferEvent);
+        return true;
+    }
+
+    std::error_code error;
+    const std::filesystem::path source = CoopFilesystem::FromUtf8(GetPlayerSidecarPath());
+    const std::filesystem::path snapshot = CoopFilesystem::FromUtf8(sourcePath);
+    std::filesystem::create_directories(snapshot.parent_path(), error);
+    if (!error)
+    {
+        std::filesystem::copy_file(
+            source,
+            snapshot,
+            std::filesystem::copy_options::overwrite_existing,
+            error);
+    }
+    if (error)
+    {
+        m_lastPlayerStateTransferEvent =
+            "intentional disconnect: immutable sidecar snapshot failed; local fallback armed";
+        LogCoop(m_lastPlayerStateTransferEvent);
+        return true;
+    }
+
+    // PlayerStateTransfer re-opens its source for every chunk. Pointing it at
+    // this private copy prevents a concurrent autosave from changing the
+    // checksum or later chunks after the disconnect request was accepted.
+    m_clientDisconnectTransferSourcePath = sourcePath;
+    m_clientDisconnectFlushTransferId = transferId;
+    m_lastPlayerStateTransferEvent =
+        "intentional disconnect: immutable live sidecar snapshot captured";
+    LogCoop(m_lastPlayerStateTransferEvent);
+    return true;
+}
+
+void ModMain::TickClientIntentionalDisconnect(float frameTime)
+{
+    if (!m_clientDisconnectFlushPending || m_networkMode != CoopNetworkMode::Client)
+        return;
+
+    const bool transportPaused = m_saveLoadGuardActive || m_arkLevelTransitionLoadActive;
+    if (!transportPaused)
+    {
+        m_clientDisconnectFlushRemainingSeconds = std::max(
+            0.0f,
+            m_clientDisconnectFlushRemainingSeconds - std::max(0.0f, frameTime));
+    }
+
+    if (m_clientDisconnectFlushStoredAckReceived)
+    {
+        const std::string reason = m_clientDisconnectFlushReason.empty()
+            ? std::string("intentional disconnect")
+            : m_clientDisconnectFlushReason;
+        m_clientDisconnectFlushPending = false;
+        m_clientDisconnectFlushAwaitingStoredAck = false;
+        m_clientDisconnectFlushStoredAckReceived = false;
+        m_lastPlayerStateTransferEvent =
+            "intentional disconnect: host stored player state; disconnecting";
+        LogCoop(m_lastPlayerStateTransferEvent);
+        DisconnectRemotePeer((reason + "; player state stored").c_str());
+        return;
+    }
+
+    if (!m_clientDisconnectFlushAwaitingStoredAck &&
+        m_clientDisconnectFlushTransferId != 0 &&
+        !m_clientDisconnectTransferSourcePath.empty() &&
+        !m_playerStateTransferSending &&
+        !m_playerStateTransferReceiving &&
+        !transportPaused)
+    {
+        if (StartPlayerStateTransferFromFile(
+                m_clientDisconnectTransferSourcePath,
+                GetLocalUsername(),
+                CoopProtocol::kPlayerStateTransferFlagUploadToHost,
+                m_clientDisconnectFlushTransferId,
+                m_clientDisconnectFlushSaveKey))
+        {
+            m_clientDisconnectFlushAwaitingStoredAck = true;
+            m_clientDisconnectFlushChecksum = m_playerStateTransferChecksum;
+            m_lastPlayerStateTransferEvent =
+                "intentional disconnect: player state upload started; awaiting host stored ack";
+            LogCoop(m_lastPlayerStateTransferEvent);
+        }
+    }
+
+    if (m_clientDisconnectFlushRemainingSeconds > 0.0f)
+        return;
+
+    const std::string reason = m_clientDisconnectFlushReason.empty()
+        ? std::string("intentional disconnect")
+        : m_clientDisconnectFlushReason;
+    if (m_clientDisconnectTransferSourcePath.empty() &&
+        IsGameReady() &&
+        !m_saveLoadGuardActive &&
+        !m_arkLevelTransitionLoadActive)
+    {
+        // Preserve the best local recovery point even when the initial live
+        // capture was blocked by a transient native load/save guard.
+        SaveLocalPlayerSidecar("intentional disconnect fallback sidecar");
+    }
+    m_clientDisconnectFlushPending = false;
+    m_clientDisconnectFlushAwaitingStoredAck = false;
+    m_clientDisconnectFlushStoredAckReceived = false;
+    m_lastPlayerStateTransferEvent =
+        "intentional disconnect: stored ack timeout; using local sidecar fallback";
+    LogCoop(m_lastPlayerStateTransferEvent);
+    DisconnectRemotePeer((reason + "; player state flush timeout").c_str());
+}
+
 void ModMain::QueueClientPlayerStateUpload(const char* reason, const std::string& saveKey)
 {
     if (m_networkMode != CoopNetworkMode::Client)
@@ -74167,6 +74417,7 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
         m_clientAwaitingHostPlayerState ||
         m_playerStateTransferSending ||
         m_playerStateTransferReceiving ||
+        m_clientDisconnectFlushPending ||
         !IsGameReady())
     {
         return;
@@ -75571,6 +75822,29 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         return;
     }
 
+    if (command == CoopProtocol::PlayerStateTransferCommand::StoredAck)
+    {
+        if (m_networkMode != CoopNetworkMode::Client ||
+            !m_clientDisconnectFlushPending ||
+            !m_clientDisconnectFlushAwaitingStoredAck ||
+            packet.transferId != m_clientDisconnectFlushTransferId ||
+            packet.checksum != m_clientDisconnectFlushChecksum ||
+            saveKey != m_clientDisconnectFlushSaveKey)
+        {
+            m_lastPlayerStateTransferEvent = "ignored unexpected player state stored ack";
+            return;
+        }
+
+        m_clientDisconnectFlushStoredAckReceived = true;
+        m_lastPlayerStateTransferEvent =
+            "received host player state stored ack transfer=" +
+            std::to_string(packet.transferId) +
+            " saveKey=" +
+            (saveKey.empty() ? std::string("-") : saveKey);
+        LogCoop(m_lastPlayerStateTransferEvent);
+        return;
+    }
+
     if (command == CoopProtocol::PlayerStateTransferCommand::HostSaveIdentity)
     {
         if (m_networkMode != CoopNetworkMode::Client || saveKey.empty())
@@ -75600,6 +75874,14 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         auto failUpload = [this, accountToken = packet.accountToken](const std::string& event)
         {
             ++m_hostPlayerStateUploadFailures;
+            const auto receiveIt = m_hostPlayerStateUploadReceives.find(accountToken);
+            if (receiveIt != m_hostPlayerStateUploadReceives.end() && !receiveIt->second.receivePath.empty())
+            {
+                std::error_code error;
+                std::filesystem::remove(
+                    CoopFilesystem::FromUtf8(receiveIt->second.receivePath),
+                    error);
+            }
             m_hostPlayerStateUploadReceives.erase(accountToken);
             m_pendingHostPlayerStateUploadRequests.erase(accountToken);
             m_lastPlayerStateTransferEvent = event;
@@ -75742,6 +76024,8 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         }
 
         const uint64_t accountToken = receive.accountToken;
+        const uint32_t storedTransferId = receive.transferId;
+        const uint32_t storedChecksum = receive.checksum;
         const std::string storedUsername = receive.username;
         const std::string storedSaveKey = receive.saveKey;
         const std::filesystem::path receivePath = CoopFilesystem::FromUtf8(receive.receivePath);
@@ -75752,25 +76036,8 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             return;
         }
 
-        std::error_code error;
         const std::filesystem::path latestDest = CoopFilesystem::FromUtf8(latestPath);
-        std::filesystem::create_directories(latestDest.parent_path(), error);
-        if (error)
-        {
-            failUpload("cannot store client player state: latest mkdir failed");
-            return;
-        }
-        std::filesystem::copy_file(
-            receivePath,
-            latestDest,
-            std::filesystem::copy_options::overwrite_existing,
-            error);
-        if (error)
-        {
-            failUpload("cannot store client player state: latest copy failed");
-            return;
-        }
-
+        std::filesystem::path scopedDest;
         if (!storedSaveKey.empty())
         {
             const std::string scopedPath =
@@ -75781,27 +76048,84 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
                 return;
             }
 
-            const std::filesystem::path scopedDest = CoopFilesystem::FromUtf8(scopedPath);
-            error.clear();
-            std::filesystem::create_directories(scopedDest.parent_path(), error);
-            if (error)
-            {
-                failUpload("cannot store client player state: save-scoped mkdir failed");
-                return;
-            }
-            error.clear();
+            scopedDest = CoopFilesystem::FromUtf8(scopedPath);
+        }
+
+        const auto commitStateFile = [&](const std::filesystem::path& destination, const char* label)
+        {
+            std::error_code commitError;
+            std::filesystem::create_directories(destination.parent_path(), commitError);
+            if (commitError)
+                return false;
+
+            std::filesystem::path staged = destination;
+            staged += ".incoming_" + std::to_string(storedTransferId);
+            std::filesystem::remove(staged, commitError);
+            commitError.clear();
             std::filesystem::copy_file(
                 receivePath,
-                scopedDest,
+                staged,
                 std::filesystem::copy_options::overwrite_existing,
-                error);
-            if (error)
+                commitError);
+            bool hasIntegrityHash = false;
+            std::string integrityReason;
+            if (commitError ||
+                !ValidatePlayerStateIntegrityFile(
+                    staged,
+                    nullptr,
+                    &hasIntegrityHash,
+                    &integrityReason) ||
+                !hasIntegrityHash)
             {
-                failUpload("cannot store client player state: save-scoped copy failed");
+                std::filesystem::remove(staged, commitError);
+                LogCoop(
+                    std::string("client player state staged commit failed: ") + label +
+                    " reason=" + (integrityReason.empty() ? commitError.message() : integrityReason));
+                return false;
+            }
+
+#ifdef _WIN32
+            if (!MoveFileExW(
+                    staged.c_str(),
+                    destination.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            {
+                commitError = std::error_code(static_cast<int>(GetLastError()), std::system_category());
+                std::filesystem::remove(staged, commitError);
+                return false;
+            }
+#else
+            std::filesystem::remove(destination, commitError);
+            commitError.clear();
+            std::filesystem::rename(staged, destination, commitError);
+            if (commitError)
+            {
+                std::filesystem::remove(staged, commitError);
+                return false;
+            }
+#endif
+            return true;
+        };
+
+        if (!scopedDest.empty())
+        {
+            // The exact save-scoped state is preferred on reconnect. Commit it
+            // first so a later failure updating the latest alias can never leave
+            // a newer upload hidden behind an older scoped file.
+            if (!commitStateFile(scopedDest, "save-scoped"))
+            {
+                failUpload("cannot store client player state: save-scoped commit failed");
                 return;
             }
         }
 
+        if (!commitStateFile(latestDest, "latest"))
+        {
+            failUpload("cannot store client player state: latest commit failed");
+            return;
+        }
+
+        std::error_code error;
         error.clear();
         std::filesystem::remove(receivePath, error);
         m_hostPlayerStateUploadReceives.erase(packet.accountToken);
@@ -75816,6 +76140,39 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             " active=" + std::to_string(m_hostPlayerStateUploadReceives.size()) +
             " pending=" + std::to_string(m_pendingHostPlayerStateUploadRequests.size());
         LogCoop(m_lastPlayerStateTransferEvent);
+
+        // This acknowledgement is deliberately sent only after both copies
+        // succeeded. The client uses it as the commit point before closing
+        // the socket for an intentional disconnect.
+        const auto peerIt = m_remotePeers.find(accountToken);
+        if (peerIt != m_remotePeers.end() &&
+            peerIt->second.address != 0 && peerIt->second.port != 0)
+        {
+            CoopProtocol::PlayerStateTransferPacket ackPacket = {};
+            ackPacket.magic = CoopProtocol::kPacketMagic;
+            ackPacket.version = CoopProtocol::kProtocolVersion;
+            ackPacket.type = static_cast<uint16_t>(CoopProtocol::PacketType::PlayerStateTransfer);
+            ackPacket.sequence = CoopSerialSequence::Advance(m_playerStateTransferSequence);
+            ackPacket.command = static_cast<uint32_t>(CoopProtocol::PlayerStateTransferCommand::StoredAck);
+            ackPacket.transferId = storedTransferId;
+            ackPacket.worldEpoch = m_localWorldEpoch;
+            ackPacket.checksum = storedChecksum;
+            ackPacket.accountToken = accountToken;
+            CopyFixedString(ackPacket.username, sizeof(ackPacket.username), storedUsername);
+            CopyFixedString(ackPacket.saveKey, sizeof(ackPacket.saveKey), storedSaveKey);
+            if (!SendPlayerStateTransferTo(
+                    ackPacket,
+                    peerIt->second.address,
+                    peerIt->second.port,
+                    "player state stored ack send failed"))
+            {
+                LogCoop("player state stored ack could not be queued account=" + Hex64(accountToken));
+            }
+        }
+        else
+        {
+            LogCoop("player state stored ack skipped: source peer unavailable account=" + Hex64(accountToken));
+        }
         return;
     }
 
