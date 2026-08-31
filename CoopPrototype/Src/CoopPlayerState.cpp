@@ -2431,6 +2431,14 @@ bool ModMain::TeleportRemoteProxyNearLocal(uint32_t reason)
         position,
         rotation,
         "downed remote proxy teleport");
+    if (const auto peerIt = m_remotePeers.find(m_activeRemotePeerToken);
+        peerIt != m_remotePeers.end())
+    {
+        // This is an explicit recovery teleport, not a PlayerPose update;
+        // discard the prior locomotion trajectory before the next pose.
+        ResetRemotePeerPoseSmoothing(peerIt->second, position, rotation, false);
+        BeginRemotePeerPoseQuarantine(peerIt->second);
+    }
     ResetProxyHealthBaseline();
     ApplyProxyDownedState(*proxyEntity);
 
