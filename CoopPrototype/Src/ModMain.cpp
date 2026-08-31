@@ -926,6 +926,20 @@ Vec3 GetOffsetFromPlayer(float metersForward)
     return playerEntity->GetWorldPos() + playerRot * Vec3(0.0f, metersForward, 0.0f);
 }
 
+// Player physics can briefly tilt the body on slopes, collisions or during a
+// load. Spawned player bodies must remain upright while preserving horizontal
+// facing; the independent view rotation is kept unchanged by callers.
+Quat MakeUprightPlayerBodyRotation(const Quat& rotation)
+{
+    Vec3 forward = rotation.GetColumn1();
+    forward.z = 0.0f;
+    const float lengthSquared = forward.GetLengthSquared();
+    if (!std::isfinite(lengthSquared) || lengthSquared < 0.000001f)
+        return Quat::CreateIdentity();
+
+    return Quat::CreateRotationZ(std::atan2(-forward.x, forward.y));
+}
+
 SOCKET ToSocket(std::uintptr_t socketValue)
 {
     return static_cast<SOCKET>(socketValue);
@@ -72550,9 +72564,12 @@ bool ModMain::WriteDefaultHostPlayerStateFile(const std::string& path, const std
         ArkPlayer& player = ArkPlayer::GetInstance();
         if (IEntity* playerEntity = player.GetEntity())
         {
-            rotation = playerEntity->GetWorldRotation();
+            rotation = MakeUprightPlayerBodyRotation(playerEntity->GetWorldRotation());
             viewRotation = player.GetViewRotation();
-            position = playerEntity->GetWorldPos() + rotation * Vec3(0.0f, -2.0f, 0.0f);
+            // A fresh joining profile starts at the host's exact feet position.
+            // Keep view rotation separate so looking up/down is not copied into
+            // the body transform that must remain perpendicular to the ground.
+            position = playerEntity->GetWorldPos();
             hasSpawn = true;
         }
     }
