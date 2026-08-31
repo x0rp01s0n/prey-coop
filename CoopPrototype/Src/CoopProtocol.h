@@ -7,7 +7,7 @@
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 241;
+constexpr uint16_t kProtocolVersion = 242;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -358,6 +358,10 @@ enum class PlayerStateTransferCommand : uint32_t
     Abort = 4,
     Request = 5,
     HostSaveIdentity = 6,
+    // Host sends this only after the client's latest and save-scoped state
+    // copies both completed. It is the application-level commit point used
+    // by an intentional client disconnect.
+    StoredAck = 7,
 };
 
 enum class AreaJournalTransferCommand : uint32_t

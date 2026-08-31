@@ -2091,6 +2091,8 @@ private:
     bool BeginHostPlayerStateTransfer(const char* reason, const std::string& requestedSaveKey = {});
     bool BeginClientPlayerStateUpload(const char* reason, const std::string& saveKey = {});
     void QueueClientPlayerStateUpload(const char* reason, const std::string& saveKey = {});
+    bool BeginClientIntentionalDisconnect(const char* reason);
+    void TickClientIntentionalDisconnect(float frameTime);
     bool RequestRemotePlayerStateUpload(const char* reason);
     bool BroadcastHostSaveIdentity(const char* reason);
     bool StartClientNativePlayerSnapshotForUpload(const char* reason, const std::string& saveKey);
@@ -4016,6 +4018,7 @@ private:
     std::string m_saveTransferSourcePath;
     std::string m_saveTransferReceivePath;
     std::string m_playerStateTransferSourcePath;
+    std::string m_clientDisconnectTransferSourcePath;
     std::string m_playerStateTransferReceivePath;
     std::string m_areaJournalTransferSourcePath;
     std::string m_areaJournalTransferReceivePath;
@@ -4609,6 +4612,14 @@ private:
     bool m_nativePauseMultiplayerFocused = false;
     bool m_multiplayerUiFocusPrimaryOnOpen = false;
     bool m_multiplayerLeaveRequested = false;
+    bool m_clientDisconnectFlushPending = false;
+    bool m_clientDisconnectFlushAwaitingStoredAck = false;
+    bool m_clientDisconnectFlushStoredAckReceived = false;
+    uint32_t m_clientDisconnectFlushTransferId = 0;
+    uint32_t m_clientDisconnectFlushChecksum = 0;
+    float m_clientDisconnectFlushRemainingSeconds = 0.0f;
+    std::string m_clientDisconnectFlushReason;
+    std::string m_clientDisconnectFlushSaveKey;
     uint64_t m_multiplayerKickRequestedToken = 0;
     uint64_t m_multiplayerInputSuppressUntilMs = 0;
     float m_multiplayerUiMouseX = -1.0f;
