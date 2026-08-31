@@ -90,6 +90,7 @@ set(SOURCE_FILES
 	CoopRuntimeLog.h
 	CoopRuntimeConfig.cpp
 	CoopRuntimeConfig.h
+	CoopFilesystem.h
 	CoopSerializerTrace.h
 	CoopSaveStoreDecoder.cpp
 	CoopSaveStoreDecoder.h

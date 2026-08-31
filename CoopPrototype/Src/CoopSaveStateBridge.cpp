@@ -2,6 +2,7 @@
 
 #include "CoopNativeFragmentPayload.h"
 #include "CoopNativeSideBlob.h"
+#include "CoopFilesystem.h"
 #include "CoopRuntimeGuards.h"
 
 #include <algorithm>
@@ -116,12 +117,14 @@ std::string PointerJson(const void* ptr)
 
 std::filesystem::path GetAtlasRootFromEnvironment()
 {
-    if (const char* overrideRoot = std::getenv("COOP_SAVE_ATLAS_ROOT"); overrideRoot && overrideRoot[0])
-        return std::filesystem::path(overrideRoot);
+    const std::filesystem::path overrideRoot = CoopFilesystem::EnvironmentPath("COOP_SAVE_ATLAS_ROOT");
+    if (!overrideRoot.empty())
+        return overrideRoot;
 
-    if (const char* userProfile = std::getenv("USERPROFILE"); userProfile && userProfile[0])
+    const std::filesystem::path userProfile = CoopFilesystem::EnvironmentPath("USERPROFILE");
+    if (!userProfile.empty())
     {
-        std::filesystem::path root(userProfile);
+        std::filesystem::path root = userProfile;
         root /= "Saved Games";
         root /= "Arkane Studios";
         root /= "Prey";
@@ -547,7 +550,7 @@ void CoopSaveStateBridge::EnsureAtlasRun()
     m_atlasRunStarted = true;
     m_atlasRunId = MakeAtlasRunId();
     const std::filesystem::path runRoot = GetAtlasRootFromEnvironment() / m_atlasRunId;
-    m_atlasRootPath = runRoot.string();
+    m_atlasRootPath = CoopFilesystem::ToUtf8(runRoot);
 
     std::error_code error;
     std::filesystem::create_directories(runRoot / "roots", error);
@@ -599,7 +602,7 @@ void CoopSaveStateBridge::WriteAtlasEvent(
     ++m_atlasEvents;
     m_lastAtlasEvent = std::string(kind && kind[0] ? kind : "event") + "_" + PhaseName(phase);
 
-    const std::filesystem::path runRoot(m_atlasRootPath);
+    const std::filesystem::path runRoot = CoopFilesystem::FromUtf8(m_atlasRootPath);
     std::ofstream out(runRoot / "calltree.jsonl", std::ios::binary | std::ios::app);
     if (!out)
         return;
@@ -632,7 +635,7 @@ void CoopSaveStateBridge::WriteAtlasSectionEvent(const SectionEvent& event)
     if (!m_atlasRunStarted)
         return;
 
-    const std::filesystem::path runRoot(m_atlasRootPath);
+    const std::filesystem::path runRoot = CoopFilesystem::FromUtf8(m_atlasRootPath);
     std::ofstream out(runRoot / "sections.jsonl", std::ios::binary | std::ios::app);
     if (!out)
         return;
@@ -659,7 +662,7 @@ void CoopSaveStateBridge::WriteAtlasSummary()
     if (!m_atlasRunStarted)
         return;
 
-    const std::filesystem::path runRoot(m_atlasRootPath);
+    const std::filesystem::path runRoot = CoopFilesystem::FromUtf8(m_atlasRootPath);
     std::ofstream out(runRoot / "schema_summary.txt", std::ios::binary | std::ios::trunc);
     if (!out)
         return;
@@ -809,7 +812,7 @@ void CoopSaveStateBridge::RecordSerializerStoreProbe(
     const uint64_t parent = g_saveTraceStack.empty() ? 0 : g_saveTraceStack.back();
     const std::string section = FindSectionForSerializerImpl(serializerPtr);
 
-    const std::filesystem::path runRoot(m_atlasRootPath);
+    const std::filesystem::path runRoot = CoopFilesystem::FromUtf8(m_atlasRootPath);
     std::ofstream out(runRoot / "store_probes.jsonl", std::ios::binary | std::ios::app);
     if (!out)
         return;

@@ -1,6 +1,7 @@
 #include "CoopRuntimeExtractor.h"
 
 #include "CoopRuntimeConfig.h"
+#include "CoopFilesystem.h"
 #include "CoopRuntimeLog.h"
 #include "CoopRuntimeGuards.h"
 
@@ -280,19 +281,19 @@ std::string CoopRuntimeExtractor::GetCurrentLevelName() const
 
 std::string CoopRuntimeExtractor::GetExtractorRootPath() const
 {
-    const char* overridePath = std::getenv("COOP_EXTRACTOR_ROOT");
-    if (overridePath && overridePath[0])
-        return overridePath;
+    const std::filesystem::path overridePath = CoopFilesystem::EnvironmentPath("COOP_EXTRACTOR_ROOT");
+    if (!overridePath.empty())
+        return CoopFilesystem::ToUtf8(overridePath);
 
-    const char* userProfile = std::getenv("USERPROFILE");
-    if (userProfile && userProfile[0])
+    const std::filesystem::path userProfile = CoopFilesystem::EnvironmentPath("USERPROFILE");
+    if (!userProfile.empty())
     {
-        std::filesystem::path root(userProfile);
+        std::filesystem::path root = userProfile;
         root /= "Saved Games";
         root /= "Arkane Studios";
         root /= "Prey";
         root /= "CoopRuntimeExtractor";
-        return root.string();
+        return CoopFilesystem::ToUtf8(root);
     }
 
     return "CoopRuntimeExtractor";
@@ -300,27 +301,27 @@ std::string CoopRuntimeExtractor::GetExtractorRootPath() const
 
 std::string CoopRuntimeExtractor::GetCommandFilePath() const
 {
-    const char* overridePath = std::getenv("COOP_EXTRACTOR_COMMAND_FILE");
-    if (overridePath && overridePath[0])
-        return overridePath;
+    const std::filesystem::path overridePath = CoopFilesystem::EnvironmentPath("COOP_EXTRACTOR_COMMAND_FILE");
+    if (!overridePath.empty())
+        return CoopFilesystem::ToUtf8(overridePath);
 
-    std::filesystem::path path(GetExtractorRootPath());
+    std::filesystem::path path = CoopFilesystem::FromUtf8(GetExtractorRootPath());
     path /= "command.txt";
-    return path.string();
+    return CoopFilesystem::ToUtf8(path);
 }
 
 std::string CoopRuntimeExtractor::GetStatusFilePath() const
 {
-    std::filesystem::path path(GetExtractorRootPath());
+    std::filesystem::path path = CoopFilesystem::FromUtf8(GetExtractorRootPath());
     path /= "status.txt";
-    return path.string();
+    return CoopFilesystem::ToUtf8(path);
 }
 
 std::string CoopRuntimeExtractor::GetLatestExportPath() const
 {
-    std::filesystem::path path(GetExtractorRootPath());
+    std::filesystem::path path = CoopFilesystem::FromUtf8(GetExtractorRootPath());
     path /= "latest.jsonl";
-    return path.string();
+    return CoopFilesystem::ToUtf8(path);
 }
 
 bool CoopRuntimeExtractor::CaptureEntityRow(IEntity& entity, EntityRow& outRow)
@@ -668,7 +669,7 @@ bool CoopRuntimeExtractor::ProbeExtensionAcrossSnapshot(const std::string& exten
 bool CoopRuntimeExtractor::ExportJsonl()
 {
     ++m_exportCount;
-    const std::filesystem::path exportPath(GetLatestExportPath());
+    const std::filesystem::path exportPath = CoopFilesystem::FromUtf8(GetLatestExportPath());
     std::error_code error;
     std::filesystem::create_directories(exportPath.parent_path(), error);
     if (error)
@@ -743,7 +744,7 @@ bool CoopRuntimeExtractor::ExportJsonl()
             << "}\n";
     }
 
-    m_lastExportPath = exportPath.string();
+    m_lastExportPath = CoopFilesystem::ToUtf8(exportPath);
     m_lastStatus = "export OK " + m_lastExportPath;
     WriteStatusFile();
     LogExtractor(m_lastStatus);
@@ -757,7 +758,7 @@ void CoopRuntimeExtractor::ProcessCommandFile(float frameTime, bool controlOnly)
         return;
     m_commandPollAccumulator = 0.0f;
 
-    const std::filesystem::path commandPath(GetCommandFilePath());
+    const std::filesystem::path commandPath = CoopFilesystem::FromUtf8(GetCommandFilePath());
     std::error_code error;
     if (!std::filesystem::is_regular_file(commandPath, error) || error)
         return;
@@ -861,7 +862,7 @@ void CoopRuntimeExtractor::ProcessCommandText(const std::string& text, bool cont
 
 void CoopRuntimeExtractor::WriteStatusFile() const
 {
-    const std::filesystem::path statusPath(GetStatusFilePath());
+    const std::filesystem::path statusPath = CoopFilesystem::FromUtf8(GetStatusFilePath());
     std::error_code error;
     std::filesystem::create_directories(statusPath.parent_path(), error);
     if (error)

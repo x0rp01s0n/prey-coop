@@ -1,6 +1,7 @@
 #include "CoopPtrHygiene.h"
 
 #include "CoopRuntimeConfig.h"
+#include "CoopFilesystem.h"
 #include "CoopRuntimeLog.h"
 
 #include <atomic>
@@ -34,11 +35,10 @@ bool EnvFlagValue()
 // ModMain internals.
 std::filesystem::path GetPreyProfileRoot()
 {
-    const char* userProfile = std::getenv("USERPROFILE");
-    if (!userProfile || !userProfile[0])
+    std::filesystem::path root = CoopFilesystem::EnvironmentPath("USERPROFILE");
+    if (root.empty())
         return {};
 
-    std::filesystem::path root(userProfile);
     root /= "Saved Games";
     root /= "Arkane Studios";
     root /= "Prey";

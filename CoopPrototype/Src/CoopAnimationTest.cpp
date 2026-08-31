@@ -1,4 +1,5 @@
 #include "ModMain.h"
+#include "CoopFilesystem.h"
 #include "CoopRuntimeConfig.h"
 #include "CoopRuntimeGuards.h"
 #include "CoopRuntimeLog.h"
@@ -1528,11 +1529,10 @@ std::string BuildProxyAnimationStateCatalog(const std::string& filter)
 
 std::filesystem::path GetCoopAnimationCatalogRoot()
 {
-    const char* userProfile = std::getenv("USERPROFILE");
-    if (!userProfile || !userProfile[0])
+    std::filesystem::path root = CoopFilesystem::EnvironmentPath("USERPROFILE");
+    if (root.empty())
         return std::filesystem::path("CoopPrototype") / "AnimCatalog";
 
-    std::filesystem::path root(userProfile);
     root /= "Saved Games";
     root /= "Arkane Studios";
     root /= "Prey";
@@ -1581,7 +1581,7 @@ bool WriteMannequinSnippetCatalog(const std::string& kind, std::string& detail)
         std::ofstream file(outputPath, std::ios::binary | std::ios::trunc);
         if (!file)
         {
-            detail = "anim_snippet_catalog_failed reason=open_failed path=" + outputPath.string();
+            detail = "anim_snippet_catalog_failed reason=open_failed path=" + CoopFilesystem::ToUtf8(outputPath);
             return false;
         }
 
@@ -1620,7 +1620,7 @@ bool WriteMannequinSnippetCatalog(const std::string& kind, std::string& detail)
             "anim_snippet_catalog_ok table=" + tableName +
             " fragments=" + std::to_string(fragmentCount) +
             " variants=" + std::to_string(variantCount) +
-            " path=" + outputPath.string();
+            " path=" + CoopFilesystem::ToUtf8(outputPath);
         return true;
     }
 

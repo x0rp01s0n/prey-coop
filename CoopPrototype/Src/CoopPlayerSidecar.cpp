@@ -1,5 +1,6 @@
 #include "ModMain.h"
 #include "CoopRuntimeConfig.h"
+#include "CoopFilesystem.h"
 #include "CoopRuntimeLog.h"
 #include "CoopItemClassification.h"
 #include "CoopPtrHygiene.h"
@@ -223,7 +224,7 @@ bool ReadAndValidatePlayerSidecarFile(
     outHasIntegrityHash = false;
     outReason.clear();
 
-    std::ifstream input(pathString, std::ios::binary);
+    std::ifstream input(CoopFilesystem::FromUtf8(pathString), std::ios::binary);
     if (!input)
     {
         outReason = "open failed";
@@ -304,7 +305,8 @@ bool ReadAndValidatePlayerSidecarFile(
 
 bool WritePlayerSidecarPayloadWithHash(const std::filesystem::path& path, const std::string& payload)
 {
-    const std::filesystem::path tempPath = path.string() + ".tmp";
+    std::filesystem::path tempPath = path;
+    tempPath += ".tmp";
     std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
     if (!output)
         return false;
@@ -341,11 +343,10 @@ bool ShouldApplyPlayerSidecarViewRotation(const ArkPlayer& player, const Quat& r
 
 std::filesystem::path GetPreyProfileRoot()
 {
-    const char* userProfile = std::getenv("USERPROFILE");
-    if (!userProfile || !userProfile[0])
+    std::filesystem::path root = CoopFilesystem::EnvironmentPath("USERPROFILE");
+    if (root.empty())
         return {};
 
-    std::filesystem::path root(userProfile);
     root /= "Saved Games";
     root /= "Arkane Studios";
     root /= "Prey";
@@ -2518,7 +2519,7 @@ std::string ModMain::GetPlayerSidecarPath() const
         return {};
 
     const std::string fileName = "player_account_" + HexPlayerAccountToken(GetLocalAccountToken()) + ".state";
-    return (root / fileName).string();
+    return CoopFilesystem::ToUtf8(root / fileName);
 }
 
 bool ModMain::SaveLocalPlayerSidecar(const char* reason)
@@ -2554,7 +2555,7 @@ bool ModMain::SaveLocalPlayerSidecar(const char* reason)
         return false;
     }
 
-    const std::filesystem::path path(pathString);
+    const std::filesystem::path path = CoopFilesystem::FromUtf8(pathString);
     std::error_code error;
     std::filesystem::create_directories(path.parent_path(), error);
     if (error)
@@ -2863,15 +2864,15 @@ bool ModMain::LoadLocalPlayerSidecar(PlayerSidecarState& state)
         GetLegacyCoopPlayerStateRoot() / ("player_" + SanitizePathComponent(GetLocalUsername()) + ".state");
     for (const std::filesystem::path& candidate : { usernamePath, legacyPath })
     {
-        if (candidate.empty() || candidate.string() == pathString)
+        if (candidate.empty() || CoopFilesystem::ToUtf8(candidate) == pathString)
             continue;
-        if (!LoadPlayerSidecarFromPath(candidate.string(), state))
+        if (!LoadPlayerSidecarFromPath(CoopFilesystem::ToUtf8(candidate), state))
             continue;
 
         std::error_code error;
-        std::filesystem::create_directories(std::filesystem::path(pathString).parent_path(), error);
+        std::filesystem::create_directories(CoopFilesystem::FromUtf8(pathString).parent_path(), error);
         if (!error)
-            std::filesystem::copy_file(candidate, pathString, std::filesystem::copy_options::overwrite_existing, error);
+            std::filesystem::copy_file(candidate, CoopFilesystem::FromUtf8(pathString), std::filesystem::copy_options::overwrite_existing, error);
         m_lastPlayerSidecarEvent = error
             ? "loaded legacy player sidecar; account migration copy failed"
             : "loaded and migrated legacy player sidecar to account identity";

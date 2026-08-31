@@ -1,5 +1,6 @@
 #include "CoopNativeFragmentPayload.h"
 
+#include "CoopFilesystem.h"
 #include "CoopNativeSaveStoreApi.h"
 #include "CoopRuntimeGuards.h"
 
@@ -998,7 +999,8 @@ bool WritePayloadFile(const std::filesystem::path& path, const BuildResult& resu
         return false;
     }
 
-    const std::filesystem::path tempPath = path.string() + ".tmp";
+    std::filesystem::path tempPath = path;
+    tempPath += ".tmp";
     std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
     if (!output)
     {

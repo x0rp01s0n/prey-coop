@@ -183,7 +183,13 @@ bool CoopIdentityConfig::ValidateAndNormalize(std::string& reason)
 bool CoopIdentityConfig::LoadExisting()
 {
     pugi::xml_document document;
-    const pugi::xml_parse_result parsed = document.load_file(m_path.string().c_str(), pugi::parse_default, pugi::encoding_utf8);
+    std::ifstream input(m_path, std::ios::binary);
+    if (!input)
+    {
+        m_status = "parse failed: open";
+        return false;
+    }
+    const pugi::xml_parse_result parsed = document.load(input, pugi::parse_default, pugi::encoding_utf8);
     if (!parsed)
     {
         m_status = std::string("parse failed: ") + parsed.description();
@@ -283,7 +289,8 @@ bool CoopIdentityConfig::CreateNew(const std::string& fallbackUsername, const ch
 bool CoopIdentityConfig::RecoverCorrupt(const std::string& fallbackUsername, const char* reason)
 {
     std::error_code error;
-    const std::filesystem::path backup = m_path.string() + ".corrupt";
+    std::filesystem::path backup = m_path;
+    backup += ".corrupt";
     std::filesystem::remove(backup, error);
     error.clear();
     std::filesystem::rename(m_path, backup, error);
@@ -380,9 +387,17 @@ bool CoopIdentityConfig::Save()
     saveBookmarks(root.append_child("Favorites"), m_data.favoriteServers);
     saveBookmarks(root.append_child("RecentServers"), m_data.recentServers);
 
-    const std::filesystem::path tempPath = m_path.string() + ".tmp";
-    if (!document.save_file(tempPath.string().c_str(), "  ", pugi::format_default, pugi::encoding_utf8) ||
-        !ReplaceFile(tempPath, m_path))
+    std::filesystem::path tempPath = m_path;
+    tempPath += ".tmp";
+    std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
+    if (!output)
+    {
+        m_status = "save failed: write";
+        return false;
+    }
+    document.save(output, "  ", pugi::format_default, pugi::encoding_utf8);
+    output.close();
+    if (!output || !ReplaceFile(tempPath, m_path))
     {
         m_status = "save failed: write";
         return false;
@@ -451,7 +466,12 @@ bool CoopIdentityConfig::RunSelfTest(const std::filesystem::path& root, std::str
     CoopIdentityConfig recovered;
     if (!recovered.LoadOrCreate(root, "RecoveredPlayer") ||
         recovered.AccountToken() == 0 ||
-        !std::filesystem::exists(recovered.Path().string() + ".corrupt"))
+        !std::filesystem::exists([&]
+        {
+            std::filesystem::path backup = recovered.Path();
+            backup += ".corrupt";
+            return backup;
+        }()))
     {
         detail = "corruption_recovery_failed_" + recovered.Status();
         return false;
