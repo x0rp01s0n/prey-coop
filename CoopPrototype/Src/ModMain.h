@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <array>
 #include <deque>
@@ -702,7 +703,11 @@ public:
     void OnArkItemLifecycleHook(CArkItem* item, const char* functionName);
     void OnArkInventoryMutationHook(const ArkInventory* inventory, const char* functionName, unsigned itemId, unsigned relatedItemId, int x, int y, bool boolResult, unsigned unsignedResult);
     void OnArkItemOwnerMutationHook(CArkItem* item, const char* functionName, unsigned pickerId, const IArkInventory* inventory, bool result);
-    void OnArkItemResetCountHook(CArkItem* item, int count);
+    void MarkLocalInventoryDirty(const char* reason);
+    bool IsLocalInventoryDirtyForSaveKey(const std::string& saveKey) const;
+    void ReconcileLocalInventoryDirtyForSaveKey(const std::string& saveKey);
+    bool HandleNativeWindowMessage(std::uintptr_t windowHandle, unsigned message, uint64_t wParam, std::int64_t lParam);
+    void OnArkItemResetCountHook(CArkItem* item, int count, unsigned ownerIdBefore);
     bool ShouldSuppressPlayerSidecarInventoryFeedback() const;
     void BeginPlayerSidecarInventoryFeedbackSuppression(const char* reason);
     void EndPlayerSidecarInventoryFeedbackSuppression(const char* reason);
@@ -1681,6 +1686,7 @@ public:
     void OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const char* reason);
     bool ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerId, const char* reason);
     void OnNativeSharedItemPicked(EntityId itemEntityId, EntityId pickerId, bool success, const char* reason);
+    void CaptureLocalPlayerPickupRecovery(EntityId pickerId, const char* reason);
     void OnSharedDropEntityRemoved(EntityId entityId);
     bool ShouldDeferSharedStorageOpen(CArkExternalInventoryUI* ui, ArkInventory* inventory, const char* reason);
     void OnSharedStorageTransfer(CArkItem* item, IArkInventory* source, IArkInventory* target, const char* reason);
@@ -2118,8 +2124,10 @@ private:
     bool BeginHostPlayerStateTransfer(const char* reason, const std::string& requestedSaveKey = {});
     bool BeginClientPlayerStateUpload(const char* reason, const std::string& saveKey = {});
     void QueueClientPlayerStateUpload(const char* reason, const std::string& saveKey = {});
-    bool BeginClientIntentionalDisconnect(const char* reason);
+    bool BeginClientIntentionalDisconnect(const char* reason, bool captureImmediately = true);
     void TickClientIntentionalDisconnect(float frameTime);
+    bool CaptureClientDisconnectSnapshot();
+    void ResumeDeferredNativeWindowClose();
     bool RequestRemotePlayerStateUpload(const char* reason);
     bool BroadcastHostSaveIdentity(const char* reason);
     bool StartClientNativePlayerSnapshotForUpload(const char* reason, const std::string& saveKey);
@@ -2782,9 +2790,20 @@ private:
     bool DebugTraceNativeEntityLifecycle(const std::vector<std::string>& args, std::string& detail);
     bool DebugTraceNativeNpcSpawn(const std::vector<std::string>& args, std::string& detail);
     std::string GetPlayerSidecarPath() const;
+    std::string GetPlayerSidecarRecoveryJournalPath() const;
     bool SaveLocalPlayerSidecar(const char* reason);
     bool LoadLocalPlayerSidecar(PlayerSidecarState& state);
     bool LoadPlayerSidecarFromPath(const std::string& path, PlayerSidecarState& state);
+    bool HasValidPlayerSidecarRecoveryJournal() const;
+    uint64_t GetPlayerSidecarRecoveryJournalRevision() const;
+    bool WriteLocalPlayerRecoveryJournal(const char* reason);
+    bool ClearLocalPlayerRecoveryJournal(
+        const std::string& sourcePath,
+        uint64_t accountToken,
+        const std::string& saveKey,
+        uint64_t revision,
+        const char* reason);
+    bool RecoverLocalPlayerRecoveryJournal(const char* reason);
     bool ApplyLocalPlayerSidecar(const PlayerSidecarState& state, const char* reason);
     bool RestorePlayerSidecarEquipment(const PlayerSidecarState& state, const char* reason);
     void QueuePlayerSidecarInventoryRestore(const std::vector<PlayerInventoryItemState>& items, bool clearInventory, const char* reason);
@@ -4540,6 +4559,10 @@ private:
     bool m_pendingHostPlayerStateSend = false;
     bool m_pendingClientPlayerStateUpload = false;
     bool m_pendingReceivedPlayerStateApply = false;
+    // The client can upload its recovery journal before applying a completed
+    // host transfer. Keep the received host file addressable while the shared
+    // transfer fields are temporarily used for that upload.
+    std::string m_pendingHostAuthoritativePlayerStateReceivePath;
     bool m_pendingNativePlayerStateOverrideValid = false;
     PlayerSidecarState m_pendingNativePlayerStateOverride;
     bool m_clientAwaitingHostPlayerState = false;
@@ -4559,6 +4582,19 @@ private:
     uint32_t m_hostPlayerStateSentWorldEpoch = 0;
     float m_receivedPlayerStateApplyDelaySeconds = 0.0f;
     bool m_pendingPlayerSidecarSave = false;
+    bool m_localInventoryDirty = false;
+    std::string m_localInventoryDirtySaveKey;
+    uint64_t m_localInventoryDirtyRevision = 0;
+    uint64_t m_localInventoryJournalRevision = 0;
+    float m_localInventoryJournalAccumulator = 0.0f;
+    bool m_clientRecoveryJournalPending = false;
+    bool m_clientRecoveryJournalAwaitingStoredAck = false;
+    bool m_clientRecoveryJournalStoredAckReceived = false;
+    uint32_t m_clientRecoveryJournalTransferId = 0;
+    uint32_t m_clientRecoveryJournalChecksum = 0;
+    uint64_t m_clientRecoveryJournalRevision = 0;
+    std::string m_clientRecoveryJournalSourcePath;
+    std::string m_clientRecoveryJournalSaveKey;
     bool m_pendingPlayerSidecarApply = false;
     bool m_pendingPlayerSidecarInventoryRestore = false;
     bool m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
@@ -4642,11 +4678,22 @@ private:
     bool m_clientDisconnectFlushPending = false;
     bool m_clientDisconnectFlushAwaitingStoredAck = false;
     bool m_clientDisconnectFlushStoredAckReceived = false;
+    bool m_clientDisconnectFlushCaptureAttempted = false;
     uint32_t m_clientDisconnectFlushTransferId = 0;
     uint32_t m_clientDisconnectFlushChecksum = 0;
     float m_clientDisconnectFlushRemainingSeconds = 0.0f;
+    float m_clientDisconnectFlushCaptureRetrySeconds = 0.0f;
+    std::chrono::steady_clock::time_point m_clientDisconnectFlushDeadline;
     std::string m_clientDisconnectFlushReason;
     std::string m_clientDisconnectFlushSaveKey;
+    std::string m_clientDisconnectFlushJournalSourcePath;
+    uint64_t m_clientDisconnectFlushJournalRevision = 0;
+    bool m_nativeWindowCloseDeferred = false;
+    bool m_nativeWindowCloseReentry = false;
+    std::uintptr_t m_nativeWindowCloseHandle = 0;
+    unsigned m_nativeWindowCloseMessage = 0;
+    uint64_t m_nativeWindowCloseWParam = 0;
+    std::int64_t m_nativeWindowCloseLParam = 0;
     uint64_t m_multiplayerKickRequestedToken = 0;
     uint64_t m_multiplayerInputSuppressUntilMs = 0;
     float m_multiplayerUiMouseX = -1.0f;

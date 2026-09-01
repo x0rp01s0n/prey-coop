@@ -4363,6 +4363,8 @@ void ModMain::DisconnectRemotePeer(const char* reason)
 {
     const std::string status = reason && reason[0] ? reason : "peer disconnected";
     const CoopNetworkMode previousMode = m_networkMode;
+    const bool nativeWindowCloseInProgress =
+        m_nativeWindowCloseDeferred || m_nativeWindowCloseReentry;
     LogCoop("disconnect remote peer begin mode=" + std::string(GetNetworkModeName()) +
         " reason=" + status);
     if (previousMode == CoopNetworkMode::Host)
@@ -4452,7 +4454,11 @@ void ModMain::DisconnectRemotePeer(const char* reason)
     m_networkStatus = status;
     m_sessionStatus = "disconnected";
     m_lastSessionWorldEvent = status;
-    QueueCoopHudFeedback("DISCONNECTED - " + status, 3.0f);
+    // Keep the explicit saving notice visible until the deferred native close
+    // has been reposted. A generic disconnect notice would otherwise replace
+    // it in the single-slot HUD queue during the same update.
+    if (!nativeWindowCloseInProgress)
+        QueueCoopHudFeedback("DISCONNECTED - " + status, 3.0f);
     LogCoop(status);
 
     if (previousMode == CoopNetworkMode::Client)

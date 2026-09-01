@@ -1431,6 +1431,8 @@ void ModMain::OnArkInventoryMutationHook(
 
     ArkPlayer* player = ArkPlayer::GetInstancePtr();
     const bool localPlayerInventory = player && inventory && inventory == player->m_pInventory;
+    if (localPlayerInventory && boolResult && !ShouldSuppressPlayerSidecarInventoryFeedback())
+        MarkLocalInventoryDirty(functionName ? functionName : "inventory mutation");
     if (ShouldLogNativeInventoryTraceDetails() && m_nativeInventoryTraceLogs++ < kNativeInventoryTraceLogLimit)
     {
         m_lastNativeItemEvent = std::string("Inventory ") +
@@ -1461,6 +1463,13 @@ void ModMain::OnArkItemOwnerMutationHook(
     bool result)
 {
     ++m_nativeItemOwnerMutationCalls;
+    ArkPlayer* player = ArkPlayer::GetInstancePtr();
+    const bool localPlayerInventory =
+        player && inventory && inventory == player->m_pInventory;
+    const bool localPicker =
+        player && pickerId != 0 && player->GetEntity() && player->GetEntity()->GetId() == pickerId;
+    if ((localPlayerInventory || localPicker) && result && !ShouldSuppressPlayerSidecarInventoryFeedback())
+        MarkLocalInventoryDirty(functionName ? functionName : "item owner mutation");
     if (ShouldLogNativeInventoryTraceDetails() && m_nativeInventoryTraceLogs++ < kNativeInventoryTraceLogLimit)
     {
         m_lastNativeItemEvent = std::string("CArkItem ") +
@@ -1480,17 +1489,46 @@ void ModMain::OnArkItemOwnerMutationHook(
     }
 }
 
-void ModMain::OnArkItemResetCountHook(CArkItem* item, int count)
+void ModMain::OnArkItemResetCountHook(CArkItem* item, int count, unsigned ownerIdBefore)
 {
+    ArkPlayer* player = ArkPlayer::GetInstancePtr();
+    const unsigned localPlayerId = player ? player->GetEntityId() : 0;
+    const bool localPlayerOwnedItem =
+        ownerIdBefore != 0 && localPlayerId != 0 && ownerIdBefore == localPlayerId;
+    const bool inventoryLoadOrRestoreHazard =
+        m_saveLoadGuardActive ||
+        m_waitingForPostLoadContinue ||
+        m_pendingPostLoadResync ||
+        m_arkLevelTransitionLoadActive ||
+        m_runtimeTransitionCleanupPrepared ||
+        m_pendingReceivedPlayerStateApply ||
+        m_clientAwaitingHostPlayerState ||
+        m_pendingPlayerSidecarInventoryRestore ||
+        m_playerSidecarInventoryNativeRestoreActive ||
+        m_playerSidecarInventoryPending > 0;
+    if (localPlayerOwnedItem &&
+        !inventoryLoadOrRestoreHazard &&
+        !ShouldSuppressPlayerSidecarInventoryFeedback())
+    {
+        // ResetCount(0) can detach the item and clear its owner. The hook
+        // captures that owner before native ResetCount so stack consumption
+        // still arms the recovery journal without marking restore activity.
+        MarkLocalInventoryDirty("CArkItem ResetCount");
+    }
+
     if (ShouldLogNativeInventoryTraceDetails() && m_nativeInventoryTraceLogs++ < kNativeInventoryTraceLogLimit)
     {
         m_lastNativeItemEvent = "CArkItem ResetCount count=" +
             std::to_string(count) +
+            " ownerBefore=" + std::to_string(ownerIdBefore) +
+            " local=" + BoolText(localPlayerOwnedItem) +
             " " + DescribeCArkItemForTrace(item);
         LogCoop("native item trace " + m_lastNativeItemEvent);
     }
     else
     {
-        m_lastNativeItemEvent = "CArkItem ResetCount trace=off count=" + std::to_string(count);
+        m_lastNativeItemEvent = "CArkItem ResetCount trace=off count=" +
+            std::to_string(count) + " ownerBefore=" + std::to_string(ownerIdBefore) +
+            " local=" + BoolText(localPlayerOwnedItem);
     }
 }
