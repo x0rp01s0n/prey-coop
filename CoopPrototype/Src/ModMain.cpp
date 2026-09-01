@@ -32,6 +32,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <Xinput.h>
+#include <Windows.h>
 
 #ifdef min
 #undef min
@@ -105,6 +106,7 @@
 #include <Prey/CrySystem/ISystem.h>
 #include <Prey/CrySystem/ITimer.h>
 #include <Prey/CryGame/Game.h>
+#include <Prey/GameDll/GameStartup.h>
 #include <Prey/Ark/ArkGameStateCondition.h>
 #include <Prey/GameDll/ark/ArkFactionManager.h>
 #include <Prey/GameDll/ark/ArkHealthExtension.h>
@@ -3530,6 +3532,78 @@ bool ValidatePlayerStateIntegrityFile(
     if (outReason)
         *outReason = "hash ok";
     return true;
+}
+
+struct RecoveryStateMetadata
+{
+    uint64_t accountToken = 0;
+    uint64_t revision = 0;
+    std::string saveKey;
+};
+
+bool ReadRecoveryStateMetadata(
+    const std::filesystem::path& path,
+    RecoveryStateMetadata& metadata)
+{
+    metadata = {};
+    bool hasHash = false;
+    std::string reason;
+    if (!ValidatePlayerStateIntegrityFile(path, nullptr, &hasHash, &reason) || !hasHash)
+        return false;
+
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+        return false;
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    if (!input.good() && !input.eof())
+        return false;
+    const std::string text = buffer.str();
+    const size_t firstLineEnd = text.find('\n');
+    if (firstLineEnd == std::string::npos)
+        return false;
+    std::istringstream payload(text.substr(firstLineEnd + 1));
+    payload.imbue(std::locale::classic());
+    bool accountPresent = false;
+    bool revisionPresent = false;
+    bool saveKeyPresent = false;
+    std::string line;
+    while (std::getline(payload, line))
+    {
+        if (line.rfind("recoveryAccount=", 0) == 0)
+        {
+            const std::string value = line.substr(std::strlen("recoveryAccount="));
+            if (value.empty() || value.size() > 16)
+                return false;
+            metadata.accountToken = 0;
+            for (const char ch : value)
+            {
+                metadata.accountToken <<= 4;
+                if (ch >= '0' && ch <= '9')
+                    metadata.accountToken |= static_cast<uint64_t>(ch - '0');
+                else if (ch >= 'a' && ch <= 'f')
+                    metadata.accountToken |= static_cast<uint64_t>(10 + ch - 'a');
+                else if (ch >= 'A' && ch <= 'F')
+                    metadata.accountToken |= static_cast<uint64_t>(10 + ch - 'A');
+                else
+                    return false;
+            }
+            accountPresent = metadata.accountToken != 0;
+        }
+        else if (line.rfind("recoverySaveKey=", 0) == 0)
+        {
+            metadata.saveKey = line.substr(std::strlen("recoverySaveKey="));
+            saveKeyPresent = !metadata.saveKey.empty();
+        }
+        else if (line.rfind("recoveryRevision=", 0) == 0)
+        {
+            std::istringstream revision(line.substr(std::strlen("recoveryRevision=")));
+            revision.imbue(std::locale::classic());
+            revision >> metadata.revision;
+            revisionPresent = !revision.fail() && metadata.revision != 0;
+        }
+    }
+    return accountPresent && saveKeyPresent && revisionPresent;
 }
 
 bool WriteTextFileWithIntegrityHash(const std::filesystem::path& path, const std::string& payload)
@@ -7606,6 +7680,7 @@ static auto s_hookCryActionSaveGame = CCryAction::FSaveGame.MakeHook();
 static auto s_hookCryActionLoadGame = CCryAction::FLoadGame.MakeHook();
 static auto s_hookCryActionNotifySaveGame = CCryAction::FNotifyGameFrameworkListenersOv1.MakeHook();
 static auto s_hookCryActionNotifyLoadGame = CCryAction::FNotifyGameFrameworkListenersOv0.MakeHook();
+static auto s_hookCGameStartupWndProcHndl = CGameStartup::FWndProcHndl.MakeHook();
 static auto s_hookArkSignalManagerSendPackage = ArkSignalSystem::Manager::FSendPackage.MakeHook();
 static auto s_hookArkSignalManagerSendToReceiver = ArkSignalSystem::Manager::FSendToReceiver.MakeHook();
 static auto s_hookArkPlayerTakeDamage = ArkPlayer::FTakeDamage.MakeHook();
@@ -19248,9 +19323,20 @@ static void CArkItem_ResetCount_Hook(CArkItem* item, int count)
         CoopPtrHygiene::LogPtrWith("item_resetcount", item, extra);
         CoopPtrHygiene::CheckAbove32("item_resetcount", item);
     }
+    unsigned ownerIdBefore = 0;
+    if (item)
+    {
+        // ResetCount(0) may detach the item before the post-hook runs, so
+        // retain the ownership identity while the native object is intact.
+        TryGuardedCall(
+            "CArkItem ResetCount owner before",
+            [item]() { return item->m_ownerId; },
+            ownerIdBefore,
+            nullptr);
+    }
     s_hookCArkItemResetCount.InvokeOrig(item, count);
     if (gMod)
-        gMod->OnArkItemResetCountHook(item, count);
+        gMod->OnArkItemResetCountHook(item, count, ownerIdBefore);
 }
 
 static void CArkItem_NotifyPlayerAcquired_Hook(const CArkItem* item, int count)
@@ -30954,6 +31040,127 @@ void ModMain::OnCoopRenderEndFrame()
     DrawCoopHudOverlayPreRender();
 }
 
+static int64_t CGameStartup_WndProcHndl_Hook(
+    HWND hWnd,
+    unsigned message,
+    uint64_t wParam,
+    int64_t lParam)
+{
+    if (gMod && gMod->HandleNativeWindowMessage(
+            reinterpret_cast<std::uintptr_t>(hWnd),
+            message,
+            wParam,
+            lParam))
+    {
+        // Returning a handled result prevents CGameStartup from beginning
+        // teardown while the client player-state flush is in flight.
+        return 1;
+    }
+
+    return s_hookCGameStartupWndProcHndl.InvokeOrig(hWnd, message, wParam, lParam);
+}
+
+bool ModMain::HandleNativeWindowMessage(
+    std::uintptr_t windowHandle,
+    unsigned message,
+    uint64_t wParam,
+    std::int64_t lParam)
+{
+    const bool isSystemClose =
+        message == WM_SYSCOMMAND && (wParam & 0xFFF0u) == SC_CLOSE;
+    const bool isClose = message == WM_CLOSE || isSystemClose;
+    if (!isClose)
+        return false;
+
+    if (m_nativeWindowCloseReentry)
+    {
+        // This is the close posted after the asynchronous flush completed.
+        // Consume the bypass exactly once, then let the game's original
+        // handler perform normal process teardown.
+        if (windowHandle != m_nativeWindowCloseHandle)
+            return false;
+
+        m_nativeWindowCloseReentry = false;
+        m_nativeWindowCloseHandle = 0;
+        m_nativeWindowCloseMessage = 0;
+        m_nativeWindowCloseWParam = 0;
+        m_nativeWindowCloseLParam = 0;
+        return false;
+    }
+
+    const bool connectedClient =
+        m_networkMode == CoopNetworkMode::Client &&
+        m_socket != kInvalidNetworkSocket &&
+        m_hasRemoteSession &&
+        m_sessionGameplayReady;
+    const bool hasPendingInventoryState =
+        IsLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey) ||
+        m_pendingPlayerSidecarSave ||
+        HasValidPlayerSidecarRecoveryJournal();
+    if (!connectedClient || !hasPendingInventoryState)
+        return false;
+
+    // A close from another native window must not replace the HWND whose
+    // close is currently being deferred. Leave unrelated windows to their
+    // original handler instead of consuming their close messages.
+    if (m_nativeWindowCloseDeferred)
+        return windowHandle == m_nativeWindowCloseHandle;
+
+    m_nativeWindowCloseHandle = windowHandle;
+    m_nativeWindowCloseMessage = message;
+    m_nativeWindowCloseWParam = wParam;
+    m_nativeWindowCloseLParam = lParam;
+    if (!m_nativeWindowCloseDeferred)
+    {
+        m_nativeWindowCloseDeferred = true;
+        QueueCoopHudFeedback(
+            "SAVING MULTIPLAYER INVENTORY...",
+            kClientDisconnectPlayerStateFlushTimeoutSeconds + 0.5f);
+        LogCoop("native window close deferred for multiplayer inventory flush");
+    }
+    return true;
+}
+
+void ModMain::ResumeDeferredNativeWindowClose()
+{
+    if (!m_nativeWindowCloseDeferred)
+        return;
+
+    if (m_nativeWindowCloseHandle == 0)
+    {
+        m_nativeWindowCloseDeferred = false;
+        m_nativeWindowCloseReentry = false;
+        m_nativeWindowCloseHandle = 0;
+        m_nativeWindowCloseMessage = 0;
+        m_nativeWindowCloseWParam = 0;
+        m_nativeWindowCloseLParam = 0;
+        return;
+    }
+
+    const HWND window = reinterpret_cast<HWND>(m_nativeWindowCloseHandle);
+    const unsigned message = m_nativeWindowCloseMessage == 0
+        ? WM_CLOSE
+        : m_nativeWindowCloseMessage;
+    const uint64_t wParam = m_nativeWindowCloseWParam;
+    const int64_t lParam = m_nativeWindowCloseLParam;
+    m_nativeWindowCloseDeferred = false;
+    m_nativeWindowCloseReentry = true;
+    if (!PostMessageW(window, message, static_cast<WPARAM>(wParam), static_cast<LPARAM>(lParam)))
+    {
+        const DWORD error = GetLastError();
+        m_nativeWindowCloseReentry = false;
+        m_nativeWindowCloseHandle = 0;
+        m_nativeWindowCloseMessage = 0;
+        m_nativeWindowCloseWParam = 0;
+        m_nativeWindowCloseLParam = 0;
+        LogCoop("native window close repost failed error=" + std::to_string(error));
+        // The original close was consumed by the hook. If reposting fails,
+        // invoke the original handler now rather than leaving the app in a
+        // permanently deferred-close state.
+        s_hookCGameStartupWndProcHndl.InvokeOrig(window, message, wParam, lParam);
+    }
+}
+
 void ModMain::InitHooks()
 {
     const bool disableNativeInventoryHooks = EnvFlagEnabled("COOP_DISABLE_NATIVE_INVENTORY_HOOKS");
@@ -30986,6 +31193,7 @@ void ModMain::InitHooks()
     s_hookCryActionLoadGame.SetHookFunc(&CryAction_LoadGame_Hook);
     s_hookCryActionNotifySaveGame.SetHookFunc(&CryAction_NotifySaveGame_Hook);
     s_hookCryActionNotifyLoadGame.SetHookFunc(&CryAction_NotifyLoadGame_Hook);
+    s_hookCGameStartupWndProcHndl.SetHookFunc(&CGameStartup_WndProcHndl_Hook);
     s_hookArkNpcOnHit.SetHookFunc(&ArkNpc_OnHit_Hook);
     s_hookArkNpcPushFear.SetHookFunc(&ArkNpc_PushFear_ProxyGuard_Hook);
     s_hookArkNpcPerformCombatReaction.SetHookFunc(&ArkNpc_PerformCombatReaction_ProxyGuard_Hook);
@@ -34970,6 +35178,16 @@ void ModMain::MainUpdate(unsigned updateFlags)
         }
         else if (leavingMode == CoopNetworkMode::Host)
             StopNetwork();
+    }
+    if (m_nativeWindowCloseDeferred && !m_clientDisconnectFlushPending)
+    {
+        // WndProc must stay non-blocking. Start the bounded flush from the
+        // normal update thread, where the sidecar capture is safe to perform.
+        if (!BeginClientIntentionalDisconnect("native window close"))
+        {
+            LogCoop("native window close flush skipped: client session no longer ready");
+            ResumeDeferredNativeWindowClose();
+        }
     }
     TickClientIntentionalDisconnect(frameTime);
     if (m_multiplayerKickRequestedToken != 0)
@@ -51319,8 +51537,12 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent)
     const uint32_t preservedDisconnectTransferId = m_clientDisconnectFlushTransferId;
     const uint32_t preservedDisconnectChecksum = m_clientDisconnectFlushChecksum;
     const float preservedDisconnectRemainingSeconds = m_clientDisconnectFlushRemainingSeconds;
+    const float preservedDisconnectCaptureRetrySeconds = m_clientDisconnectFlushCaptureRetrySeconds;
+    const std::chrono::steady_clock::time_point preservedDisconnectDeadline = m_clientDisconnectFlushDeadline;
     const std::string preservedDisconnectReason = m_clientDisconnectFlushReason;
     const std::string preservedDisconnectSaveKey = m_clientDisconnectFlushSaveKey;
+    const std::string preservedDisconnectJournalSourcePath = m_clientDisconnectFlushJournalSourcePath;
+    const uint64_t preservedDisconnectJournalRevision = m_clientDisconnectFlushJournalRevision;
 
     if (!preserveClientDisconnectFlush && !m_clientDisconnectTransferSourcePath.empty())
     {
@@ -51377,12 +51599,24 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent)
     m_clientDisconnectFlushRemainingSeconds = preserveClientDisconnectFlush
         ? preservedDisconnectRemainingSeconds
         : 0.0f;
+    m_clientDisconnectFlushCaptureRetrySeconds = preserveClientDisconnectFlush
+        ? preservedDisconnectCaptureRetrySeconds
+        : 0.0f;
+    m_clientDisconnectFlushDeadline = preserveClientDisconnectFlush
+        ? preservedDisconnectDeadline
+        : std::chrono::steady_clock::time_point();
     m_clientDisconnectFlushReason = preserveClientDisconnectFlush
         ? preservedDisconnectReason
         : std::string();
     m_clientDisconnectFlushSaveKey = preserveClientDisconnectFlush
         ? preservedDisconnectSaveKey
         : std::string();
+    m_clientDisconnectFlushJournalSourcePath = preserveClientDisconnectFlush
+        ? preservedDisconnectJournalSourcePath
+        : std::string();
+    m_clientDisconnectFlushJournalRevision = preserveClientDisconnectFlush
+        ? preservedDisconnectJournalRevision
+        : 0;
     m_clientPlayerSnapshotForUploadPending = false;
     m_clientPlayerSnapshotCooldownSeconds = 0.0f;
     m_clientPlayerSnapshotForUploadWaitSeconds = 0.0f;
@@ -51395,8 +51629,20 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent)
     m_pendingHostPlayerStateSend = false;
     m_pendingClientPlayerStateUpload = false;
     m_pendingReceivedPlayerStateApply = false;
+    m_pendingHostAuthoritativePlayerStateReceivePath.clear();
     m_pendingNativePlayerStateOverrideValid = false;
     m_pendingNativePlayerStateOverride = PlayerSidecarState();
+    // A network/reset boundary cancels only in-flight recovery transport. The
+    // durable journal is intentionally left on disk for the next exact host
+    // identity handshake.
+    m_clientRecoveryJournalPending = false;
+    m_clientRecoveryJournalAwaitingStoredAck = false;
+    m_clientRecoveryJournalStoredAckReceived = false;
+    m_clientRecoveryJournalTransferId = 0;
+    m_clientRecoveryJournalChecksum = 0;
+    m_clientRecoveryJournalRevision = 0;
+    m_clientRecoveryJournalSourcePath.clear();
+    m_clientRecoveryJournalSaveKey.clear();
     m_clientAwaitingHostPlayerState = false;
     m_hostPlayerStatePreloadSent = false;
     m_receivedPlayerStateInventoryPreparedForNativeLoad = false;
@@ -52447,6 +52693,17 @@ void ModMain::StartClient()
 
 void ModMain::StopNetwork()
 {
+    const bool preserveClientInventoryRecovery =
+        m_networkMode == CoopNetworkMode::Client &&
+        (m_clientDisconnectFlushPending ||
+            IsLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey));
+
+    // A peer-loss teardown can bypass the intentional-disconnect tick. The
+    // original close message was already consumed, so always put it back on
+    // the window queue before clearing session state.
+    if (m_nativeWindowCloseDeferred)
+        ResumeDeferredNativeWindowClose();
+
     if (m_clientDisconnectFlushPending)
     {
         // StopNetwork is the connection-loss/replacement path. It must not
@@ -52460,8 +52717,12 @@ void ModMain::StopNetwork()
         m_clientDisconnectFlushTransferId = 0;
         m_clientDisconnectFlushChecksum = 0;
         m_clientDisconnectFlushRemainingSeconds = 0.0f;
+        m_clientDisconnectFlushCaptureRetrySeconds = 0.0f;
+        m_clientDisconnectFlushDeadline = std::chrono::steady_clock::time_point();
         m_clientDisconnectFlushReason.clear();
         m_clientDisconnectFlushSaveKey.clear();
+        m_clientDisconnectFlushJournalSourcePath.clear();
+        m_clientDisconnectFlushJournalRevision = 0;
     }
     m_debugPlayerFollowEnemyNetId = 0;
     m_pendingDebugEnemyAbilityNetId = 0;
@@ -52523,7 +52784,9 @@ void ModMain::StopNetwork()
         }
     }
 
-    SaveLocalPlayerSidecar("network stop");
+    const bool savedNetworkStopSidecar = SaveLocalPlayerSidecar("network stop");
+    if (preserveClientInventoryRecovery && savedNetworkStopSidecar)
+        WriteLocalPlayerRecoveryJournal("network stop recovery fallback");
     ClearJoinOverlayState("network stop");
     ReleaseLocalPlayerDownedAttentionState();
     ReleaseLocalDownedControls();
@@ -52853,6 +53116,16 @@ void ModMain::StopNetwork()
     m_sentMimicDeadState = false;
     m_mimicHealthAvailable = false;
     m_lastMimicDamage = 0.0f;
+
+    // Network shutdown invalidates any HWND captured from the old session.
+    // Never carry a deferred native close or its reentry bypass into a new
+    // session.
+    m_nativeWindowCloseDeferred = false;
+    m_nativeWindowCloseReentry = false;
+    m_nativeWindowCloseHandle = 0;
+    m_nativeWindowCloseMessage = 0;
+    m_nativeWindowCloseWParam = 0;
+    m_nativeWindowCloseLParam = 0;
 }
 
 void ModMain::TickNetwork(float frameTime)
@@ -57553,6 +57826,7 @@ void ModMain::SetCurrentHostSaveStateKey(const std::string& saveKey, bool retain
     }
 
     m_currentHostSaveStateKey = saveKey;
+    ReconcileLocalInventoryDirtyForSaveKey(saveKey);
 }
 
 uint64_t ModMain::BuildStoryEventId(uint16_t eventKind, uint64_t targetId, int32_t count, uint16_t flags, uint32_t sequence) const
@@ -68568,6 +68842,17 @@ void ModMain::RemoveRemotePeer(uint64_t accountToken, const char* reason, bool a
     if (it == m_remotePeers.end())
         return;
     const RemotePeerSession peer = it->second;
+
+    // A host save transfer is shared by the active peer context, but its
+    // completion state is still owned by the account it targets. Do not let
+    // a completed transfer for a departed peer block that account's next
+    // ClientNeedsHostWorld request (or affect another connected peer).
+    if (m_networkMode == CoopNetworkMode::Host &&
+        m_saveTransferAccountToken == accountToken)
+    {
+        ResetSaveTransferState("remote peer removed; save transfer reset");
+    }
+
     std::vector<EntityId> reclaimedTurretEntities;
 
     uint32_t releasedEnemyLeases = 0;
@@ -73674,7 +73959,7 @@ bool ModMain::BeginClientPlayerStateUpload(const char* reason, const std::string
     return started;
 }
 
-bool ModMain::BeginClientIntentionalDisconnect(const char* reason)
+bool ModMain::BeginClientIntentionalDisconnect(const char* reason, bool captureImmediately)
 {
     if (m_networkMode != CoopNetworkMode::Client ||
         m_socket == kInvalidNetworkSocket ||
@@ -73697,26 +73982,90 @@ bool ModMain::BeginClientIntentionalDisconnect(const char* reason)
     m_clientDisconnectFlushTransferId = 0;
     m_clientDisconnectFlushChecksum = 0;
     m_clientDisconnectFlushRemainingSeconds = kClientDisconnectPlayerStateFlushTimeoutSeconds;
+    m_clientDisconnectFlushCaptureRetrySeconds = 0.0f;
+    m_clientDisconnectFlushDeadline =
+        std::chrono::steady_clock::now() +
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+            std::chrono::duration<float>(kClientDisconnectPlayerStateFlushTimeoutSeconds));
     m_clientDisconnectFlushReason = reason && reason[0] ? reason : "intentional client disconnect";
     m_clientDisconnectFlushSaveKey = !m_currentHostSaveStateKey.empty()
         ? m_currentHostSaveStateKey
         : BuildHostSaveStateKey(m_lastSaveLoadPath);
+    m_clientDisconnectFlushJournalSourcePath.clear();
+    m_clientDisconnectFlushJournalRevision = 0;
     m_clientDisconnectTransferSourcePath.clear();
+    m_clientDisconnectFlushCaptureAttempted = false;
 
+    if (captureImmediately)
+        CaptureClientDisconnectSnapshot();
+    return true;
+}
+
+bool ModMain::CaptureClientDisconnectSnapshot()
+{
+    if (m_clientDisconnectFlushCaptureAttempted)
+        return !m_clientDisconnectTransferSourcePath.empty();
+
+    m_clientDisconnectFlushCaptureAttempted = true;
     m_lastPlayerStateTransferEvent =
         "intentional disconnect: capturing live player sidecar saveKey=" +
         (m_clientDisconnectFlushSaveKey.empty() ? std::string("-") : m_clientDisconnectFlushSaveKey);
     LogCoop(m_lastPlayerStateTransferEvent);
 
-    if (!IsGameReady() || !SaveLocalPlayerSidecar("intentional disconnect live sidecar"))
+    const uint64_t capturedDirtyRevision = m_localInventoryDirtyRevision;
+    // Always recapture the live sidecar before creating a journal. A valid
+    // journal is durable fallback data, not permission to reuse an older
+    // snapshot while the live player is available.
+    bool liveCaptureSucceeded = false;
+    if (!m_saveLoadGuardActive &&
+        !m_arkLevelTransitionLoadActive &&
+        IsGameReady() &&
+        SaveLocalPlayerSidecar("intentional disconnect live sidecar"))
+    {
+        liveCaptureSucceeded = true;
+    }
+    else
     {
         // Keep the five-second bounded state alive. A sidecar written by an
         // earlier save remains the local fallback if the live capture is not
         // available during a transition or native save guard.
+        if (HasValidPlayerSidecarRecoveryJournal())
+        {
+            m_lastPlayerStateTransferEvent =
+                "intentional disconnect: live capture unavailable; using existing recovery journal";
+            LogCoop(m_lastPlayerStateTransferEvent);
+        }
+        else
+        {
+            m_lastPlayerStateTransferEvent =
+                "intentional disconnect: live sidecar capture unavailable; local fallback armed";
+            LogCoop(m_lastPlayerStateTransferEvent);
+            m_clientDisconnectFlushCaptureAttempted = false;
+            m_clientDisconnectFlushCaptureRetrySeconds = 0.25f;
+            return false;
+        }
+    }
+
+    // Never fall back to an older journal after a successful fresh capture
+    // whose journal write failed. The immutable live sidecar is newer.
+    const bool journalWritten = liveCaptureSucceeded &&
+        WriteLocalPlayerRecoveryJournal("intentional disconnect");
+    if (liveCaptureSucceeded && !journalWritten)
+    {
+        // Keep the live snapshot from being shadowed by an older journal on a
+        // later reconnect. The dirty bit makes the next exact host identity
+        // retry the journal write before any recovery upload can start.
+        m_localInventoryDirty = true;
+        m_localInventoryDirtySaveKey = m_clientDisconnectFlushSaveKey;
+        m_localInventoryJournalAccumulator = 0.0f;
         m_lastPlayerStateTransferEvent =
-            "intentional disconnect: live sidecar capture unavailable; local fallback armed";
+            "intentional disconnect: recovery journal write unavailable; local fallback armed";
         LogCoop(m_lastPlayerStateTransferEvent);
-        return true;
+    }
+    else if (journalWritten && capturedDirtyRevision == m_localInventoryDirtyRevision)
+    {
+        m_localInventoryDirty = false;
+        m_localInventoryDirtySaveKey.clear();
     }
 
     const uint32_t transferId =
@@ -73731,11 +74080,37 @@ bool ModMain::BeginClientIntentionalDisconnect(const char* reason)
         m_lastPlayerStateTransferEvent =
             "intentional disconnect: immutable sidecar snapshot path unavailable; local fallback armed";
         LogCoop(m_lastPlayerStateTransferEvent);
-        return true;
+        m_clientDisconnectFlushCaptureAttempted = false;
+        m_clientDisconnectFlushCaptureRetrySeconds = 0.25f;
+        return false;
     }
 
     std::error_code error;
-    const std::filesystem::path source = CoopFilesystem::FromUtf8(GetPlayerSidecarPath());
+    const std::string journalPath = GetPlayerSidecarRecoveryJournalPath();
+    // Prefer the freshly captured canonical sidecar if writing the recovery
+    // journal failed. Never fall back to an older journal in that case.
+    const std::string sourcePathString = journalWritten
+        ? journalPath
+        : (liveCaptureSucceeded ? GetPlayerSidecarPath() :
+            (HasValidPlayerSidecarRecoveryJournal() ? journalPath : GetPlayerSidecarPath()));
+    if (journalWritten)
+    {
+        m_clientDisconnectFlushJournalSourcePath = journalPath;
+        m_clientDisconnectFlushJournalRevision = GetPlayerSidecarRecoveryJournalRevision();
+    }
+    else if (!liveCaptureSucceeded && !journalPath.empty())
+    {
+        // The immutable source is the durable journal when live capture was
+        // unavailable. Track its exact revision so only this acknowledged
+        // journal can be cleared below.
+        const uint64_t journalRevision = GetPlayerSidecarRecoveryJournalRevision();
+        if (journalRevision != 0)
+        {
+            m_clientDisconnectFlushJournalSourcePath = journalPath;
+            m_clientDisconnectFlushJournalRevision = journalRevision;
+        }
+    }
+    const std::filesystem::path source = CoopFilesystem::FromUtf8(sourcePathString);
     const std::filesystem::path snapshot = CoopFilesystem::FromUtf8(sourcePath);
     std::filesystem::create_directories(snapshot.parent_path(), error);
     if (!error)
@@ -73750,8 +74125,10 @@ bool ModMain::BeginClientIntentionalDisconnect(const char* reason)
     {
         m_lastPlayerStateTransferEvent =
             "intentional disconnect: immutable sidecar snapshot failed; local fallback armed";
+        m_clientDisconnectFlushCaptureAttempted = false;
+        m_clientDisconnectFlushCaptureRetrySeconds = 0.25f;
         LogCoop(m_lastPlayerStateTransferEvent);
-        return true;
+        return false;
     }
 
     // PlayerStateTransfer re-opens its source for every chunk. Pointing it at
@@ -73760,7 +74137,9 @@ bool ModMain::BeginClientIntentionalDisconnect(const char* reason)
     m_clientDisconnectTransferSourcePath = sourcePath;
     m_clientDisconnectFlushTransferId = transferId;
     m_lastPlayerStateTransferEvent =
-        "intentional disconnect: immutable live sidecar snapshot captured";
+        "intentional disconnect: immutable " +
+        (sourcePathString == journalPath ? std::string("recovery journal") : std::string("live sidecar")) +
+        " snapshot captured";
     LogCoop(m_lastPlayerStateTransferEvent);
     return true;
 }
@@ -73771,26 +74150,62 @@ void ModMain::TickClientIntentionalDisconnect(float frameTime)
         return;
 
     const bool transportPaused = m_saveLoadGuardActive || m_arkLevelTransitionLoadActive;
-    if (!transportPaused)
+    const auto now = std::chrono::steady_clock::now();
+    if (m_clientDisconnectFlushDeadline == std::chrono::steady_clock::time_point())
     {
-        m_clientDisconnectFlushRemainingSeconds = std::max(
-            0.0f,
-            m_clientDisconnectFlushRemainingSeconds - std::max(0.0f, frameTime));
+        m_clientDisconnectFlushDeadline = now +
+            std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::duration<float>(m_clientDisconnectFlushRemainingSeconds));
     }
+    const float wallRemaining = std::max(
+        0.0f,
+        std::chrono::duration<float>(m_clientDisconnectFlushDeadline - now).count());
+    m_clientDisconnectFlushRemainingSeconds = wallRemaining;
+
+    m_clientDisconnectFlushCaptureRetrySeconds = std::max(
+        0.0f,
+        m_clientDisconnectFlushCaptureRetrySeconds - std::max(0.0f, frameTime));
 
     if (m_clientDisconnectFlushStoredAckReceived)
     {
         const std::string reason = m_clientDisconnectFlushReason.empty()
             ? std::string("intentional disconnect")
             : m_clientDisconnectFlushReason;
+        const bool resumeNativeClose = m_nativeWindowCloseDeferred;
+        if (!m_clientDisconnectFlushJournalSourcePath.empty())
+        {
+            ClearLocalPlayerRecoveryJournal(
+                m_clientDisconnectFlushJournalSourcePath,
+                GetLocalAccountToken(),
+                m_clientDisconnectFlushSaveKey,
+                m_clientDisconnectFlushJournalRevision,
+                "host StoredAck");
+        }
         m_clientDisconnectFlushPending = false;
         m_clientDisconnectFlushAwaitingStoredAck = false;
         m_clientDisconnectFlushStoredAckReceived = false;
+        m_clientDisconnectFlushCaptureAttempted = false;
+        m_clientDisconnectFlushCaptureRetrySeconds = 0.0f;
+        m_clientDisconnectFlushDeadline = std::chrono::steady_clock::time_point();
+        m_clientDisconnectFlushJournalSourcePath.clear();
+        m_clientDisconnectFlushJournalRevision = 0;
         m_lastPlayerStateTransferEvent =
             "intentional disconnect: host stored player state; disconnecting";
         LogCoop(m_lastPlayerStateTransferEvent);
+        if (resumeNativeClose)
+            ResumeDeferredNativeWindowClose();
         DisconnectRemotePeer((reason + "; player state stored").c_str());
         return;
+    }
+
+    if (!m_clientDisconnectFlushAwaitingStoredAck &&
+        m_clientDisconnectTransferSourcePath.empty() &&
+        m_clientDisconnectFlushCaptureRetrySeconds <= 0.0f)
+    {
+        // Retry the snapshot from the normal update tick. Capture itself
+        // refuses to enter native save state while a load guard is active;
+        // the wall-clock deadline below still advances during that guard.
+        CaptureClientDisconnectSnapshot();
     }
 
     if (!m_clientDisconnectFlushAwaitingStoredAck &&
@@ -73821,21 +74236,28 @@ void ModMain::TickClientIntentionalDisconnect(float frameTime)
     const std::string reason = m_clientDisconnectFlushReason.empty()
         ? std::string("intentional disconnect")
         : m_clientDisconnectFlushReason;
-    if (m_clientDisconnectTransferSourcePath.empty() &&
-        IsGameReady() &&
+    if (IsGameReady() &&
         !m_saveLoadGuardActive &&
         !m_arkLevelTransitionLoadActive)
     {
         // Preserve the best local recovery point even when the initial live
         // capture was blocked by a transient native load/save guard.
-        SaveLocalPlayerSidecar("intentional disconnect fallback sidecar");
+        if (SaveLocalPlayerSidecar("intentional disconnect fallback sidecar"))
+            WriteLocalPlayerRecoveryJournal("intentional disconnect timeout fallback");
     }
     m_clientDisconnectFlushPending = false;
     m_clientDisconnectFlushAwaitingStoredAck = false;
     m_clientDisconnectFlushStoredAckReceived = false;
+    m_clientDisconnectFlushCaptureAttempted = false;
+    m_clientDisconnectFlushCaptureRetrySeconds = 0.0f;
+    m_clientDisconnectFlushDeadline = std::chrono::steady_clock::time_point();
+    m_clientDisconnectFlushJournalSourcePath.clear();
+    m_clientDisconnectFlushJournalRevision = 0;
     m_lastPlayerStateTransferEvent =
         "intentional disconnect: stored ack timeout; using local sidecar fallback";
     LogCoop(m_lastPlayerStateTransferEvent);
+    if (m_nativeWindowCloseDeferred)
+        ResumeDeferredNativeWindowClose();
     DisconnectRemotePeer((reason + "; player state flush timeout").c_str());
 }
 
@@ -74098,6 +74520,7 @@ bool ModMain::EnforceClientPlayerStateApplyInvariant(const char* reason)
         return false;
 
     m_pendingReceivedPlayerStateApply = false;
+    m_pendingHostAuthoritativePlayerStateReceivePath.clear();
     m_pendingNativePlayerStateOverrideValid = false;
     m_pendingNativePlayerStateOverride = PlayerSidecarState();
     m_clientAwaitingHostPlayerState = false;
@@ -74143,9 +74566,18 @@ bool ModMain::PrepareReceivedPlayerStateForHostLoad(const char* reason)
         return false;
 
     PlayerSidecarState state;
-    if (!LoadPlayerSidecarFromPath(m_playerStateTransferReceivePath, state))
+    const bool useRecoveryJournal =
+        m_clientRecoveryJournalPending &&
+        !m_clientRecoveryJournalSourcePath.empty() &&
+        m_clientRecoveryJournalSaveKey == m_currentHostSaveStateKey;
+    const std::string& sourcePath = useRecoveryJournal
+        ? m_clientRecoveryJournalSourcePath
+        : m_playerStateTransferReceivePath;
+    if (!LoadPlayerSidecarFromPath(sourcePath, state))
     {
-        m_lastPlayerStateTransferEvent = "failed to prepare host player state before load";
+        m_lastPlayerStateTransferEvent = useRecoveryJournal
+            ? "failed to prepare recovery journal before host load"
+            : "failed to prepare host player state before load";
         return false;
     }
 
@@ -74174,7 +74606,7 @@ bool ModMain::PrepareReceivedPlayerStateForHostLoad(const char* reason)
     }
 
     m_lastPlayerStateTransferEvent =
-        "prepared host player state before load inv=" +
+        std::string(useRecoveryJournal ? "prepared recovery player state before load inv=" : "prepared host player state before load inv=") +
         std::to_string(state.hasInventory ? static_cast<int>(state.inventory.size()) : -1) +
         " native=" + std::to_string(state.hasNativeCapture ? 1 : 0) +
         " nativeItems=" + std::to_string(state.nativeCapture.items.size()) +
@@ -74572,6 +75004,14 @@ bool ModMain::TryApplyReceivedPlayerStateTransfer(const char* reason)
     if (!m_pendingReceivedPlayerStateApply)
         return false;
 
+    if (m_clientRecoveryJournalPending)
+    {
+        m_lastPlayerStateTransferEvent =
+            "waiting to apply host player state: recovery journal upload pending";
+        m_receivedPlayerStateApplyDelaySeconds = kHostPlayerStateRetryApplyDelaySeconds;
+        return false;
+    }
+
     if (!IsGameReady())
     {
         m_lastPlayerStateTransferEvent = "waiting to apply host player state: game not ready";
@@ -74599,6 +75039,7 @@ bool ModMain::TryApplyReceivedPlayerStateTransfer(const char* reason)
         }
 
         m_pendingReceivedPlayerStateApply = false;
+        m_pendingHostAuthoritativePlayerStateReceivePath.clear();
         m_pendingNativePlayerStateOverrideValid = false;
         m_pendingNativePlayerStateOverride = PlayerSidecarState();
         m_clientAwaitingHostPlayerState = false;
@@ -74629,11 +75070,17 @@ bool ModMain::TryApplyReceivedPlayerStateTransfer(const char* reason)
     {
         state = m_pendingNativePlayerStateOverride;
     }
-    else if (!LoadPlayerSidecarFromPath(m_playerStateTransferReceivePath, state))
+    else
     {
-        m_lastPlayerStateTransferEvent = "failed to load received player state";
-        m_receivedPlayerStateApplyDelaySeconds = kHostPlayerStateRetryApplyDelaySeconds;
-        return false;
+        const std::string receivePath = !m_playerStateTransferReceivePath.empty()
+            ? m_playerStateTransferReceivePath
+            : m_pendingHostAuthoritativePlayerStateReceivePath;
+        if (!LoadPlayerSidecarFromPath(receivePath, state))
+        {
+            m_lastPlayerStateTransferEvent = "failed to load received player state";
+            m_receivedPlayerStateApplyDelaySeconds = kHostPlayerStateRetryApplyDelaySeconds;
+            return false;
+        }
     }
 
     const std::string currentLevel = NormalizeLevelName(GetCurrentLevelName());
@@ -74675,6 +75122,7 @@ bool ModMain::TryApplyReceivedPlayerStateTransfer(const char* reason)
     }
 
     m_pendingReceivedPlayerStateApply = false;
+    m_pendingHostAuthoritativePlayerStateReceivePath.clear();
     m_pendingNativePlayerStateOverrideValid = false;
     m_pendingNativePlayerStateOverride = PlayerSidecarState();
     m_clientAwaitingHostPlayerState = false;
@@ -74703,6 +75151,146 @@ bool ModMain::TryApplyReceivedPlayerStateTransfer(const char* reason)
 void ModMain::TickPlayerStateTransfer(float frameTime)
 {
     const float clampedFrameTime = std::max(0.0f, frameTime);
+
+    if (m_clientRecoveryJournalStoredAckReceived)
+    {
+        const uint64_t acknowledgedRevision = m_clientRecoveryJournalRevision;
+        const std::string acknowledgedSourcePath = m_clientRecoveryJournalSourcePath;
+        const std::string acknowledgedSaveKey = m_clientRecoveryJournalSaveKey;
+        const bool cleared = ClearLocalPlayerRecoveryJournal(
+            acknowledgedSourcePath,
+            GetLocalAccountToken(),
+            acknowledgedSaveKey,
+            acknowledgedRevision,
+            "host recovery journal StoredAck");
+        RecoveryStateMetadata currentJournal;
+        const bool currentJournalReadable =
+            !acknowledgedSourcePath.empty() &&
+            ReadRecoveryStateMetadata(
+                CoopFilesystem::FromUtf8(acknowledgedSourcePath),
+                currentJournal);
+        const bool newerJournal = currentJournalReadable &&
+            currentJournal.accountToken == GetLocalAccountToken() &&
+            currentJournal.saveKey == acknowledgedSaveKey &&
+            currentJournal.revision > acknowledgedRevision;
+        const bool newerLocalMutation =
+            IsLocalInventoryDirtyForSaveKey(acknowledgedSaveKey) || newerJournal;
+
+        if (newerLocalMutation)
+        {
+            // Keep the join blocked until the latest on-disk snapshot has its
+            // own upload/ack. The old ack is scoped to its immutable source;
+            // it must not clear or apply over a newer local inventory.
+            m_clientRecoveryJournalPending = true;
+            m_clientRecoveryJournalAwaitingStoredAck = false;
+            m_clientRecoveryJournalStoredAckReceived = false;
+            m_clientRecoveryJournalTransferId = 0;
+            m_clientRecoveryJournalChecksum = 0;
+            m_clientRecoveryJournalRevision = 0;
+            m_clientRecoveryJournalSourcePath.clear();
+            m_clientRecoveryJournalSaveKey.clear();
+
+            bool capturedNewerMutation = false;
+            if (IsLocalInventoryDirtyForSaveKey(acknowledgedSaveKey) &&
+                !m_saveLoadGuardActive &&
+                m_currentHostSaveStateKey == acknowledgedSaveKey &&
+                IsGameReady())
+            {
+                const uint64_t capturedRevision = m_localInventoryDirtyRevision;
+                const char* captureReason = "recovery journal: mutation after StoredAck";
+                if (SaveLocalPlayerSidecar(captureReason) &&
+                    WriteLocalPlayerRecoveryJournal(captureReason) &&
+                    capturedRevision == m_localInventoryDirtyRevision)
+                {
+                    m_localInventoryDirty = false;
+                    m_localInventoryDirtySaveKey.clear();
+                    capturedNewerMutation = true;
+                }
+            }
+            // If capture failed, leave the source empty and let the retry path
+            // capture the live mutation. Reusing the just-acked journal would
+            // upload stale state over the newer local mutation.
+            if (!m_localInventoryDirty && (capturedNewerMutation || newerJournal))
+                RecoverLocalPlayerRecoveryJournal("newer local recovery journal");
+        }
+        else
+        {
+            m_clientRecoveryJournalPending = false;
+            m_clientRecoveryJournalAwaitingStoredAck = false;
+            m_clientRecoveryJournalStoredAckReceived = false;
+            m_clientRecoveryJournalTransferId = 0;
+            m_clientRecoveryJournalChecksum = 0;
+            m_clientRecoveryJournalRevision = 0;
+            m_clientRecoveryJournalSourcePath.clear();
+            m_clientRecoveryJournalSaveKey.clear();
+            if (!cleared)
+                m_lastPlayerStateTransferEvent = "recovery journal ack had no matching source; continuing host apply";
+        }
+    }
+
+    if (m_networkMode == CoopNetworkMode::Client &&
+        m_clientRecoveryJournalPending &&
+        m_clientRecoveryJournalSourcePath.empty() &&
+        IsLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey) &&
+        !m_currentHostSaveStateKey.empty() &&
+        !m_saveLoadGuardActive &&
+        !m_playerStateTransferSending &&
+        !m_playerStateTransferReceiving &&
+        IsGameReady())
+    {
+        const uint64_t capturedRevision = m_localInventoryDirtyRevision;
+        const char* captureReason = "recovery journal: retry newer mutation capture";
+        if (SaveLocalPlayerSidecar(captureReason) &&
+            WriteLocalPlayerRecoveryJournal(captureReason) &&
+            capturedRevision == m_localInventoryDirtyRevision)
+        {
+            m_localInventoryDirty = false;
+            m_localInventoryDirtySaveKey.clear();
+        }
+        RecoverLocalPlayerRecoveryJournal(captureReason);
+    }
+
+    if (m_networkMode == CoopNetworkMode::Client &&
+        m_clientRecoveryJournalPending &&
+        !m_clientRecoveryJournalAwaitingStoredAck &&
+        !m_clientDisconnectFlushPending &&
+        !m_currentHostSaveStateKey.empty() &&
+        m_currentHostSaveStateKey == m_clientRecoveryJournalSaveKey &&
+        !IsLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey) &&
+        !m_saveLoadGuardActive &&
+        !m_playerStateTransferSending &&
+        !m_playerStateTransferReceiving &&
+        // On the initial join the Host's Start may arrive just after the
+        // save-identity packet. Do not let the recovery upload take over the
+        // shared transfer slot before that Start has been received; the host
+        // transfer remains available for apply after this upload is acked.
+        (!m_clientAwaitingHostPlayerState || m_pendingReceivedPlayerStateApply) &&
+        !m_clientRecoveryJournalSourcePath.empty())
+    {
+        if (m_clientRecoveryJournalTransferId == 0)
+        {
+            m_clientRecoveryJournalTransferId =
+                m_playerStateTransferId == std::numeric_limits<uint32_t>::max()
+                    ? 1u
+                    : m_playerStateTransferId + 1u;
+        }
+        if (StartPlayerStateTransferFromFile(
+                m_clientRecoveryJournalSourcePath,
+                GetLocalUsername(),
+                CoopProtocol::kPlayerStateTransferFlagUploadToHost,
+                m_clientRecoveryJournalTransferId,
+                m_clientRecoveryJournalSaveKey))
+        {
+            m_clientRecoveryJournalAwaitingStoredAck = true;
+            m_clientRecoveryJournalChecksum = m_playerStateTransferChecksum;
+            m_lastPlayerStateTransferEvent =
+                "started recovery journal upload revision=" +
+                std::to_string(m_clientRecoveryJournalRevision) +
+                " saveKey=" + m_clientRecoveryJournalSaveKey;
+            LogCoop(m_lastPlayerStateTransferEvent);
+        }
+    }
+
     if (m_clientPlayerSnapshotCooldownSeconds > 0.0f)
         m_clientPlayerSnapshotCooldownSeconds = std::max(0.0f, m_clientPlayerSnapshotCooldownSeconds - clampedFrameTime);
 
@@ -76174,6 +76762,21 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
 
     if (command == CoopProtocol::PlayerStateTransferCommand::StoredAck)
     {
+        if (m_networkMode == CoopNetworkMode::Client &&
+            m_clientRecoveryJournalPending &&
+            m_clientRecoveryJournalAwaitingStoredAck &&
+            packet.transferId == m_clientRecoveryJournalTransferId &&
+            packet.checksum == m_clientRecoveryJournalChecksum &&
+            saveKey == m_clientRecoveryJournalSaveKey)
+        {
+            m_clientRecoveryJournalStoredAckReceived = true;
+            m_lastPlayerStateTransferEvent =
+                "received host recovery journal stored ack transfer=" +
+                std::to_string(packet.transferId) +
+                " revision=" + std::to_string(m_clientRecoveryJournalRevision);
+            LogCoop(m_lastPlayerStateTransferEvent);
+            return;
+        }
         if (m_networkMode != CoopNetworkMode::Client ||
             !m_clientDisconnectFlushPending ||
             !m_clientDisconnectFlushAwaitingStoredAck ||
@@ -76204,6 +76807,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         }
 
         SetCurrentHostSaveStateKey(saveKey, true);
+        RecoverLocalPlayerRecoveryJournal("host save identity");
         m_lastPlayerStateTransferEvent = "applied host save identity saveKey=" + saveKey;
         LogCoop(m_lastPlayerStateTransferEvent);
         return;
@@ -76401,6 +77005,37 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             scopedDest = CoopFilesystem::FromUtf8(scopedPath);
         }
 
+        RecoveryStateMetadata incomingRecovery;
+        const bool incomingIsRecovery =
+            ReadRecoveryStateMetadata(receivePath, incomingRecovery);
+        if (incomingIsRecovery &&
+            (incomingRecovery.accountToken != accountToken ||
+                incomingRecovery.saveKey != storedSaveKey ||
+                storedSaveKey.empty()))
+        {
+            failUpload(
+                "rejected recovery journal identity account=" +
+                Hex64(accountToken));
+            return;
+        }
+
+        bool recoveryAlreadyStored = false;
+        if (incomingIsRecovery && !scopedDest.empty())
+        {
+            RecoveryStateMetadata existingRecovery;
+            if (ReadRecoveryStateMetadata(scopedDest, existingRecovery) &&
+                existingRecovery.accountToken == accountToken &&
+                existingRecovery.saveKey == storedSaveKey &&
+                existingRecovery.revision >= incomingRecovery.revision)
+            {
+                recoveryAlreadyStored = true;
+                LogCoop(
+                    "idempotent recovery journal upload already stored account=" +
+                    Hex64(accountToken) +
+                    " revision=" + std::to_string(incomingRecovery.revision));
+            }
+        }
+
         const auto commitStateFile = [&](const std::filesystem::path& destination, const char* label)
         {
             std::error_code commitError;
@@ -76457,7 +77092,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             return true;
         };
 
-        if (!scopedDest.empty())
+        if (!recoveryAlreadyStored && !scopedDest.empty())
         {
             // The exact save-scoped state is preferred on reconnect. Commit it
             // first so a later failure updating the latest alias can never leave
@@ -76469,7 +77104,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             }
         }
 
-        if (!commitStateFile(latestDest, "latest"))
+        if (!recoveryAlreadyStored && !commitStateFile(latestDest, "latest"))
         {
             failUpload("cannot store client player state: latest commit failed");
             return;
@@ -76541,6 +77176,39 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             return;
         }
 
+        if (m_networkMode == CoopNetworkMode::Client &&
+            hostAuthoritative &&
+            m_clientDisconnectFlushPending)
+        {
+            // A final disconnect upload owns the shared transfer state until
+            // its StoredAck or deadline. Replacing it with a late host push
+            // would strand the immutable inventory snapshot mid-transfer.
+            m_lastPlayerStateTransferEvent =
+                "ignored host player state during disconnect inventory flush";
+            LogCoop(m_lastPlayerStateTransferEvent);
+            return;
+        }
+
+        // Upload and receive share the legacy transfer bookkeeping. If a
+        // host-authoritative Start overtakes a recovery upload, retain the
+        // recovery journal request and retry that upload after this incoming
+        // transfer completes instead of losing the request or dropping Start.
+        if (m_networkMode == CoopNetworkMode::Client &&
+            hostAuthoritative &&
+            m_clientRecoveryJournalPending &&
+            m_clientRecoveryJournalAwaitingStoredAck &&
+            m_playerStateTransferSending)
+        {
+            m_clientRecoveryJournalAwaitingStoredAck = false;
+            m_clientRecoveryJournalChecksum = 0;
+        }
+
+        if (m_networkMode == CoopNetworkMode::Client && hostAuthoritative && !saveKey.empty())
+        {
+            SetCurrentHostSaveStateKey(saveKey, true);
+            RecoverLocalPlayerRecoveryJournal("host player state identity");
+        }
+
         m_playerStateTransferId = packet.transferId;
         m_playerStateTransferTotalBytes = packet.totalBytes;
         m_playerStateTransferChunkCount = packet.chunkCount;
@@ -76552,9 +77220,9 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         m_playerStateTransferUsername = username.empty() ? std::string("Player") : username;
         m_playerStateTransferAccountToken = packet.accountToken;
         m_playerStateTransferSaveKey = saveKey;
-        if (m_networkMode == CoopNetworkMode::Client && hostAuthoritative && !saveKey.empty())
-            SetCurrentHostSaveStateKey(saveKey, true);
         m_playerStateTransferReceivePath = BuildCoopTempPlayerStatePath(packet.transferId, m_playerStateTransferUsername);
+        if (m_networkMode == CoopNetworkMode::Client && hostAuthoritative)
+            m_pendingHostAuthoritativePlayerStateReceivePath = m_playerStateTransferReceivePath;
         m_playerStateTransferSending = false;
         m_playerStateTransferReceiving = true;
         m_playerStateTransferStarted = true;
@@ -76703,6 +77371,25 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
 
         if (m_networkMode == CoopNetworkMode::Client && hostAuthoritative)
         {
+            if (m_clientRecoveryJournalPending &&
+                !m_clientRecoveryJournalSourcePath.empty() &&
+                m_clientRecoveryJournalSaveKey == m_currentHostSaveStateKey)
+            {
+                PlayerSidecarState recoveryState;
+                if (!LoadPlayerSidecarFromPath(m_clientRecoveryJournalSourcePath, recoveryState))
+                {
+                    m_lastPlayerStateTransferEvent =
+                        "failed to stage recovery journal after host player state transfer";
+                    LogCoop(m_lastPlayerStateTransferEvent);
+                    return;
+                }
+                // Keep the newer local snapshot in memory while its durable
+                // journal is uploaded and deleted after StoredAck. The host's
+                // older transfer remains useful for join sequencing only.
+                m_pendingNativePlayerStateOverride = std::move(recoveryState);
+                m_pendingNativePlayerStateOverrideValid = true;
+            }
+
             if (m_pendingHostWorldLoadAfterPlayerState)
             {
                 if (!PrepareReceivedPlayerStateForHostLoad("preload host player state"))

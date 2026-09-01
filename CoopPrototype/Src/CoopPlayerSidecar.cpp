@@ -17,6 +17,7 @@
 #include <fstream>
 #include <iomanip>
 #include <locale>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -24,6 +25,10 @@
 #include <vector>
 
 #include <boost/variant/get.hpp>
+
+#ifdef _WIN32
+#include <Windows.h>
+#endif
 
 #include <Chairloader/IChairLogger.h>
 #include <Prey/CryEntitySystem/IEntity.h>
@@ -319,15 +324,146 @@ bool WritePlayerSidecarPayloadWithHash(const std::filesystem::path& path, const 
         return false;
 
     std::error_code error;
+#ifdef _WIN32
+    // Rename is not a replacement operation on Windows. Use the same
+    // write-through replacement as the transfer commit path so a power loss
+    // cannot leave a partially written recovery journal as the only copy.
+    if (MoveFileExW(
+            tempPath.c_str(),
+            path.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        return true;
+    }
+    return false;
+#else
     std::filesystem::rename(tempPath, path, error);
     if (!error)
         return true;
+#endif
 
     error.clear();
     std::filesystem::copy_file(tempPath, path, std::filesystem::copy_options::overwrite_existing, error);
     std::error_code removeError;
     std::filesystem::remove(tempPath, removeError);
     return !error;
+}
+
+struct RecoveryJournalMetadata
+{
+    uint64_t accountToken = 0;
+    uint64_t revision = 0;
+    std::string saveKey;
+};
+
+bool StartsWith(std::string_view value, std::string_view prefix);
+std::string AfterPrefix(std::string_view value, std::string_view prefix);
+
+bool ParseRecoveryJournalUint64(std::string_view text, uint64_t& value)
+{
+    if (text.empty() || text.size() > 16)
+        return false;
+
+    value = 0;
+    for (const char ch : text)
+    {
+        value <<= 4;
+        if (ch >= '0' && ch <= '9')
+            value |= static_cast<uint64_t>(ch - '0');
+        else if (ch >= 'a' && ch <= 'f')
+            value |= static_cast<uint64_t>(10 + ch - 'a');
+        else if (ch >= 'A' && ch <= 'F')
+            value |= static_cast<uint64_t>(10 + ch - 'A');
+        else
+            return false;
+    }
+    return value != 0;
+}
+
+bool ParseRecoveryJournalMetadata(
+    const std::string& pathString,
+    RecoveryJournalMetadata& metadata,
+    std::string* outPayload = nullptr)
+{
+    metadata = {};
+    std::string payload;
+    bool hasIntegrityHash = false;
+    std::string integrityReason;
+    if (!ReadAndValidatePlayerSidecarFile(
+            pathString,
+            payload,
+            hasIntegrityHash,
+            integrityReason) ||
+        !hasIntegrityHash)
+    {
+        return false;
+    }
+
+    bool hasAccount = false;
+    bool hasSaveKey = false;
+    bool hasRevision = false;
+    std::istringstream input(payload);
+    input.imbue(std::locale::classic());
+    std::string line;
+    while (std::getline(input, line))
+    {
+        if (StartsWith(line, "recoveryAccount="))
+            hasAccount = ParseRecoveryJournalUint64(AfterPrefix(line, "recoveryAccount="), metadata.accountToken);
+        else if (StartsWith(line, "recoverySaveKey="))
+        {
+            metadata.saveKey = AfterPrefix(line, "recoverySaveKey=");
+            hasSaveKey = !metadata.saveKey.empty();
+        }
+        else if (StartsWith(line, "recoveryRevision="))
+        {
+            std::istringstream revisionStream(AfterPrefix(line, "recoveryRevision="));
+            revisionStream.imbue(std::locale::classic());
+            revisionStream >> metadata.revision;
+            hasRevision = !revisionStream.fail() && metadata.revision != 0;
+        }
+    }
+
+    if (outPayload)
+        *outPayload = std::move(payload);
+    return hasAccount && hasSaveKey && hasRevision;
+}
+
+uint64_t GetRecoveryJournalDiskMaxRevision(
+    const std::filesystem::path& root,
+    uint64_t accountToken)
+{
+    if (root.empty() || accountToken == 0)
+        return 0;
+
+    const std::string filePrefix =
+        "player_recovery_account_" + HexPlayerAccountToken(accountToken) + "_";
+    uint64_t maxRevision = 0;
+    std::error_code error;
+    for (std::filesystem::directory_iterator it(root, error), end; it != end; it.increment(error))
+    {
+        if (error)
+        {
+            error.clear();
+            continue;
+        }
+
+        const std::filesystem::path candidate = it->path();
+        std::error_code fileError;
+        if (!std::filesystem::is_regular_file(candidate, fileError) || fileError)
+            continue;
+
+        const std::string fileName = CoopFilesystem::ToUtf8(candidate.filename());
+        if (candidate.extension() != ".state" || !StartsWith(fileName, filePrefix))
+            continue;
+
+        RecoveryJournalMetadata metadata;
+        if (ParseRecoveryJournalMetadata(CoopFilesystem::ToUtf8(candidate), metadata) &&
+            metadata.accountToken == accountToken)
+        {
+            maxRevision = std::max(maxRevision, metadata.revision);
+        }
+    }
+    return maxRevision;
 }
 
 bool ShouldApplyPlayerSidecarTransform(const IEntity& entity, const Vec3& position, const Quat& rotation)
@@ -2522,6 +2658,296 @@ std::string ModMain::GetPlayerSidecarPath() const
     return CoopFilesystem::ToUtf8(root / fileName);
 }
 
+std::string ModMain::GetPlayerSidecarRecoveryJournalPath() const
+{
+    const uint64_t accountToken = GetLocalAccountToken();
+    if (accountToken == 0)
+        return {};
+
+    // Recovery belongs to the exact host save identity advertised for the
+    // current session. Do not infer a key from a transfer or local load path:
+    // either can still describe the previous session during reconnect.
+    const std::string& saveKey = m_currentHostSaveStateKey;
+    if (saveKey.empty() || saveKey == "unknown_save")
+        return {};
+
+    const std::filesystem::path root = GetCoopPlayerStateRoot();
+    if (root.empty())
+        return {};
+
+    return CoopFilesystem::ToUtf8(
+        root / ("player_recovery_account_" + HexPlayerAccountToken(accountToken) +
+            "_" + SanitizePathComponent(saveKey) + ".state"));
+}
+
+bool ModMain::HasValidPlayerSidecarRecoveryJournal() const
+{
+    const std::string pathString = GetPlayerSidecarRecoveryJournalPath();
+    if (pathString.empty())
+        return false;
+
+    RecoveryJournalMetadata metadata;
+    if (!ParseRecoveryJournalMetadata(pathString, metadata))
+        return false;
+
+    const std::string& expectedSaveKey = m_currentHostSaveStateKey;
+    return metadata.accountToken == GetLocalAccountToken() &&
+        metadata.saveKey == expectedSaveKey &&
+        metadata.revision != 0;
+}
+
+uint64_t ModMain::GetPlayerSidecarRecoveryJournalRevision() const
+{
+    const std::string pathString = GetPlayerSidecarRecoveryJournalPath();
+    if (pathString.empty())
+        return 0;
+
+    RecoveryJournalMetadata metadata;
+    return ParseRecoveryJournalMetadata(pathString, metadata) ? metadata.revision : 0;
+}
+
+bool ModMain::WriteLocalPlayerRecoveryJournal(const char* reason)
+{
+    const std::string journalPathString = GetPlayerSidecarRecoveryJournalPath();
+    const std::string sourcePathString = GetPlayerSidecarPath();
+    if (journalPathString.empty() || sourcePathString.empty())
+        return false;
+
+    std::string payload;
+    bool hasIntegrityHash = false;
+    std::string integrityReason;
+    if (!ReadAndValidatePlayerSidecarFile(
+            sourcePathString,
+            payload,
+            hasIntegrityHash,
+            integrityReason) ||
+        !hasIntegrityHash)
+    {
+        LogCoop(
+            "player recovery journal skipped: sidecar unreadable reason=" +
+            (integrityReason.empty() ? std::string("invalid") : integrityReason));
+        return false;
+    }
+
+    const uint64_t accountToken = GetLocalAccountToken();
+    const std::string& saveKey = m_currentHostSaveStateKey;
+    if (saveKey.empty() || saveKey == "unknown_save")
+        return false;
+    if (m_networkMode == CoopNetworkMode::Client &&
+        m_localInventoryDirty &&
+        !IsLocalInventoryDirtyForSaveKey(saveKey))
+    {
+        LogCoop("player recovery journal skipped: dirty state belongs to another saveKey");
+        return false;
+    }
+
+    // The dirty counter is process-local. Use the highest valid durable
+    // revision for this account (including other save-key files) so a fresh
+    // process cannot reuse an older revision after restart.
+    uint64_t durableRevision = GetRecoveryJournalDiskMaxRevision(
+        GetCoopPlayerStateRoot(), accountToken);
+    durableRevision = std::max(durableRevision, m_localInventoryJournalRevision);
+    if (durableRevision == std::numeric_limits<uint64_t>::max())
+    {
+        LogCoop("player recovery journal write failed: revision exhausted");
+        return false;
+    }
+    const uint64_t revision = durableRevision + 1;
+
+    if (!payload.empty() && payload.back() != '\n')
+        payload.push_back('\n');
+    payload += "recoveryAccount=" + HexPlayerAccountToken(accountToken) + "\n";
+    payload += "recoverySaveKey=" + saveKey + "\n";
+    payload += "recoveryRevision=" + std::to_string(revision) + "\n";
+
+    const std::filesystem::path journalPath = CoopFilesystem::FromUtf8(journalPathString);
+    std::error_code error;
+    std::filesystem::create_directories(journalPath.parent_path(), error);
+    if (error || !WritePlayerSidecarPayloadWithHash(journalPath, payload))
+    {
+        LogCoop("player recovery journal write failed saveKey=" + saveKey);
+        return false;
+    }
+
+    m_localInventoryJournalRevision = revision;
+    m_lastPlayerSidecarEvent =
+        "wrote player recovery journal revision=" + std::to_string(revision) +
+        (reason && reason[0] ? ": " + std::string(reason) : "");
+    LogCoop("player recovery journal " + m_lastPlayerSidecarEvent);
+    return true;
+}
+
+bool ModMain::ClearLocalPlayerRecoveryJournal(
+    const std::string& sourcePath,
+    uint64_t accountToken,
+    const std::string& saveKey,
+    uint64_t revision,
+    const char* reason)
+{
+    if (sourcePath.empty() || accountToken == 0 || saveKey.empty() || revision == 0)
+        return false;
+
+    RecoveryJournalMetadata metadata;
+    if (!ParseRecoveryJournalMetadata(sourcePath, metadata) ||
+        metadata.accountToken != accountToken ||
+        metadata.saveKey != saveKey ||
+        metadata.revision != revision)
+        return false;
+
+    // A mutation can arrive while the transfer is in flight. Never let an ack
+    // for the older immutable snapshot erase that newer local recovery point.
+    if (IsLocalInventoryDirtyForSaveKey(saveKey))
+        return false;
+
+    std::error_code error;
+    std::filesystem::remove(CoopFilesystem::FromUtf8(sourcePath), error);
+    if (!error || error == std::errc::no_such_file_or_directory)
+    {
+        // Retain the last acknowledged revision in memory. The next dirty
+        // rewrite must still be greater than this revision even if the file
+        // was removed before the process is restarted.
+        m_localInventoryJournalRevision = std::max(m_localInventoryJournalRevision, revision);
+        m_localInventoryDirtySaveKey.clear();
+        m_lastPlayerSidecarEvent =
+            "cleared player recovery journal" +
+            (reason && reason[0] ? ": " + std::string(reason) : "");
+        LogCoop("player recovery journal " + m_lastPlayerSidecarEvent);
+        return true;
+    }
+    return false;
+}
+
+bool ModMain::RecoverLocalPlayerRecoveryJournal(const char* reason)
+{
+    if (m_networkMode != CoopNetworkMode::Client)
+        return false;
+
+    // A host save handover invalidates the previous in-flight upload. Keep
+    // that save's journal on disk, but never let its transport state block
+    // recovery for the newly advertised host key.
+    if (m_clientRecoveryJournalPending &&
+        !m_currentHostSaveStateKey.empty() &&
+        m_clientRecoveryJournalSaveKey != m_currentHostSaveStateKey)
+    {
+        m_clientRecoveryJournalPending = false;
+        m_clientRecoveryJournalAwaitingStoredAck = false;
+        m_clientRecoveryJournalStoredAckReceived = false;
+        m_clientRecoveryJournalTransferId = 0;
+        m_clientRecoveryJournalChecksum = 0;
+        m_clientRecoveryJournalRevision = 0;
+        m_clientRecoveryJournalSourcePath.clear();
+        m_clientRecoveryJournalSaveKey.clear();
+    }
+
+    const std::string pathString = GetPlayerSidecarRecoveryJournalPath();
+    if (pathString.empty())
+        return false;
+
+    RecoveryJournalMetadata metadata;
+    if (!ParseRecoveryJournalMetadata(pathString, metadata) ||
+        metadata.accountToken != GetLocalAccountToken())
+    {
+        return false;
+    }
+
+    const std::string& expectedSaveKey = m_currentHostSaveStateKey;
+    if (expectedSaveKey.empty() || expectedSaveKey == "unknown_save")
+        return false;
+    if (metadata.saveKey != expectedSaveKey || metadata.revision == 0)
+        return false;
+
+    PlayerSidecarState state;
+    if (!LoadPlayerSidecarFromPath(pathString, state))
+    {
+        LogCoop("player recovery journal rejected: sidecar parse failed saveKey=" + metadata.saveKey);
+        return false;
+    }
+
+    if (m_clientRecoveryJournalPending &&
+        m_clientRecoveryJournalSourcePath == pathString &&
+        m_clientRecoveryJournalRevision == metadata.revision)
+    {
+        return true;
+    }
+
+    m_localInventoryJournalRevision = std::max(m_localInventoryJournalRevision, metadata.revision);
+    m_clientRecoveryJournalPending = true;
+    m_clientRecoveryJournalAwaitingStoredAck = false;
+    m_clientRecoveryJournalStoredAckReceived = false;
+    m_clientRecoveryJournalTransferId = 0;
+    m_clientRecoveryJournalChecksum = 0;
+    m_clientRecoveryJournalRevision = metadata.revision;
+    m_clientRecoveryJournalSourcePath = pathString;
+    m_clientRecoveryJournalSaveKey = metadata.saveKey;
+    m_lastPlayerStateTransferEvent =
+        "pending newer player recovery journal revision=" +
+        std::to_string(metadata.revision) + " saveKey=" + metadata.saveKey +
+        (reason && reason[0] ? ": " + std::string(reason) : "");
+    LogCoop(m_lastPlayerStateTransferEvent);
+    return true;
+}
+
+bool ModMain::IsLocalInventoryDirtyForSaveKey(const std::string& saveKey) const
+{
+    return m_localInventoryDirty &&
+        !saveKey.empty() &&
+        saveKey != "unknown_save" &&
+        m_localInventoryDirtySaveKey == saveKey;
+}
+
+void ModMain::ReconcileLocalInventoryDirtyForSaveKey(const std::string& saveKey)
+{
+    if (m_networkMode != CoopNetworkMode::Client ||
+        !m_localInventoryDirty ||
+        saveKey.empty() ||
+        saveKey == "unknown_save" ||
+        m_localInventoryDirtySaveKey == saveKey)
+    {
+        return;
+    }
+
+    // A dirty snapshot is only valid for the host/save identity that was
+    // active when the mutation happened. Keep the old keyed recovery journal
+    // on disk for a same-key reconnect, but never carry its in-memory dirty
+    // bit into a different campaign or host save.
+    LogCoop(
+        "discarded stale local inventory dirty state oldSaveKey=" +
+        (m_localInventoryDirtySaveKey.empty() ? std::string("-") : m_localInventoryDirtySaveKey) +
+        " newSaveKey=" + saveKey);
+    m_localInventoryDirty = false;
+    m_localInventoryDirtySaveKey.clear();
+    m_localInventoryJournalAccumulator = 0.0f;
+}
+
+void ModMain::MarkLocalInventoryDirty(const char* reason)
+{
+    if (!m_enablePlayerSidecar || ShouldSuppressPlayerSidecarInventoryFeedback())
+        return;
+
+    // Before the host identity handshake there is no safe destination for a
+    // client mutation. Dropping the unscoped dirty bit is safer than later
+    // uploading pre-join inventory to an unrelated host/save.
+    if (m_networkMode == CoopNetworkMode::Client &&
+        (m_currentHostSaveStateKey.empty() || m_currentHostSaveStateKey == "unknown_save"))
+    {
+        LogCoop("ignored unscoped local inventory mutation before host save identity");
+        return;
+    }
+
+    if (m_networkMode == CoopNetworkMode::Client)
+    {
+        ReconcileLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey);
+        m_localInventoryDirtySaveKey = m_currentHostSaveStateKey;
+    }
+    m_localInventoryDirty = true;
+    ++m_localInventoryDirtyRevision;
+    if (m_localInventoryDirtyRevision == 0)
+        m_localInventoryDirtyRevision = 1;
+    m_localInventoryJournalAccumulator = 0.0f;
+    if (reason && reason[0])
+        m_lastPlayerSidecarEvent = "local inventory dirty: " + std::string(reason);
+}
+
 bool ModMain::SaveLocalPlayerSidecar(const char* reason)
 {
     if (!m_enablePlayerSidecar)
@@ -2534,13 +2960,18 @@ bool ModMain::SaveLocalPlayerSidecar(const char* reason)
         return false;
     }
 
+    const bool recoveryJournalCapture =
+        m_clientRecoveryJournalPending &&
+        IsLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey) &&
+        reason && std::string_view(reason).find("recovery journal") != std::string_view::npos;
     if (m_networkMode == CoopNetworkMode::Client &&
         (m_pendingPlayerSidecarInventoryRestore ||
             m_pendingPlayerSidecarChipsetRestore ||
             m_playerSidecarInventoryPending > 0 ||
             m_playerSidecarChipsetsPending > 0 ||
             m_pendingReceivedPlayerStateApply ||
-            m_clientAwaitingHostPlayerState))
+            m_clientAwaitingHostPlayerState) &&
+        !recoveryJournalCapture)
     {
         ++m_playerSidecarFailCount;
         m_lastPlayerSidecarEvent = "save skipped: host player state restore pending";
@@ -4489,6 +4920,7 @@ bool ModMain::DebugClearLocalInventory(std::string& detail)
         return false;
     }
 
+    MarkLocalInventoryDirty("debug inventory clear");
     ++m_debugInventoryClearCount;
     m_lastDebugInventoryEvent =
         std::string(nativeCleared ? "cleared local inventory" : "cleared local inventory via storage fallback") +
@@ -4627,6 +5059,45 @@ void ModMain::TickPlayerSidecar(float frameTime)
 {
     if (!m_enablePlayerSidecar)
         return;
+
+    if (m_networkMode == CoopNetworkMode::Client &&
+        !m_currentHostSaveStateKey.empty() &&
+        m_currentHostSaveStateKey != "unknown_save")
+    {
+        ReconcileLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey);
+    }
+
+    if (m_networkMode == CoopNetworkMode::Client &&
+        !m_currentHostSaveStateKey.empty() &&
+        IsLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey) &&
+        !m_saveLoadGuardActive &&
+        !m_playerStateTransferSending &&
+        IsGameReady())
+    {
+        m_localInventoryJournalAccumulator += std::max(0.0f, frameTime);
+        if (m_localInventoryJournalAccumulator >= 0.5f)
+        {
+            const uint64_t capturedRevision = m_localInventoryDirtyRevision;
+            m_localInventoryJournalAccumulator = 0.0f;
+            const char* reason = m_clientRecoveryJournalPending
+                ? "recovery journal: debounced local inventory mutation"
+                : "debounced local inventory mutation";
+            if (SaveLocalPlayerSidecar(reason) &&
+                WriteLocalPlayerRecoveryJournal(reason) &&
+                capturedRevision == m_localInventoryDirtyRevision)
+            {
+                m_localInventoryDirty = false;
+                m_localInventoryDirtySaveKey.clear();
+                if (m_clientRecoveryJournalPending)
+                    RecoverLocalPlayerRecoveryJournal("refreshed recovery journal");
+            }
+        }
+    }
+    else if (!m_localInventoryDirty ||
+        !IsLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey))
+    {
+        m_localInventoryJournalAccumulator = 0.0f;
+    }
 
     if (m_pendingPlayerSidecarInventoryRestore)
     {
