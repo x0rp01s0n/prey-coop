@@ -1686,6 +1686,7 @@ public:
     void OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const char* reason);
     bool ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerId, const char* reason);
     void OnNativeSharedItemPicked(EntityId itemEntityId, EntityId pickerId, bool success, const char* reason);
+    void CaptureLocalPlayerPickupRecovery(EntityId pickerId, const char* reason);
     void OnSharedDropEntityRemoved(EntityId entityId);
     bool ShouldDeferSharedStorageOpen(CArkExternalInventoryUI* ui, ArkInventory* inventory, const char* reason);
     void OnSharedStorageTransfer(CArkItem* item, IArkInventory* source, IArkInventory* target, const char* reason);

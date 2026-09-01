@@ -19310,7 +19310,11 @@ static bool CArkItem_PickUp_Hook(CArkItem* item, const unsigned pickerId, bool s
 
     const bool result = s_hookCArkItemPickUp.InvokeOrig(item, pickerId, scaleOnLerp);
     if (gMod)
+    {
         gMod->OnNativeSharedItemPicked(itemEntityId, pickerId, result, "CArkItem::PickUp");
+        if (result)
+            gMod->CaptureLocalPlayerPickupRecovery(pickerId, "CArkItem::PickUp");
+    }
     return result;
 }
 

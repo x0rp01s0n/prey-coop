@@ -2948,6 +2948,49 @@ void ModMain::MarkLocalInventoryDirty(const char* reason)
         m_lastPlayerSidecarEvent = "local inventory dirty: " + std::string(reason);
 }
 
+void ModMain::CaptureLocalPlayerPickupRecovery(EntityId pickerId, const char* reason)
+{
+    if (m_networkMode != CoopNetworkMode::Client ||
+        !m_enablePlayerSidecar ||
+        !ArkPlayer::GetInstancePtr() ||
+        pickerId != ArkPlayer::GetInstance().GetEntityId())
+    {
+        return;
+    }
+
+    // PickUp can run from the shared-drop commit while m_sharedDropApplyDepth
+    // is non-zero. Capture here, after native PickUp has returned, instead of
+    // relying on the normal debounced tick which an immediate process kill can
+    // precede.
+    MarkLocalInventoryDirty("successful local-player pickup");
+    const std::string saveKey = m_currentHostSaveStateKey;
+    if (!IsLocalInventoryDirtyForSaveKey(saveKey))
+        return;
+
+    const uint64_t capturedRevision = m_localInventoryDirtyRevision;
+    const std::string captureReason =
+        std::string("recovery journal: successful local-player pickup") +
+        (reason && reason[0] ? " (" + std::string(reason) + ")" : "");
+    const bool sidecarSaved = SaveLocalPlayerSidecar(captureReason.c_str());
+    const bool journalWritten = sidecarSaved &&
+        WriteLocalPlayerRecoveryJournal(captureReason.c_str());
+    if (sidecarSaved && journalWritten && capturedRevision == m_localInventoryDirtyRevision)
+    {
+        m_localInventoryDirty = false;
+        m_localInventoryDirtySaveKey.clear();
+        m_localInventoryJournalAccumulator = 0.0f;
+        return;
+    }
+
+    // Keep the dirty marker armed when either capture step cannot complete.
+    // TickPlayerSidecar will retry with the same exact host save key.
+    m_localInventoryJournalAccumulator = 0.0f;
+    LogCoop(
+        "immediate local pickup recovery capture deferred saveKey=" + saveKey +
+        " sidecar=" + std::to_string(sidecarSaved ? 1 : 0) +
+        " journal=" + std::to_string(journalWritten ? 1 : 0));
+}
+
 bool ModMain::SaveLocalPlayerSidecar(const char* reason)
 {
     if (!m_enablePlayerSidecar)
