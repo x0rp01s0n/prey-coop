@@ -25,6 +25,8 @@ class NullUi
 public:
     void ShowNotice(NullUiNoticeSlot slot, NullUiLayer layer, const std::string& text, float nowSeconds, float durationSeconds);
     void ClearNotice(NullUiNoticeSlot slot);
+    void SetChatText(std::string text);
+    void ClearChatText();
     void ClearAll();
     bool HasVisibleNotice(float nowSeconds) const;
     void DrawPreyHud(float nowSeconds);
@@ -48,4 +50,5 @@ private:
     float GetNoticeAlpha(const Notice& notice, float nowSeconds) const;
 
     std::array<Notice, kNoticeCount> m_notices;
+    std::string m_chatText;
 };

@@ -1596,6 +1596,14 @@ bool ModMain::ShouldSuppressArkPlayerAction(const CCryName& action, int activati
 {
     (void)value;
 
+    if (IsChatInputOpen())
+    {
+        const std::string actionName = ToLowerAscii(action.c_str());
+        ++m_suppressedDownedActions;
+        m_lastSuppressedDownedAction = actionName.empty() ? std::string("chat_input") : "chat_" + actionName;
+        return true;
+    }
+
     if (m_joinOverlayActive && ShouldBlockJoinInput())
     {
         const std::string actionName = ToLowerAscii(action.c_str());

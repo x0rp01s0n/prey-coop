@@ -7,7 +7,7 @@
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 242;
+constexpr uint16_t kProtocolVersion = 243;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -17,6 +17,8 @@ constexpr size_t kSavePathSize = 96;
 constexpr size_t kSaveKeySize = 64;
 constexpr size_t kWeaponClassNameSize = 64;
 constexpr size_t kMaxPacketSize = 1200;
+constexpr size_t kTextChatMaxUtf8Bytes = 768;
+constexpr size_t kTextChatMaxUtf8Chars = 255;
 constexpr size_t kReliablePayloadSize = 1164;
 constexpr size_t kSaveTransferDataSize = 1024;
 constexpr size_t kPlayerStateTransferDataSize = 960;
@@ -417,6 +419,7 @@ enum class PacketType : uint16_t
     SessionReject = 0x22,
     EnemyMannequinAction = 0x23,
     EnemyDeathPresentation = 0x24,
+    TextChat = 0x25,
 };
 
 enum class EnemyMannequinActionCommand : uint16_t
@@ -1551,6 +1554,18 @@ struct SessionRejectPacket
     uint16_t reserved = 0;
     char message[96] = {};
 };
+
+struct TextChatPacket
+{
+    uint32_t magic = kPacketMagic;
+    uint16_t version = kProtocolVersion;
+    uint16_t type = static_cast<uint16_t>(PacketType::TextChat);
+    uint32_t sequence = 0;
+    uint64_t sourceAccountToken = 0;
+    uint16_t textLength = 0;
+    uint16_t flags = 0;
+    char text[kTextChatMaxUtf8Bytes] = {};
+};
 constexpr size_t kReliableEnvelopeHeaderSize = offsetof(ReliableEnvelopePacket, payload);
 #pragma pack(pop)
 
@@ -1559,6 +1574,7 @@ static_assert(kPlayerPoseBaseWireSize == sizeof(PlayerPosePacket) - kMimicModelP
 static_assert(kPlayerPoseBaseWireSize >= sizeof(PacketHeader));
 static_assert(sizeof(PlayerPosePacket) <= kMaxPacketSize);
 static_assert(sizeof(SessionHelloPacket) <= kMaxPacketSize);
+static_assert(sizeof(TextChatPacket) <= kMaxPacketSize);
 static_assert(sizeof(AreaLeasePacket) <= kReliablePayloadSize);
 static_assert(sizeof(RemotePlayerDamagePacket) <= kMaxPacketSize);
 static_assert(sizeof(TestMimicSpawnPacket) <= kMaxPacketSize);

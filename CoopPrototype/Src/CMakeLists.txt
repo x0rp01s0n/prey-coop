@@ -9,6 +9,8 @@ set(SOURCE_FILES
 	CoopAreaStateOverlay.cpp
 	CoopAreaStateOverlay.h
 	CoopAnimationTest.cpp
+	CoopChat.cpp
+	CoopChat.h
 	CoopBreakableSync.cpp
 	CoopAssetDump.cpp
 	CoopCoverageDiscovery.cpp
@@ -101,6 +103,7 @@ set(SOURCE_FILES
 	CoopProtocol.h
 	CoopVTableHook.h
 	ModMain.cpp
+	ModMainChat.cpp
 	ModMain.h
 	pch.h
 )

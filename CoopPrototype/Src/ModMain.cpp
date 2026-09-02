@@ -1,5 +1,6 @@
 #include "ModMain.h"
 #include "CoopRuntimeGuards.h"
+#include "CoopChat.h"
 #include "CoopHookStats.h"
 #include "CoopWorkstationSync.h"
 #include "CoopSerialSequence.h"
@@ -7260,6 +7261,7 @@ void ModMain::CoopRenderListener::EndFrame()
 
 ModMain::~ModMain()
 {
+    ShutdownChat();
     CloseServerBrowserSocket();
     UnregisterCoopRenderListener();
     RemoveCrashExceptionHandler();
@@ -31070,6 +31072,9 @@ bool ModMain::HandleNativeWindowMessage(
     uint64_t wParam,
     std::int64_t lParam)
 {
+    if (HandleChatWindowMessage(message, wParam, lParam))
+        return true;
+
     const bool isSystemClose =
         message == WM_SYSCOMMAND && (wParam & 0xFFF0u) == SC_CLOSE;
     const bool isClose = message == WM_CLOSE || isSystemClose;
@@ -31661,6 +31666,7 @@ void ModMain::InitSystem(const ModInitInfo& initInfo, ModDllInfo& dllInfo)
 void ModMain::InitGame(bool isHotReloading)
 {
     BaseClass::InitGame(isHotReloading);
+    InitializeChat();
     InstallCrashExceptionHandler();
     RegisterSystemEventListener();
     if (!EnvFlagEnabled("COOP_DISABLE_ENTITY_SINK"))
@@ -35351,6 +35357,7 @@ void ModMain::MainUpdate(unsigned updateFlags)
     TickPendingRemoteCorpsePhantomResults();
 
     TickNetwork(frameTime);
+    TickChat(frameTime, GetNowSeconds());
     TickRemotePlayerProxySmoothing(frameTime);
     TickRemoteDoorPowerConvergence(frameTime);
     TickArkElevatorTransitScan(frameTime);
@@ -37428,6 +37435,7 @@ std::string ModMain::BuildRuntimeControlStatus() const
         << " reliableSeq=" << m_reliableSendSequence << "/" << m_reliableRecvSequence << "/" << m_reliableAckedSequence
         << " reliableLast=" << StatusToken(m_lastReliableEvent)
         << " netTelemetry=" << m_networkTelemetry.BuildCompactStatus()
+        << " chat=" << StatusToken(BuildChatTelemetry())
         << " runtimeCost=" << StatusToken(BuildRuntimeCostReport())
         << " coverage=" << StatusToken(m_coverageDiscovery.BuildCompactReport())
         << " saveSend=" << (m_saveTransferSending ? 1 : 0)
@@ -42813,6 +42821,19 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
     if (command == "coop_status" || command == "coop")
     {
         action = "status";
+    }
+    else if (command == "coop_chat_send")
+    {
+        std::string text;
+        for (size_t index = 0; index < args.size(); ++index)
+        {
+            if (!text.empty())
+                text += ' ';
+            text += args[index];
+        }
+        ok = SendChatTextCommand(text);
+        action = ok ? "chat_sent" : "chat_send_failed";
+        commandDetail = BuildChatTelemetry();
     }
     else if (command == "coop_network_report")
     {
@@ -52697,6 +52718,8 @@ void ModMain::StartClient()
 
 void ModMain::StopNetwork()
 {
+    ResetChat();
+    m_chatTextRates.clear();
     const bool preserveClientInventoryRecovery =
         m_networkMode == CoopNetworkMode::Client &&
         (m_clientDisconnectFlushPending ||
@@ -68925,6 +68948,8 @@ void ModMain::RemoveRemotePeer(uint64_t accountToken, const char* reason, bool a
     m_reliableEndpointStates.erase(MakeEndpointKey(peer.address, peer.port));
     m_hostPlayerStateUploadReceives.erase(accountToken);
     m_pendingHostPlayerStateUploadRequests.erase(accountToken);
+    RemoveChatSender(accountToken);
+    m_chatTextRates.erase(accountToken);
     m_remotePeers.erase(it);
     for (const EntityId entityId : reclaimedTurretEntities)
     {
@@ -69133,6 +69158,14 @@ void ModMain::TickReceivePackets(const char* failurePrefix)
             HandleReliableEnvelope(packet, fromAddress.sin_addr.s_addr, fromAddress.sin_port);
             continue;
         }
+
+        if (HandleChatDatagram(
+                header,
+                packetBuffer,
+                receivedBytes,
+                fromAddress.sin_addr.s_addr,
+                fromAddress.sin_port))
+            continue;
 
         if (header.type == static_cast<uint16_t>(CoopProtocol::PacketType::GooResult))
         {

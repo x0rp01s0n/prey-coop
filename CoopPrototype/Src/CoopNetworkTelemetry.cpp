@@ -17,7 +17,7 @@ struct PacketDescriptor
     const char* delivery;
 };
 
-constexpr std::array<PacketDescriptor, 30> kPacketDescriptors = {{
+constexpr std::array<PacketDescriptor, 31> kPacketDescriptors = {{
     {CoopProtocol::PacketType::PlayerPose, "PlayerPose", sizeof(CoopProtocol::PlayerPosePacket), "direct-variable"},
     {CoopProtocol::PacketType::SessionHello, "SessionHello", sizeof(CoopProtocol::SessionHelloPacket), "direct"},
     {CoopProtocol::PacketType::RemotePlayerDamage, "RemotePlayerDamage", sizeof(CoopProtocol::RemotePlayerDamagePacket), "reliable"},
@@ -48,6 +48,7 @@ constexpr std::array<PacketDescriptor, 30> kPacketDescriptors = {{
     {CoopProtocol::PacketType::DialogueLease, "DialogueLease", sizeof(CoopProtocol::DialogueLeasePacket), "reliable"},
     {CoopProtocol::PacketType::TimeDilation, "TimeDilation", sizeof(CoopProtocol::TimeDilationPacket), "reliable"},
     {CoopProtocol::PacketType::CorpsePhantomRequest, "CorpsePhantomRequest", sizeof(CoopProtocol::CorpsePhantomRequestPacket), "reliable"},
+    {CoopProtocol::PacketType::TextChat, "TextChat", sizeof(CoopProtocol::TextChatPacket), "direct"},
 }};
 
 void Add(CoopNetworkTelemetry::Totals& target, uint64_t packets, uint64_t bytes)
