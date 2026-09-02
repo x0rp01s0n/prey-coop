@@ -8,7 +8,7 @@
 class CoopNetworkTelemetry final
 {
 public:
-    static constexpr size_t kPacketTypeSlots = 32;
+    static constexpr size_t kPacketTypeSlots = 64;
 
     enum class ProducerSuppressionReason : uint8_t
     {

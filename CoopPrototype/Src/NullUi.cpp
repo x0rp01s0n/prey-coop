@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <utility>
 
 #include <imgui.h>
 #include <Prey/CryRenderer/IRenderAuxGeom.h>
@@ -21,6 +22,9 @@ constexpr float kSystemFontSize = 1.05f;
 constexpr float kPriorityFontSize = 1.65f;
 constexpr float kImGuiSystemFontSize = 18.0f;
 constexpr float kImGuiPriorityFontSize = 28.0f;
+constexpr float kChatFontSize = 18.0f;
+constexpr float kChatRightMargin = 28.0f;
+constexpr float kChatBottomMargin = 24.0f;
 
 size_t SlotIndex(NullUiNoticeSlot slot)
 {
@@ -59,6 +63,16 @@ void NullUi::ClearNotice(NullUiNoticeSlot slot)
     notice->active = false;
 }
 
+void NullUi::SetChatText(std::string text)
+{
+    m_chatText = std::move(text);
+}
+
+void NullUi::ClearChatText()
+{
+    m_chatText.clear();
+}
+
 void NullUi::ClearAll()
 {
     for (Notice& notice : m_notices)
@@ -67,10 +81,14 @@ void NullUi::ClearAll()
         notice.durationSeconds = 0.0f;
         notice.active = false;
     }
+    ClearChatText();
 }
 
 bool NullUi::HasVisibleNotice(float nowSeconds) const
 {
+    if (!m_chatText.empty())
+        return true;
+
     for (const Notice& notice : m_notices)
     {
         if (IsNoticeVisible(notice, nowSeconds))
@@ -235,6 +253,42 @@ void NullUi::DrawImGuiOverlay(float nowSeconds)
             shadowColor(alpha),
             notice->text);
         y += kImGuiPriorityFontSize + 8.0f;
+    }
+
+    if (!m_chatText.empty())
+    {
+        const float scale = kChatFontSize / std::max(1.0f, ImGui::GetFontSize());
+        const float left = viewportPos.x + kChatRightMargin;
+        const float right = viewportPos.x + displaySize.x - kChatRightMargin;
+        const float maxWidth = std::max(1.0f, right - left);
+        const float wrapWidth = maxWidth / scale;
+        const ImVec2 measured = ImGui::CalcTextSize(m_chatText.c_str(), nullptr, false, wrapWidth);
+        const float textWidth = std::min(maxWidth, measured.x * scale);
+        const float textHeight = measured.y * scale;
+        const ImVec2 pos(
+            right - textWidth,
+            viewportPos.y + displaySize.y - kChatBottomMargin - textHeight);
+        drawList->PushClipRect(
+            ImVec2(left, viewportPos.y),
+            ImVec2(right, viewportPos.y + displaySize.y),
+            true);
+        drawList->AddText(
+            nullptr,
+            kChatFontSize,
+            ImVec2(pos.x + 2.0f, pos.y + 2.0f),
+            IM_COL32(0, 0, 0, 190),
+            m_chatText.c_str(),
+            nullptr,
+            wrapWidth);
+        drawList->AddText(
+            nullptr,
+            kChatFontSize,
+            pos,
+            IM_COL32(230, 242, 255, 255),
+            m_chatText.c_str(),
+            nullptr,
+            wrapWidth);
+        drawList->PopClipRect();
     }
 }
 

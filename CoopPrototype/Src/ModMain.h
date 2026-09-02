@@ -42,6 +42,7 @@
 #include <Prey/GameDll/EntityUtility/EntityEffects.h>
 
 class ArkNpc;
+class CoopChat;
 class ArkLevelTransitionDoor;
 class ArkWorldUIOwner;
 class ArkSaveLoadSystem;
@@ -1809,6 +1810,25 @@ private:
     bool BuildPlayerStateTransferPacket(CoopProtocol::PlayerStateTransferPacket& packet, CoopProtocol::PlayerStateTransferCommand command, uint32_t transferId);
     bool BuildAreaJournalTransferPacket(CoopProtocol::AreaJournalTransferPacket& packet, CoopProtocol::AreaJournalTransferCommand command, uint32_t transferId);
     bool SendPacketTo(const void* packet, int packetSize, uint32_t address, uint16_t port, const char* failurePrefix);
+    bool SendChatDatagram(const void* packet, int packetSize, const char* failurePrefix);
+    void InitializeChat();
+    void ShutdownChat();
+    bool HandleChatWindowMessage(unsigned message, uint64_t wParam, int64_t lParam);
+    void TickChat(float frameTime, float nowSeconds);
+    bool IsChatInputOpen() const;
+    std::string BuildChatTelemetry() const;
+    bool SendChatTextCommand(const std::string& text);
+    void ResetChat();
+    void RemoveChatSender(uint64_t accountToken);
+    bool CanAcceptChatTextPacket(const CoopProtocol::TextChatPacket& packet) const;
+    bool HandleChatTextPacket(const CoopProtocol::TextChatPacket& packet, const std::string& username, float nowSeconds);
+    bool HandleChatDatagram(
+        const CoopProtocol::PacketHeader& header,
+        const void* packetData,
+        int packetBytes,
+        uint32_t fromAddress,
+        uint16_t fromPort);
+    bool AcceptChatTextRate(uint64_t accountToken, float nowSeconds);
     bool SendPosePacketTo(const CoopProtocol::PlayerPosePacket& packet, uint32_t address, uint16_t port, const char* failurePrefix);
     bool SendSessionHelloTo(uint32_t address, uint16_t port, const char* failurePrefix);
     bool SendAreaLeaseTo(const CoopProtocol::AreaLeasePacket& packet, uint32_t address, uint16_t port, const char* failurePrefix);
@@ -1867,6 +1887,7 @@ private:
     void RelayReliablePayloadToPeers(const CoopProtocol::ReliableEnvelopePacket& packet, uint32_t fromAddress, uint16_t fromPort);
     void RelayPoseToPeers(const CoopProtocol::PlayerPosePacket& packet, uint32_t fromAddress, uint16_t fromPort);
     void RelayDatagramToPeers(const void* packet, int packetSize, uint32_t fromAddress, uint16_t fromPort, const char* failurePrefix);
+    void RelayChatTextToPeers(const void* packet, int packetSize, uint32_t fromAddress, uint16_t fromPort, const char* failurePrefix);
     bool RouteRemoteAreaEnemyStateDatagram(
         const void* packet,
         int packetSize,
@@ -4252,7 +4273,14 @@ private:
     std::unordered_map<uint64_t, float> m_hugePhysicsBoundsRepairFailureCooldownUntil;
     std::deque<PendingReliablePacket> m_reliableSendQueue;
     std::unordered_map<uint64_t, ReliableEndpointState> m_reliableEndpointStates;
+    struct ChatTextRateState
+    {
+        float windowStart = -1.0f;
+        float lastMessage = -1000.0f;
+        uint32_t count = 0;
+    };
     std::unordered_map<uint64_t, RemotePeerSession> m_remotePeers;
+    std::unordered_map<uint64_t, ChatTextRateState> m_chatTextRates;
     std::unordered_map<uint64_t, HostPlayerStateUploadReceive> m_hostPlayerStateUploadReceives;
     std::unordered_set<uint64_t> m_pendingHostPlayerStateUploadRequests;
     std::unordered_set<uint64_t> m_kickedAccountTokens;
@@ -4262,6 +4290,7 @@ private:
     uint64_t m_activePacketSourceAccountToken = 0;
     int m_maxSessionPlayers = 4;
     CoopNetworkTelemetry m_networkTelemetry;
+    CoopChat* m_chat = nullptr;
     CoopCoverageDiscovery m_coverageDiscovery;
     std::atomic<uint64_t> m_runtimeLogEmissions{0};
     uint64_t m_runtimeTransformHookCalls = 0;
