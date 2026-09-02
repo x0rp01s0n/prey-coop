@@ -51,7 +51,7 @@ High-rate traffic is limited to compact player/enemy pose and actively moving pr
 - **Player state corrupt for exact save:** restore that account/save state from backup, or remove only the reported exact-save state to create an empty player slot. The Host never substitutes another save's inventory or progression.
 - **GPU/VRAM startup failure during local multi-instance testing:** terminate stale Prey/Proton/Wine processes before retrying. Do not repeatedly relaunch into exhausted VRAM.
 - **Missing Host geometry during local multi-instance testing:** stop all test instances and rebuild that profile's shader cache. Each test prefix must use its own cache directory; sharing Steam's live `shadercache/480490` between simultaneous renderers can corrupt or starve the Host cache.
-- **Diagnostics:** the large developer window and verbose traces are off by default. Enable them only for a bounded reproducer; normal play should not emit sustained console spam.
+- **Diagnostics:** the bounded runtime report is written automatically to `Saved Games/Arkane Studios/Prey/coop_runtime_log.txt`, next to `Game.log`. The large developer window and verbose traces are off by default; enable them only for a bounded reproducer so normal play does not emit sustained console spam.
 
 ## Build
 

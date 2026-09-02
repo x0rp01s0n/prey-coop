@@ -30934,6 +30934,31 @@ void ModMain::InstallCrashExceptionHandler()
             g_crashTraceDirectory = CoopFilesystem::ToUtf8(crashDir);
     }
 
+    const std::filesystem::path runtimeLogPath = profileRoot.empty()
+        ? std::filesystem::path("coop_runtime_log.txt")
+        : profileRoot / "coop_runtime_log.txt";
+    std::filesystem::path configuredRuntimeLogPath = runtimeLogPath;
+    bool runtimeLogConfigured = CoopRuntimeLog::ConfigureFile(runtimeLogPath);
+    if (!runtimeLogConfigured && !profileRoot.empty())
+    {
+        configuredRuntimeLogPath = std::filesystem::path("coop_runtime_log.txt");
+        runtimeLogConfigured = CoopRuntimeLog::ConfigureFile(configuredRuntimeLogPath);
+    }
+    if (runtimeLogConfigured)
+    {
+        LogCoop(
+            "runtime log initialized path=" +
+            CoopFilesystem::ToUtf8(configuredRuntimeLogPath));
+        // Persist the startup breadcrumb immediately. The normal update loop
+        // refreshes this bounded snapshot at most once per second, but a
+        // loader-time crash must still leave proof that the file was active.
+        CoopRuntimeLog::Flush();
+    }
+    else
+    {
+        LogCoop("runtime log initialization failed");
+    }
+
     if (!g_purecallTraceHandlerInstalled)
     {
         g_previousPurecallHandler = _set_purecall_handler(&CoopPurecallTraceHandler);
@@ -30978,11 +31003,12 @@ void ModMain::RemoveCrashExceptionHandler()
         g_invalidParameterTraceHandlerInstalled = false;
     }
 
-    if (!g_crashVectoredHandler)
-        return;
-
-    RemoveVectoredExceptionHandler(g_crashVectoredHandler);
-    g_crashVectoredHandler = nullptr;
+    if (g_crashVectoredHandler)
+    {
+        RemoveVectoredExceptionHandler(g_crashVectoredHandler);
+        g_crashVectoredHandler = nullptr;
+    }
+    CoopRuntimeLog::CloseFile();
 }
 
 //---------------------------------------------------------------------------------
@@ -35119,6 +35145,11 @@ void ModMain::OnArkSaveLoadSerializePersistentStateHook(
 void ModMain::MainUpdate(unsigned updateFlags)
 {
     const float frameTime = gEnv && gEnv->pTimer ? gEnv->pTimer->GetFrameTime() : 0.0f;
+
+    // Refresh the bounded report outside the log hot path. This keeps the
+    // release diagnostic available without turning every emitted event into a
+    // synchronous disk write.
+    CoopRuntimeLog::Flush();
 
     // Periodic self-profiling dump (issue #2): hook cost breakdown + guarded
     // call / VirtualQuery totals straight into Game.log, independent of the
