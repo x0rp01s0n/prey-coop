@@ -895,18 +895,11 @@ bool ModMain::ApplyAreaObjectWorkstationUtilityPressed(
         return false;
     }
 
-    const bool localAreaAuthority =
-        m_networkMode == CoopNetworkMode::Host || IsClientAreaAuthorityActive();
-    if (m_applyingRemoteAreaObjectEvent && !localAreaAuthority)
-    {
-        // The reliable event is an input request. Same-area observers wait for
-        // authoritative mission results instead of executing the FlowGraph.
-        detail = "accepted_workstation_utility_observer_id_" + std::to_string(utilityButtonId) +
-            "_entity_" + std::to_string(entityId) +
-            "_guid_" + std::to_string(guid);
-        return true;
-    }
-
+    // The Area Authority has already accepted this input. Remote observers
+    // intentionally replay the same authored outputs locally so
+    // ArkSceneWindow/LookingGlass and other native FlowGraph presentation runs
+    // on every peer. The enclosing remote-apply guard prevents this replay from
+    // becoming a new packet.
     IEntity* outputEntity = nullptr;
     std::string reason;
     const bool entityOk = TryGuardedCall(
