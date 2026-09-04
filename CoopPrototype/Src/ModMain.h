@@ -1367,9 +1367,13 @@ private:
         std::string username;
         std::string levelName;
         std::string poseAnimationClip;
+        std::string weaponVisualPath;
         Vec3 location = Vec3(ZERO);
         EntityId proxyEntityId = INVALID_ENTITYID;
+        EntityId weaponVisualEntityId = INVALID_ENTITYID;
         RemotePeerPoseSmoothingState poseSmoothing;
+        int weaponVisualSlotIndex = -1;
+        uint32_t weaponVisualClass = 0;
         uint32_t lastPoseSequence = 0;
         uint32_t lastPlayerStatusSequence = 0;
         uint32_t lastDamageSequence = 0;
@@ -1427,6 +1431,9 @@ private:
         bool areaJournalTransferStarted = false;
         bool areaJournalTransferComplete = false;
         bool deferredAreaJournalTransferPending = false;
+        bool weaponVisualCrouched = false;
+        bool weaponVisualLowCrouched = false;
+        bool weaponVisualZeroG = false;
         bool downed = false;
         bool sessionReady = false;
     };
@@ -2244,6 +2251,15 @@ private:
         bool lowCrouched,
         bool zeroG,
         const char* reason);
+    bool ApplyAdditionalProxyWeaponVisual(
+        RemotePeerSession& peer,
+        IEntity& entity,
+        bool equipped,
+        uint32_t weaponClass,
+        bool crouched,
+        bool lowCrouched,
+        bool zeroG,
+        const char* reason);
     void ClearProxyWeaponVisual(IEntity* entity, const char* reason);
     bool TriggerProxyParticleEffect(
         const char* effectName,
@@ -2402,7 +2418,7 @@ private:
         const Quat& rotation,
         const char* reason,
         std::string* failureReason = nullptr);
-    void ApplyRemotePoseToProxy(const CoopProtocol::PlayerPosePacket& packet);
+    void ApplyRemotePoseToProxy(const CoopProtocol::PlayerPosePacket& packet, bool presentationReplay = false);
     void ProcessPendingDebugActions();
     void SendRemoteReviveCommand();
     bool SetLocalPlayerHealthSafe(float health, const char* reason);
@@ -2420,6 +2436,7 @@ private:
     void RecoverLocalPlayerFromNativeDeathState(const char* reason);
     bool SendLocalPlayerStatus(uint32_t flags, uint32_t reason, const Vec3* overridePosition = nullptr, const Quat* overrideRotation = nullptr);
     bool TeleportLocalPlayer(const Vec3& position, const Quat& rotation);
+    void SetLocalPlayerViewRotationAfterTeleport(const Quat& rotation);
     bool TeleportLocalPlayerNearRemote(uint32_t reason);
     bool TeleportRemoteProxyNearLocal(uint32_t reason);
     void TickDownedState(float frameTime);
@@ -2940,6 +2957,7 @@ private:
     uint32_t m_receivedPosePackets = 0;
     CoopProtocol::PlayerPosePacket m_lastTransmittedPosePacket = {};
     CoopProtocol::PlayerPosePacket m_lastReceivedPosePacket = {};
+    CoopProtocol::PlayerPosePacket m_lastPrimaryRemotePosePacket = {};
     uint32_t m_localPoseFlagsObserved = 0;
     uint32_t m_remotePoseFlagsObserved = 0;
     uint32_t m_localPoseVerticalSamples = 0;
@@ -2956,6 +2974,9 @@ private:
     float m_remotePoseMinDownwardSpeed = 0.0f;
     float m_localPoseSnapshotSilenceSeconds = 0.0f;
     bool m_hasLastTransmittedPosePacket = false;
+    bool m_hasLastPrimaryRemotePosePacket = false;
+    bool m_remotePosePresentationReplayPending = false;
+    uint8_t m_remotePosePresentationReplayFrames = 0;
     uint32_t m_sentSessionPackets = 0;
     uint32_t m_receivedSessionPackets = 0;
     uint32_t m_areaLeaseSequence = 0;
@@ -4048,6 +4069,8 @@ private:
     int m_remotePoseActionOverlayLayer = 1;
     uint32_t m_lastLocalPoseWeaponClass = 0;
     bool m_hasLastLocalPoseWeaponClass = false;
+    uint32_t m_stableLocalPoseWeaponClass = 0;
+    uint8_t m_missingLocalPoseWeaponSamples = 0;
     std::string m_lastPoseActionEvent = "-";
     std::string m_lastNpcMannequinActionTraceEvent = "-";
     std::string m_lastNpcMannequinConstructTraceEvent = "-";

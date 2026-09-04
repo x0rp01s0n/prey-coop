@@ -52143,6 +52143,12 @@ void ModMain::StartHost()
     m_receivedPosePackets = 0;
     m_lastTransmittedPosePacket = {};
     m_lastReceivedPosePacket = {};
+    m_lastPrimaryRemotePosePacket = {};
+    m_hasLastPrimaryRemotePosePacket = false;
+    m_remotePosePresentationReplayPending = false;
+    m_remotePosePresentationReplayFrames = 0;
+    m_stableLocalPoseWeaponClass = 0;
+    m_missingLocalPoseWeaponSamples = 0;
     m_localPoseFlagsObserved = 0;
     m_remotePoseFlagsObserved = 0;
     m_localPoseVerticalSamples = 0;
@@ -52567,6 +52573,12 @@ void ModMain::StartClient()
     m_receivedPosePackets = 0;
     m_lastTransmittedPosePacket = {};
     m_lastReceivedPosePacket = {};
+    m_lastPrimaryRemotePosePacket = {};
+    m_hasLastPrimaryRemotePosePacket = false;
+    m_remotePosePresentationReplayPending = false;
+    m_remotePosePresentationReplayFrames = 0;
+    m_stableLocalPoseWeaponClass = 0;
+    m_missingLocalPoseWeaponSamples = 0;
     m_localPoseFlagsObserved = 0;
     m_remotePoseFlagsObserved = 0;
     m_localPoseVerticalSamples = 0;
@@ -53141,6 +53153,12 @@ void ModMain::StopNetwork()
     m_nextEnemyNetId = 100;
     m_hasLastLocalPlayerPos = false;
     m_hasLastMimicAuthorityPos = false;
+    m_lastPrimaryRemotePosePacket = {};
+    m_hasLastPrimaryRemotePosePacket = false;
+    m_remotePosePresentationReplayPending = false;
+    m_remotePosePresentationReplayFrames = 0;
+    m_stableLocalPoseWeaponClass = 0;
+    m_missingLocalPoseWeaponSamples = 0;
     ResetProxyHealthBaseline();
     m_hasRemoteEndpoint = false;
     m_hasRemoteSession = false;
@@ -53793,6 +53811,20 @@ void ModMain::TickPoseActionTimers(float frameTime)
         m_remotePoseBaseActionSeconds <= 0.0f)
     {
         ClearRemoteProxyActionOverlay("action cooldown expired");
+        if (m_hasLastPrimaryRemotePosePacket)
+            ApplyRemotePoseToProxy(m_lastPrimaryRemotePosePacket, true);
+    }
+
+    if (m_remotePosePresentationReplayPending)
+    {
+        if (m_remotePosePresentationReplayFrames > 0)
+            --m_remotePosePresentationReplayFrames;
+        if (m_remotePosePresentationReplayFrames == 0)
+        {
+            m_remotePosePresentationReplayPending = false;
+            if (m_hasLastPrimaryRemotePosePacket)
+                ApplyRemotePoseToProxy(m_lastPrimaryRemotePosePacket, true);
+        }
     }
 }
 
@@ -53906,12 +53938,29 @@ bool ModMain::BuildLocalPosePacket(CoopProtocol::PlayerPosePacket& packet, float
     if (weaponIdOk && weaponPtrOk && equippedWeaponId != 0 && equippedWeapon)
     {
         weaponClass = ClassifyPoseWeapon(equippedWeapon);
-        if (weaponClass != 0)
-        {
-            packet.flags |= CoopProtocol::kPlayerPoseFlagWeaponEquipped;
-            packet.flags |= (weaponClass << CoopProtocol::kPlayerPoseWeaponClassShift) &
-                CoopProtocol::kPlayerPoseWeaponClassMask;
-        }
+    }
+    if (weaponClass != 0)
+    {
+        m_stableLocalPoseWeaponClass = weaponClass;
+        m_missingLocalPoseWeaponSamples = 0;
+    }
+    // Native equip swaps briefly expose neither the old nor new weapon. Keep
+    // the last confirmed visual through that gap instead of flashing unarmed.
+    else if (m_stableLocalPoseWeaponClass != 0 && m_missingLocalPoseWeaponSamples < 3)
+    {
+        ++m_missingLocalPoseWeaponSamples;
+        weaponClass = m_stableLocalPoseWeaponClass;
+    }
+    else
+    {
+        m_stableLocalPoseWeaponClass = 0;
+        m_missingLocalPoseWeaponSamples = 0;
+    }
+    if (weaponClass != 0)
+    {
+        packet.flags |= CoopProtocol::kPlayerPoseFlagWeaponEquipped;
+        packet.flags |= (weaponClass << CoopProtocol::kPlayerPoseWeaponClassShift) &
+            CoopProtocol::kPlayerPoseWeaponClassMask;
     }
     if (weaponIdOk && weaponPtrOk && equippedWeaponId != 0 && equippedWeapon && weaponClass != 0)
     {
@@ -68162,9 +68211,23 @@ void ModMain::HandlePeerPresence(const CoopProtocol::PeerPresencePacket& packet)
 void ModMain::RetireRemotePeerProxyForAreaChange(RemotePeerSession& peer, const char* reason)
 {
     const EntityId proxyId = peer.proxyEntityId;
+    if (peer.accountToken == m_primaryRemotePeerToken)
+    {
+        m_lastPrimaryRemotePosePacket = {};
+        m_hasLastPrimaryRemotePosePacket = false;
+        m_remotePosePresentationReplayPending = false;
+        m_remotePosePresentationReplayFrames = 0;
+    }
     peer.lastPoseSequence = 0;
     ClearRemotePeerPoseSmoothing(peer);
     peer.poseAnimationClip.clear();
+    peer.weaponVisualEntityId = INVALID_ENTITYID;
+    peer.weaponVisualSlotIndex = -1;
+    peer.weaponVisualClass = 0;
+    peer.weaponVisualCrouched = false;
+    peer.weaponVisualLowCrouched = false;
+    peer.weaponVisualZeroG = false;
+    peer.weaponVisualPath.clear();
     peer.downed = false;
     if (proxyId == INVALID_ENTITYID)
         return;
@@ -68989,6 +69052,20 @@ void ModMain::ApplyAdditionalRemotePose(
         stance == static_cast<int>(EStance::STANCE_CRAWL) ||
         stance == static_cast<int>(EStance::STANCE_PRONE);
     const bool crouched = stance == static_cast<int>(EStance::STANCE_SNEAK);
+    const bool anyCrouched = crouched || lowCrouched;
+    const bool weaponEquipped = (packet.flags & CoopProtocol::kPlayerPoseFlagWeaponEquipped) != 0;
+    const uint32_t weaponClass =
+        (packet.flags & CoopProtocol::kPlayerPoseWeaponClassMask) >> CoopProtocol::kPlayerPoseWeaponClassShift;
+
+    ApplyAdditionalProxyWeaponVisual(
+        peer,
+        *entity,
+        weaponEquipped,
+        weaponClass,
+        anyCrouched,
+        lowCrouched,
+        zeroG,
+        "additional remote pose");
 
     if (zeroG)
     {
@@ -69052,6 +69129,17 @@ void ModMain::ApplyAdditionalRemotePose(
         frozenPose = true;
         frozenPoseTime = 0.20f;
     }
+    else if (moving && weaponEquipped && weaponClass == CoopProtocol::kPlayerPoseWeaponClassWrench)
+    {
+        clip = "4d-Bspace_Combat_MoveTurnStrafeSlope_Pistol";
+        duration = 0.98f;
+        animationBlend = 0.04f;
+    }
+    else if (moving && weaponEquipped)
+    {
+        clip = "4d-Bspace_Combat_Aiming_MoveTurnStrafeSlope_Pistol";
+        duration = running ? 1.25f : 1.15f;
+    }
     else if (moving && running)
     {
         clip = "Fear_Run_Forward_Empty";
@@ -69061,6 +69149,19 @@ void ModMain::ApplyAdditionalRemotePose(
     {
         clip = "4d-Bspace_Relaxed_MoveTurnStrafeSlope_Empty";
         duration = 1.15f;
+    }
+    else if (weaponEquipped && weaponClass == CoopProtocol::kPlayerPoseWeaponClassWrench)
+    {
+        clip = "Combat_BreakGloo_B_Pistol";
+        animationBlend = 0.04f;
+        frozenPose = true;
+        frozenPoseTime = 0.98f;
+    }
+    else if (weaponEquipped)
+    {
+        clip = "combat_aiming_idle_pistol";
+        frozenPose = true;
+        frozenPoseTime = 0.0f;
     }
 
     const bool restartAnimation = spawned || peer.poseAnimationClip != clip;
@@ -69193,6 +69294,10 @@ void ModMain::RemoveRemotePeer(uint64_t accountToken, const char* reason, bool a
         m_activeRemotePeerToken = 0;
     if (m_primaryRemotePeerToken == accountToken)
     {
+        m_lastPrimaryRemotePosePacket = {};
+        m_hasLastPrimaryRemotePosePacket = false;
+        m_remotePosePresentationReplayPending = false;
+        m_remotePosePresentationReplayFrames = 0;
         m_primaryRemotePeerToken = m_remotePeers.empty() ? 0 : m_remotePeers.begin()->first;
         if (m_primaryRemotePeerToken != 0)
             ActivateRemotePeerContext(m_primaryRemotePeerToken);
@@ -69689,6 +69794,8 @@ void ModMain::TickReceivePackets(const char* failurePrefix)
             }
             CoopSerialSequence::Observe(packet.sequence, sourcePeer.lastPoseSequence);
             sourcePeer.location = Vec3(packet.px, packet.py, packet.pz);
+            m_lastPrimaryRemotePosePacket = packet;
+            m_hasLastPrimaryRemotePosePacket = true;
 
             ActivateRemotePeerContext(packet.sourceAccountToken);
             const bool remotePlayerProxyDisabled = EnvFlagEnabled("COOP_DISABLE_REMOTE_PLAYER_PROXY");
@@ -81278,6 +81385,116 @@ bool ModMain::ApplyProxyWeaponVisual(
     }
 }
 
+bool ModMain::ApplyAdditionalProxyWeaponVisual(
+    RemotePeerSession& peer,
+    IEntity& entity,
+    bool equipped,
+    uint32_t weaponClass,
+    bool crouched,
+    bool lowCrouched,
+    bool zeroG,
+    const char* reason)
+{
+    const auto clearVisual = [&]()
+    {
+        if (peer.weaponVisualEntityId == entity.GetId() &&
+            peer.weaponVisualSlotIndex >= 0 &&
+            entity.IsSlotValid(peer.weaponVisualSlotIndex))
+        {
+            entity.FreeSlot(peer.weaponVisualSlotIndex);
+        }
+        peer.weaponVisualEntityId = INVALID_ENTITYID;
+        peer.weaponVisualSlotIndex = -1;
+        peer.weaponVisualClass = 0;
+        peer.weaponVisualCrouched = false;
+        peer.weaponVisualLowCrouched = false;
+        peer.weaponVisualZeroG = false;
+        peer.weaponVisualPath.clear();
+    };
+
+    if (m_proxyWeaponVisualDisabled)
+        return false;
+    if (!equipped || weaponClass == 0)
+    {
+        clearVisual();
+        return true;
+    }
+
+    const std::string modelPath = GetProxyWeaponVisualModelPath(weaponClass);
+    if (modelPath.empty())
+    {
+        clearVisual();
+        return false;
+    }
+
+    try
+    {
+        const int characterSlot = FindProxyCharacterSlot(entity);
+        if (characterSlot < 0)
+            return false;
+
+        const uint32_t visualMountClass = GetProxyWeaponVisualMountClass(
+            weaponClass,
+            crouched,
+            lowCrouched,
+            zeroG);
+        const Vec3 visualOffset = GetProxyWeaponVisualOffsetForClass(
+            visualMountClass,
+            m_proxyWeaponVisualOffset,
+            crouched,
+            lowCrouched,
+            zeroG);
+        const Ang3 visualAngles = GetProxyWeaponVisualAnglesForClass(
+            visualMountClass,
+            m_proxyWeaponVisualAngles);
+        const Matrix34 localTm = Matrix34::Create(
+            Vec3(m_proxyWeaponVisualScale, m_proxyWeaponVisualScale, m_proxyWeaponVisualScale),
+            Quat::CreateRotationXYZ(visualAngles),
+            visualOffset);
+
+        if (peer.weaponVisualEntityId == entity.GetId() &&
+            peer.weaponVisualSlotIndex >= 0 &&
+            entity.IsSlotValid(peer.weaponVisualSlotIndex) &&
+            peer.weaponVisualClass == weaponClass &&
+            peer.weaponVisualPath == modelPath &&
+            peer.weaponVisualCrouched == crouched &&
+            peer.weaponVisualLowCrouched == lowCrouched &&
+            peer.weaponVisualZeroG == zeroG)
+        {
+            entity.SetSlotLocalTM(peer.weaponVisualSlotIndex, localTm, ENTITY_XFORM_NO_EVENT);
+            return true;
+        }
+
+        clearVisual();
+        const int slot = entity.LoadGeometry(-1, modelPath.c_str(), nullptr, IEntity::EF_NO_STREAMING);
+        if (slot < 0)
+            return false;
+
+        entity.SetSlotFlags(slot, ENTITY_SLOT_RENDER | ENTITY_SLOT_IGNORE_PHYSICS | ENTITY_SLOT_HIDDEN_IN_PROBES);
+        entity.SetSlotLocalTM(slot, localTm, ENTITY_XFORM_NO_EVENT);
+        entity.SetParentSlot(characterSlot, slot);
+        peer.weaponVisualEntityId = entity.GetId();
+        peer.weaponVisualSlotIndex = slot;
+        peer.weaponVisualClass = weaponClass;
+        peer.weaponVisualCrouched = crouched;
+        peer.weaponVisualLowCrouched = lowCrouched;
+        peer.weaponVisualZeroG = zeroG;
+        peer.weaponVisualPath = modelPath;
+        ++m_proxyWeaponVisualApplies;
+        m_lastProxyWeaponVisualEvent =
+            "additional_weapon_visual_apply peer=" + std::to_string(peer.accountToken) +
+            " class=" + std::to_string(weaponClass) +
+            " reason=" + StatusToken(reason && reason[0] ? std::string(reason) : std::string("-"));
+        return true;
+    }
+    catch (...)
+    {
+        clearVisual();
+        ++m_proxyWeaponVisualFailures;
+        return false;
+    }
+}
+
 bool ModMain::DebugProxyWeaponVisualCommand(const std::vector<std::string>& args, std::string& detail)
 {
     IEntity* proxyEntity = GetProxyEntity();
@@ -83610,7 +83827,9 @@ IEntity* ModMain::SpawnProxyOnly(const Vec3& position, const Quat& rotation)
     return entity;
 }
 
-void ModMain::ApplyRemotePoseToProxy(const CoopProtocol::PlayerPosePacket& packet)
+void ModMain::ApplyRemotePoseToProxy(
+    const CoopProtocol::PlayerPosePacket& packet,
+    bool presentationReplay)
 {
     if (EnvFlagEnabled("COOP_DISABLE_REMOTE_PLAYER_PROXY"))
     {
@@ -83638,7 +83857,7 @@ void ModMain::ApplyRemotePoseToProxy(const CoopProtocol::PlayerPosePacket& packe
     if (!smoothingPeer)
         return;
     bool hardSnap = false;
-    if (!UpdateRemotePeerPoseTarget(*smoothingPeer, packet, false, &hardSnap))
+    if (!presentationReplay && !UpdateRemotePeerPoseTarget(*smoothingPeer, packet, false, &hardSnap))
         return;
 
     bool spawnedProxyForPose = false;
@@ -83743,12 +83962,13 @@ void ModMain::ApplyRemotePoseToProxy(const CoopProtocol::PlayerPosePacket& packe
     const bool remoteSwitchSignal = (packet.flags & CoopProtocol::kPlayerPoseActionSwitch) != 0;
     const bool remotePsiSignal = (packet.flags & CoopProtocol::kPlayerPoseActionPsi) != 0;
     const bool remotePsiImpactSignal = (packet.flags & CoopProtocol::kPlayerPoseActionPsiImpact) != 0;
-    const bool remoteFire = remoteFireSignal && packet.fireSerial != 0 && packet.fireSerial != m_lastRemotePoseFireSerial;
-    const bool remoteReload = remoteReloadSignal && packet.reloadSerial != 0 && packet.reloadSerial != m_lastRemotePoseReloadSerial;
-    const bool remoteMelee = remoteMeleeSignal && packet.meleeSerial != 0 && packet.meleeSerial != m_lastRemotePoseMeleeSerial;
-    const bool remoteSwitch = remoteSwitchSignal && packet.switchSerial != 0 && packet.switchSerial != m_lastRemotePoseSwitchSerial;
-    const bool remotePsi = remotePsiSignal && packet.psiSerial != 0 && packet.psiSerial != m_lastRemotePosePsiSerial;
+    const bool remoteFire = !presentationReplay && remoteFireSignal && packet.fireSerial != 0 && packet.fireSerial != m_lastRemotePoseFireSerial;
+    const bool remoteReload = !presentationReplay && remoteReloadSignal && packet.reloadSerial != 0 && packet.reloadSerial != m_lastRemotePoseReloadSerial;
+    const bool remoteMelee = !presentationReplay && remoteMeleeSignal && packet.meleeSerial != 0 && packet.meleeSerial != m_lastRemotePoseMeleeSerial;
+    const bool remoteSwitch = !presentationReplay && remoteSwitchSignal && packet.switchSerial != 0 && packet.switchSerial != m_lastRemotePoseSwitchSerial;
+    const bool remotePsi = !presentationReplay && remotePsiSignal && packet.psiSerial != 0 && packet.psiSerial != m_lastRemotePosePsiSerial;
     const bool remotePsiImpact =
+        !presentationReplay &&
         remotePsiImpactSignal &&
         packet.psiImpactSerial != 0 &&
         packet.psiImpactSerial != m_lastRemotePosePsiImpactSerial;
@@ -83827,6 +84047,10 @@ void ModMain::ApplyRemotePoseToProxy(const CoopProtocol::PlayerPosePacket& packe
     if (spawnedProxyForPose && !EnvFlagEnabled("COOP_DISABLE_PROXY_FIRST_POSE_VISUAL_DEFER"))
     {
         TraceProxyLifecycle("remote pose first spawned frame deferred visuals");
+        // The initial frame is intentionally Ark-safe, but its persistent pose
+        // must be replayed next frame even when the sender is otherwise idle.
+        m_remotePosePresentationReplayPending = true;
+        m_remotePosePresentationReplayFrames = 1;
         return;
     }
     if (remoteMimicActive != m_remotePoseMimicActive)

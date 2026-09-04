@@ -82,6 +82,23 @@ constexpr uint32_t kDamagePositionFnvPrime = 16777619u;
 constexpr float kDamagePositionQuantization = 4.0f;
 constexpr float kDamageTimeBucketSeconds = 0.5f;
 
+Quat MakeUprightTeleportBodyRotation(const Quat& rotation)
+{
+    Vec3 forward = rotation.GetColumn1();
+    forward.z = 0.0f;
+    if (!std::isfinite(forward.GetLengthSquared()) || forward.GetLengthSquared() < 0.000001f)
+        return Quat::CreateIdentity();
+    return Quat::CreateRotationZ(std::atan2(-forward.x, forward.y));
+}
+
+Quat MakeRollFreeViewRotation(const Quat& rotation)
+{
+    const Vec3 forward = rotation.GetColumn1();
+    if (!std::isfinite(forward.GetLengthSquared()) || forward.GetLengthSquared() < 0.000001f)
+        return Quat::CreateIdentity();
+    return Quat::CreateRotationVDir(forward.GetNormalized());
+}
+
 void LogCoop(std::string_view msg)
 {
     CoopRuntimeLog::Write(msg);
@@ -2393,10 +2410,26 @@ bool ModMain::TeleportLocalPlayer(const Vec3& position, const Quat& rotation)
     if (!playerEntity)
         return false;
 
-    playerEntity->SetPosRotScale(position, rotation, playerEntity->GetScale(), 0);
+    ArkPlayer& player = ArkPlayer::GetInstance();
+    bool zeroG = false;
+    TryGuardedCall("teleport local player IsZeroG", [&player]() { return player.IsZeroG(); }, zeroG, nullptr);
+    const Quat appliedRotation = zeroG ? rotation : MakeUprightTeleportBodyRotation(rotation);
+    playerEntity->SetPosRotScale(position, appliedRotation, playerEntity->GetScale(), 0);
+    SetLocalPlayerViewRotationAfterTeleport(player.GetViewRotation());
     m_lastLocalPlayerPos = position;
     m_hasLastLocalPlayerPos = true;
     return true;
+}
+
+void ModMain::SetLocalPlayerViewRotationAfterTeleport(const Quat& rotation)
+{
+    if (!ArkPlayer::GetInstancePtr())
+        return;
+
+    ArkPlayer& player = ArkPlayer::GetInstance();
+    bool zeroG = false;
+    TryGuardedCall("teleport view IsZeroG", [&player]() { return player.IsZeroG(); }, zeroG, nullptr);
+    player.SetViewRotation(zeroG ? rotation : MakeRollFreeViewRotation(rotation));
 }
 
 bool ModMain::TeleportLocalPlayerNearRemote(uint32_t reason)
