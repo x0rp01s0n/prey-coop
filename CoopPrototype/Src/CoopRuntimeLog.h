@@ -2,11 +2,18 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <string_view>
 
 namespace CoopRuntimeLog
 {
+// Configure the bounded user-facing snapshot written for bug reports. The
+// path is kept as std::filesystem::path so non-ASCII Windows profiles are not
+// routed through the active code page.
+bool ConfigureFile(const std::filesystem::path& path);
+void Flush();
+void CloseFile();
 void Write(std::string_view message);
 bool WriteRateLimited(
     std::string_view key,
