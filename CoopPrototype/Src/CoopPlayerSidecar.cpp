@@ -4391,6 +4391,16 @@ bool ModMain::TryRestorePendingPlayerSidecarInventory(const char* reason, bool n
             return false;
         }
 
+        // Tear down equipped weapons before deleting their inventory owners.
+        // Reversing this order leaves the Host-save reticle/attachment alive
+        // while the Client inventory is already empty, and later pickups can
+        // never finish the outgoing weapon's unequip transition.
+        if (!ResetLocalPlayerWeaponsForInventoryReplacement("sidecar inventory native clear"))
+        {
+            m_lastPlayerSidecarEvent = "inventory restore waiting: weapon reset failed";
+            return false;
+        }
+
         if (!TryGuardedVoidCall(
                 "coop inventory restore RemoveAllItems",
                 [&]()
@@ -4409,7 +4419,6 @@ bool ModMain::TryRestorePendingPlayerSidecarInventory(const char* reason, bool n
 
         m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
         m_playerSidecarInventoryApplied = 0;
-        ReconcileLocalPlayerWeaponsFromInventory("sidecar inventory native clear", true);
     }
 
     const EntityId playerEntityId = playerEntity->GetId();

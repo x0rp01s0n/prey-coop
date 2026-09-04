@@ -1,4 +1,5 @@
 #include "ModMain.h"
+#include "CoopItemClassification.h"
 #include "CoopSerialSequence.h"
 #include "CoopRuntimeGuards.h"
 
@@ -335,16 +336,22 @@ void ModMain::OnNativeSharedItemPicked(EntityId itemEntityId, EntityId pickerId,
     IEntity* grantedEntity = gEnv && gEnv->pEntitySystem
         ? gEnv->pEntitySystem->GetEntity(itemEntityId)
         : nullptr;
-    if (grantedEntity)
-    {
-        std::string presentationReason;
+    CArkItem* grantedItem = grantedEntity
+        ? CArkItem::GetItemFromEntityId(itemEntityId)
+        : nullptr;
+    std::string presentationReason;
+    const bool isWeapon = CoopItemClassification::IsRealWeaponInventoryItem(grantedItem, presentationReason);
+    if (grantedEntity && !isWeapon)
         SetSharedDropWorldPresentation(*grantedEntity, false, presentationReason);
-    }
 
     // Do not erase the entity binding here. CArkItem::PickUp may keep the world
     // entity alive during its native lerp, and that exact interval previously
     // allowed the same shared stack to be picked up repeatedly. OnRemove retires
     // the binding, or a later Drop replaces it with a fresh shared lifetime.
+    // The tombstone blocks another pickup; do not overwrite the presentation
+    // chosen by native PickUp. In particular, forcing an inventory-owned weapon
+    // invisible/non-physical prevents a later weapon-wheel selection from
+    // completing until the next level load rebuilds the weapon entity.
     if (!gEnv || !gEnv->pEntitySystem || !gEnv->pEntitySystem->GetEntity(itemEntityId))
     {
         m_sharedDropByEntityId.erase(byEntity);
@@ -500,9 +507,12 @@ bool ModMain::RemoveSharedDropLocal(SharedDropRecord& record, bool grantToLocalP
         IEntity* grantedEntity = gEnv && gEnv->pEntitySystem
             ? gEnv->pEntitySystem->GetEntity(entityId)
             : nullptr;
+        const bool isWeapon = CoopItemClassification::IsRealWeaponInventoryItem(item, reason);
         bool presentationHidden = !grantedEntity;
-        if (grantedEntity)
+        if (grantedEntity && !isWeapon)
             presentationHidden = SetSharedDropWorldPresentation(*grantedEntity, false, reason);
+        else if (grantedEntity)
+            presentationHidden = grantedEntity->IsHidden();
         else
         {
             m_sharedDropByEntityId.erase(entityId);
