@@ -5460,7 +5460,7 @@ std::string BuildCoopClientTempSavePath(const std::string& saveKey, const std::s
     std::snprintf(
         fileName,
         sizeof(fileName),
-        "PreyCoopClientSave_%s_%s_%s_r%d_%s.sav",
+        "PreyCoopClientSave_%s_%s_%s_r%d_%s",
         key.c_str(),
         Hex32(originalPathHash).c_str(),
         slot.c_str(),
