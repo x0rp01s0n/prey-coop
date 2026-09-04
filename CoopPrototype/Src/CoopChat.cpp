@@ -86,7 +86,7 @@ bool CoopChat::HandleNativeWindowMessage(unsigned message, uint64_t wParam, int6
     const bool keyDown = message == WM_KEYDOWN || message == WM_SYSKEYDOWN;
     const bool keyUp = message == WM_KEYUP || message == WM_SYSKEYUP;
     const uint32_t key = static_cast<uint32_t>(wParam & 0xffffu);
-    const bool chatOpenKey = key == 'Y' || key == VK_OEM_5 || key == VK_OEM_PLUS;
+    const bool chatOpenKey = key == VK_OEM_5;
 
     // The opening key is also delivered as WM_CHAR by the native window.
     // Consume that character so it cannot leak into the first chat line.
