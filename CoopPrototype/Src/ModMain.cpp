@@ -257,6 +257,119 @@ using CoopRuntimeGuards::TryGuardedVoidCall;
 using CoopRuntimeGuards::TryReadRuntimeValue;
 using CoopRuntimeGuards::TryWriteRuntimeValue;
 
+// PreyDll 0x1534F40 is a native queue handoff which can be called while its
+// slot is being retired. Keep the guard allocation-free: the invalid path
+// only records bounded counters and leaves cleanup to the queue.
+constexpr std::uintptr_t kCoopNative1534F40Rva = 0x1534F40u;
+constexpr uint32_t kCoopNative1534F40Timestamp = 0x611DB4BCu;
+constexpr uint32_t kCoopNative1534F40ImageSize = 0x2E10000u;
+constexpr std::size_t kCoopNative1534F40OwnerLoadOffset = 0x77u;
+constexpr std::size_t kCoopNative1534F40FaultOffset = 0x9Du;
+constexpr std::array<uint8_t, 8> kCoopNative1534F40EntryBytes = {
+    0x40, 0x53, 0x48, 0x83, 0xEC, 0x20, 0xC7, 0x41};
+constexpr std::array<uint8_t, 3> kCoopNative1534F40OwnerLoadBytes = {
+    0x48, 0x8B, 0x19};
+constexpr std::array<uint8_t, 3> kCoopNative1534F40FaultBytes = {
+    0x8B, 0x4B, 0x14};
+
+std::atomic<bool> g_coopNative1534F40BuildAccepted{false};
+std::atomic<uint32_t> g_coopNative1534F40Calls{0};
+std::atomic<uint32_t> g_coopNative1534F40OwnerReadFailures{0};
+std::atomic<uint32_t> g_coopNative1534F40NullOwners{0};
+
+void IncrementBoundedNative1534F40Counter(std::atomic<uint32_t>& counter)
+{
+    uint32_t current = counter.load(std::memory_order_relaxed);
+    while (current != std::numeric_limits<uint32_t>::max() &&
+        !counter.compare_exchange_weak(
+            current,
+            current + 1,
+            std::memory_order_relaxed,
+            std::memory_order_relaxed))
+    {
+    }
+}
+
+bool IsExpectedCoopNative1534F40Build()
+{
+    HMODULE preyDll = GetModuleHandleA("PreyDll.dll");
+    if (!preyDll)
+        return false;
+
+    const auto* imageBase = reinterpret_cast<const std::byte*>(preyDll);
+    IMAGE_DOS_HEADER dosHeader{};
+    if (!TryReadRuntimeValue(
+            reinterpret_cast<const IMAGE_DOS_HEADER*>(imageBase),
+            dosHeader) ||
+        dosHeader.e_magic != IMAGE_DOS_SIGNATURE ||
+        dosHeader.e_lfanew <= 0 ||
+        static_cast<uint32_t>(dosHeader.e_lfanew) > 0x100000u)
+    {
+        return false;
+    }
+
+    IMAGE_NT_HEADERS64 ntHeaders{};
+    if (!TryReadRuntimeValue(
+            reinterpret_cast<const IMAGE_NT_HEADERS64*>(imageBase + dosHeader.e_lfanew),
+            ntHeaders) ||
+        ntHeaders.Signature != IMAGE_NT_SIGNATURE ||
+        ntHeaders.FileHeader.TimeDateStamp != kCoopNative1534F40Timestamp ||
+        ntHeaders.OptionalHeader.SizeOfImage != kCoopNative1534F40ImageSize)
+    {
+        return false;
+    }
+
+    std::array<uint8_t, kCoopNative1534F40EntryBytes.size()> entryBytes{};
+    std::array<uint8_t, kCoopNative1534F40OwnerLoadBytes.size()> ownerLoadBytes{};
+    std::array<uint8_t, kCoopNative1534F40FaultBytes.size()> faultBytes{};
+    return TryReadRuntimeValue(
+               reinterpret_cast<const decltype(entryBytes)*>(
+                   imageBase + kCoopNative1534F40Rva),
+               entryBytes) &&
+        TryReadRuntimeValue(
+            reinterpret_cast<const decltype(ownerLoadBytes)*>(
+                imageBase + kCoopNative1534F40Rva + kCoopNative1534F40OwnerLoadOffset),
+            ownerLoadBytes) &&
+        TryReadRuntimeValue(
+            reinterpret_cast<const decltype(faultBytes)*>(
+                imageBase + kCoopNative1534F40Rva + kCoopNative1534F40FaultOffset),
+            faultBytes) &&
+        entryBytes == kCoopNative1534F40EntryBytes &&
+        ownerLoadBytes == kCoopNative1534F40OwnerLoadBytes &&
+        faultBytes == kCoopNative1534F40FaultBytes;
+}
+
+int CoopNative1534F40ReadExceptionFilter(unsigned code)
+{
+    switch (code)
+    {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case EXCEPTION_GUARD_PAGE:
+        return EXCEPTION_EXECUTE_HANDLER;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+}
+
+bool TryReadCoopNative1534F40Owner(const void* slot, void*& owner)
+{
+    owner = nullptr;
+    if (!slot)
+        return false;
+
+    bool readComplete = false;
+    __try
+    {
+        owner = *reinterpret_cast<void* const*>(slot);
+        readComplete = true;
+    }
+    __except (CoopNative1534F40ReadExceptionFilter(GetExceptionCode()))
+    {
+    }
+    return readComplete;
+}
+
 constexpr uint64_t kCoopLobbyMainLiftGuid = 5617616201710343076ULL;
 constexpr uint64_t kCoopLobbyMainLiftKioskGuid = 5360973934226282836ULL;
 constexpr uint64_t kCoopLobbyMainLiftDoorGuid = 5280804956559454273ULL;
@@ -7340,6 +7453,12 @@ std::string ModMain::BuildRuntimeCostReport() const
     out << ",guardCallsNs=" << guardTotals.guardedCallTotalNs
         << ",virtualQueries=" << guardTotals.virtualQueryCalls;
 
+    out << ",native1534f40="
+        << (g_coopNative1534F40BuildAccepted.load(std::memory_order_acquire) ? 1 : 0)
+        << "/" << g_coopNative1534F40Calls.load(std::memory_order_relaxed)
+        << "/" << g_coopNative1534F40OwnerReadFailures.load(std::memory_order_relaxed)
+        << "/" << g_coopNative1534F40NullOwners.load(std::memory_order_relaxed);
+
     const std::string hookStats = CoopHookStats::BuildReport();
     if (!hookStats.empty())
         out << ",hookStats=" << hookStats;
@@ -7813,6 +7932,9 @@ static auto s_hookArkDialogPlayerPlay = ArkDialogPlayer::FPlay.MakeHook();
 static auto s_funcArkVisualPerceptionManagerUpdate =
     PreyFunction<void(ArkVisualPerceptionManager* const, float)>(0x1537460);
 static auto s_hookArkVisualPerceptionManagerUpdate = s_funcArkVisualPerceptionManagerUpdate.MakeHook();
+using CoopNative1534F40Fn = void(void*, const uint32_t*, const void*);
+static PreyFunction<CoopNative1534F40Fn> s_funcCoopNative1534F40(kCoopNative1534F40Rva);
+static auto s_hookCoopNative1534F40 = s_funcCoopNative1534F40.MakeHook();
 static auto s_funcArkVisualPerceptionManagerAcquireAllPerceivableInfo =
     PreyFunction<void(ArkVisualPerceptionManager* const)>(0x15316D0);
 static auto s_hookArkVisualPerceptionManagerAcquireAllPerceivableInfo =
@@ -24323,6 +24445,35 @@ static bool ArkDialogPlayer_Play_Hook(ArkDialogPlayer* dialogPlayer, const SDial
     return s_hookArkDialogPlayerPlay.InvokeOrig(dialogPlayer, params);
 }
 
+static void CoopNative1534F40_Hook(
+    void* slot,
+    const uint32_t* rayId,
+    const void* rayResult)
+{
+    IncrementBoundedNative1534F40Counter(g_coopNative1534F40Calls);
+
+    if (!slot)
+    {
+        IncrementBoundedNative1534F40Counter(g_coopNative1534F40OwnerReadFailures);
+        return;
+    }
+
+    void* owner = nullptr;
+    if (!TryReadCoopNative1534F40Owner(slot, owner))
+    {
+        IncrementBoundedNative1534F40Counter(g_coopNative1534F40OwnerReadFailures);
+        return;
+    }
+
+    if (!owner)
+    {
+        IncrementBoundedNative1534F40Counter(g_coopNative1534F40NullOwners);
+        return;
+    }
+
+    s_hookCoopNative1534F40.InvokeOrig(slot, rayId, rayResult);
+}
+
 static void ArkVisualPerceptionManager_Update_Hook(ArkVisualPerceptionManager* manager, float elapsedTime)
 {
     TracePostLoadNativeHook("ArkVisualPerceptionManager::Update");
@@ -31197,6 +31348,10 @@ void ModMain::InitHooks()
         EnvFlagEnabled("COOP_TRACE_SAVE_LOAD_COMPLETE") ||
         EnvFlagEnabled("COOP_SAVE_ATLAS_TRACE_LOAD_COMPLETE");
     const bool disableFlashHooks = EnvFlagEnabled("COOP_DISABLE_FLASH_HOOKS");
+    const bool native1534F40BuildAccepted = IsExpectedCoopNative1534F40Build();
+    g_coopNative1534F40BuildAccepted.store(
+        native1534F40BuildAccepted,
+        std::memory_order_release);
 
     s_hookCryActionSaveGame.SetHookFunc(&CryAction_SaveGame_Hook);
     s_hookCryActionLoadGame.SetHookFunc(&CryAction_LoadGame_Hook);
@@ -31320,6 +31475,8 @@ void ModMain::InitHooks()
     s_hookArkFocusModeStart.SetHookFunc(&ArkFocusMode_Start_Hook);
     s_hookArkFocusModeStop.SetHookFunc(&ArkFocusMode_Stop_Hook);
     s_hookArkDialogPlayerPlay.SetHookFunc(&ArkDialogPlayer_Play_Hook);
+    if (native1534F40BuildAccepted)
+        s_hookCoopNative1534F40.SetHookFunc(&CoopNative1534F40_Hook);
     s_hookArkVisualPerceptionManagerUpdate.SetHookFunc(&ArkVisualPerceptionManager_Update_Hook);
     s_hookArkVisualPerceptionManagerAcquireAllPerceivableInfo.SetHookFunc(&ArkVisualPerceptionManager_AcquireAllPerceivableInfo_Hook);
     s_hookArkPlayerHitDeathUIOpenDeathScreen.SetHookFunc(&ArkPlayerHitDeathUI_OpenDeathScreen_Hook);
