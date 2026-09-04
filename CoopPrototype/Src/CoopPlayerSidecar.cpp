@@ -4016,7 +4016,7 @@ bool ModMain::ApplyLocalPlayerSidecar(const PlayerSidecarState& state, const cha
     }
 
     if (applyPosition && hasPlayerViewRotation && ShouldApplyPlayerSidecarViewRotation(player, playerViewRotation))
-        player.SetViewRotation(playerViewRotation);
+        SetLocalPlayerViewRotationAfterTeleport(playerViewRotation);
 
     if (applyPosition && useNativePlayerCapture && state.nativeCapture.stance > static_cast<int>(EStance::STANCE_NULL))
         SetLocalPlayerStanceSafe(state.nativeCapture.stance, "apply native player sidecar stance");
