@@ -8036,6 +8036,10 @@ static auto s_hookCArkItemTryGiveInventory = CArkItem::FTryGiveInventory.MakeHoo
 static auto s_hookCArkItemDrop = CArkItem::FDrop.MakeHook();
 static auto s_hookCArkItemClone = CArkItem::FClone.MakeHook();
 static auto s_hookCArkItemPickUp = CArkItem::FPickUp.MakeHook();
+static auto s_hookArkPlayerWeaponComponentEquipWeapon = ArkPlayerWeaponComponent::FEquipWeaponOv0.MakeHook();
+static auto s_hookCArkWeaponOnEquip = CArkWeapon::FOnEquip.MakeHook();
+static thread_local ArkPlayerWeaponComponent* s_activeLocalWeaponEquipComponent = nullptr;
+static thread_local unsigned s_activeLocalWeaponEquipId = INVALID_ENTITYID;
 static auto s_hookArkPlayerCarryThrowCarriedEntity = ArkPlayerCarry::FThrowCarriedEntity.MakeHook();
 static auto s_hookArkPlayerCarryStopCarrying = ArkPlayerCarry::FStopCarrying.MakeHook();
 static auto s_hookArkWeaponUtilsDoHitImpulse1 = ArkWeaponUtils::FDoHitImpulseOv1.MakeHook();
@@ -19440,6 +19444,40 @@ static bool CArkItem_PickUp_Hook(CArkItem* item, const unsigned pickerId, bool s
             gMod->CaptureLocalPlayerPickupRecovery(pickerId, "CArkItem::PickUp");
     }
     return result;
+}
+
+static bool ArkPlayerWeaponComponent_EquipWeapon_Hook(
+    ArkPlayerWeaponComponent* component,
+    unsigned weaponId)
+{
+    ArkPlayerWeaponComponent* previousComponent = s_activeLocalWeaponEquipComponent;
+    const unsigned previousWeaponId = s_activeLocalWeaponEquipId;
+    if (ArkPlayer::GetInstancePtr() && component == &ArkPlayer::GetInstance().m_weaponComponent)
+    {
+        s_activeLocalWeaponEquipComponent = component;
+        s_activeLocalWeaponEquipId = weaponId;
+    }
+    const bool result = s_hookArkPlayerWeaponComponentEquipWeapon.InvokeOrig(component, weaponId);
+    s_activeLocalWeaponEquipComponent = previousComponent;
+    s_activeLocalWeaponEquipId = previousWeaponId;
+    return result;
+}
+
+static void CArkWeapon_OnEquip_Hook(CArkWeapon* weapon)
+{
+    const unsigned weaponId = weapon ? weapon->GetEntityId() : INVALID_ENTITYID;
+    if (weapon && ArkPlayer::GetInstancePtr() &&
+        s_activeLocalWeaponEquipComponent == &ArkPlayer::GetInstance().m_weaponComponent &&
+        s_activeLocalWeaponEquipId == weaponId &&
+        weapon->m_ownerId == INVALID_ENTITYID)
+    {
+        // ArkPlayerWeaponComponent is synchronously equipping this exact item
+        // for the local player, but a network-materialized drop can reach this
+        // callback before PickUp publishes its owner. Restore that native
+        // invariant so Vanilla builds the attachment and weapon actions.
+        weapon->m_ownerId = ArkPlayer::GetInstance().GetEntityId();
+    }
+    s_hookCArkWeaponOnEquip.InvokeOrig(weapon);
 }
 
 static void CArkItem_ResetCount_Hook(CArkItem* item, int count)
@@ -31586,6 +31624,8 @@ void ModMain::InitHooks()
         s_hookCArkItemDrop.SetHookFunc(&CArkItem_Drop_Hook);
         s_hookCArkItemClone.SetHookFunc(&CArkItem_Clone_Hook);
         s_hookCArkItemPickUp.SetHookFunc(&CArkItem_PickUp_Hook);
+        s_hookArkPlayerWeaponComponentEquipWeapon.SetHookFunc(&ArkPlayerWeaponComponent_EquipWeapon_Hook);
+        s_hookCArkWeaponOnEquip.SetHookFunc(&CArkWeapon_OnEquip_Hook);
     }
     s_hookArkPlayerCarryThrowCarriedEntity.SetHookFunc(&ArkPlayerCarry_ThrowCarriedEntity_Hook);
     s_hookArkPlayerCarryStopCarrying.SetHookFunc(&ArkPlayerCarry_StopCarrying_Hook);

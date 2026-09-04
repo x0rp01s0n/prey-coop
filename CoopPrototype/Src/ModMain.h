@@ -713,6 +713,7 @@ public:
     void BeginPlayerSidecarInventoryFeedbackSuppression(const char* reason);
     void EndPlayerSidecarInventoryFeedbackSuppression(const char* reason);
     bool EnsureLocalPlayerWeaponRegistered(unsigned itemId, const char* reason);
+    bool ResetLocalPlayerWeaponsForInventoryReplacement(const char* reason);
     uint32_t ReconcileLocalPlayerWeaponsFromInventory(const char* reason, bool resetWeaponState);
     void OnArkPlayerCarryThrowHook(ArkPlayerCarry* carry, const char* phase, bool result);
     void OnArkPlayerCarryStopHook(EntityId entityId, float impulse, bool applyAngularImpulse, bool thrown, bool fromSerialize);

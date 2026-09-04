@@ -539,6 +539,57 @@ bool ModMain::EnsureLocalPlayerWeaponRegistered(unsigned itemId, const char* rea
     return true;
 }
 
+bool ModMain::ResetLocalPlayerWeaponsForInventoryReplacement(const char* reason)
+{
+    ArkPlayer* player = ArkPlayer::GetInstancePtr();
+    if (!player || !IsLikelyRuntimeCppObject(player, sizeof(ArkPlayer)) || !player->GetEntity())
+        return false;
+
+    std::string guardReason;
+    ArkPlayerWeaponComponent& weaponComponent = player->m_weaponComponent;
+    if (!TryGuardedVoidCall(
+            "coop weapon replacement RemoveWeapons",
+            [&weaponComponent]()
+            {
+                // This must run while the outgoing inventory still owns its
+                // weapon entities. Vanilla can then detach/hide the equipped
+                // weapon and clear its HUD state through the normal callbacks.
+                weaponComponent.RemoveWeapons();
+                weaponComponent.m_weaponTypesAcquired.clear();
+            },
+            &guardReason))
+    {
+        LogCoop(
+            "local weapon replacement reset failed" +
+            (reason && reason[0] ? ": " + std::string(reason) : std::string()) +
+            (guardReason.empty() ? std::string() : " guard=" + StatusToken(guardReason)));
+        return false;
+    }
+
+    ArkQuickSelectComponent& quickSelect = player->m_playerComponent.GetQuickSelectComponent();
+    if (!TryGuardedVoidCall(
+            "coop weapon replacement quickselect reset",
+            [&quickSelect]()
+            {
+                quickSelect.CloseQuickSelect();
+                quickSelect.Reset();
+                quickSelect.RefreshFilterFeedback();
+            },
+            &guardReason))
+    {
+        LogCoop(
+            "local weapon replacement quickselect reset failed" +
+            (reason && reason[0] ? ": " + std::string(reason) : std::string()) +
+            (guardReason.empty() ? std::string() : " guard=" + StatusToken(guardReason)));
+        return false;
+    }
+
+    LogCoop(
+        "local weapon state reset before inventory replacement" +
+        (reason && reason[0] ? ": " + std::string(reason) : std::string()));
+    return true;
+}
+
 uint32_t ModMain::ReconcileLocalPlayerWeaponsFromInventory(const char* reason, bool resetWeaponState)
 {
     ArkPlayer* player = ArkPlayer::GetInstancePtr();
