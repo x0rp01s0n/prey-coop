@@ -3652,6 +3652,7 @@ struct RecoveryStateMetadata
     uint64_t hostAccountToken = 0;
     uint64_t timelineToken = 0;
     uint64_t revision = 0;
+    uint32_t contentChecksum = 0;
     std::string saveKey;
 };
 
@@ -3663,6 +3664,8 @@ bool ReadRecoveryStateMetadata(
     bool hasHash = false;
     std::string reason;
     if (!ValidatePlayerStateIntegrityFile(path, nullptr, &hasHash, &reason) || !hasHash)
+        return false;
+    if (!ComputeFileChecksum(CoopFilesystem::ToUtf8(path), metadata.contentChecksum))
         return false;
 
     std::ifstream input(path, std::ios::binary);
@@ -78480,14 +78483,37 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
                 existingRecovery.accountToken == accountToken &&
                 existingRecovery.hostAccountToken == GetLocalAccountToken() &&
                 existingRecovery.timelineToken == receive.hostTimelineToken &&
-                existingRecovery.saveKey == storedSaveKey &&
-                existingRecovery.revision >= incomingRecovery.revision)
+                existingRecovery.saveKey == storedSaveKey)
             {
-                recoveryAlreadyStored = true;
-                LogCoop(
-                    "idempotent recovery journal upload already stored account=" +
-                    Hex64(accountToken) +
-                    " revision=" + std::to_string(incomingRecovery.revision));
+                if (existingRecovery.revision > incomingRecovery.revision)
+                {
+                    recoveryAlreadyStored = true;
+                    LogCoop(
+                        "stale recovery journal upload already superseded account=" +
+                        Hex64(accountToken) +
+                        " incomingRevision=" + std::to_string(incomingRecovery.revision) +
+                        " storedRevision=" + std::to_string(existingRecovery.revision));
+                }
+                else if (existingRecovery.revision == incomingRecovery.revision)
+                {
+                    if (existingRecovery.contentChecksum == incomingRecovery.contentChecksum)
+                    {
+                        recoveryAlreadyStored = true;
+                        LogCoop(
+                            "idempotent recovery journal upload already stored account=" +
+                            Hex64(accountToken) +
+                            " revision=" + std::to_string(incomingRecovery.revision) +
+                            " checksum=" + Hex32(incomingRecovery.contentChecksum));
+                    }
+                    else
+                    {
+                        failUpload(
+                            "recovery journal revision collision account=" +
+                            Hex64(accountToken) +
+                            " revision=" + std::to_string(incomingRecovery.revision));
+                        return;
+                    }
+                }
             }
         }
 
@@ -78535,8 +78561,9 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
                 return false;
             }
 #else
-            std::filesystem::remove(destination, commitError);
-            commitError.clear();
+            // POSIX rename replaces a regular destination atomically. Do not
+            // unlink it first: a crash or interrupted commit must never leave
+            // the host without the last valid player state.
             std::filesystem::rename(staged, destination, commitError);
             if (commitError)
             {
