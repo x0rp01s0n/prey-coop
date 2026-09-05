@@ -509,6 +509,66 @@ uint64_t GetRecoveryJournalDiskMaxRevision(
     return maxRevision;
 }
 
+std::filesystem::path GetRecoveryJournalRevisionCounterPath(
+    const std::filesystem::path& root,
+    uint64_t accountToken)
+{
+    if (root.empty() || accountToken == 0)
+        return {};
+
+    return root / (
+        "player_recovery_account_" + HexPlayerAccountToken(accountToken) +
+        ".revision_counter");
+}
+
+uint64_t ReadRecoveryJournalRevisionCounter(const std::filesystem::path& path)
+{
+    if (path.empty())
+        return 0;
+
+    std::string payload;
+    bool hasIntegrityHash = false;
+    std::string reason;
+    if (!ReadAndValidatePlayerSidecarFile(
+            CoopFilesystem::ToUtf8(path),
+            payload,
+            hasIntegrityHash,
+            reason) ||
+        !hasIntegrityHash)
+    {
+        return 0;
+    }
+
+    std::istringstream input(payload);
+    input.imbue(std::locale::classic());
+    std::string line;
+    while (std::getline(input, line))
+    {
+        if (!StartsWith(line, "revisionCounter="))
+            continue;
+
+        std::istringstream valueStream(AfterPrefix(line, "revisionCounter="));
+        valueStream.imbue(std::locale::classic());
+        uint64_t revision = 0;
+        valueStream >> revision;
+        if (!valueStream.fail() && revision != 0)
+            return revision;
+    }
+    return 0;
+}
+
+bool WriteRecoveryJournalRevisionCounter(
+    const std::filesystem::path& path,
+    uint64_t revision)
+{
+    if (path.empty() || revision == 0)
+        return false;
+
+    return WritePlayerSidecarPayloadWithHash(
+        path,
+        "revisionCounter=" + std::to_string(revision) + "\n");
+}
+
 bool ShouldApplyPlayerSidecarTransform(const IEntity& entity, const Vec3& position, const Quat& rotation)
 {
     return !Vec3::IsEquivalent(entity.GetWorldPos(), position, kPlayerSidecarPositionApplyEpsilon) ||
@@ -2790,11 +2850,19 @@ bool ModMain::WriteLocalPlayerRecoveryJournal(const char* reason)
         return false;
     }
 
-    // The dirty counter is process-local. Use the highest valid durable
-    // revision for this account (including other save-key files) so a fresh
-    // process cannot reuse an older revision after restart.
+    // Use both the journal scan and a durable per-account counter. The scan
+    // covers older builds, while the counter survives acknowledgement cleanup
+    // (which removes the journal) and therefore prevents a restarted client
+    // from reusing the same revision.
+    const std::filesystem::path playerStateRoot = GetCoopPlayerStateRoot();
+    const std::filesystem::path revisionCounterPath =
+        GetRecoveryJournalRevisionCounterPath(playerStateRoot, accountToken);
     uint64_t durableRevision = GetRecoveryJournalDiskMaxRevision(
-        GetCoopPlayerStateRoot(), accountToken);
+        playerStateRoot,
+        accountToken);
+    durableRevision = std::max(
+        durableRevision,
+        ReadRecoveryJournalRevisionCounter(revisionCounterPath));
     durableRevision = std::max(durableRevision, m_localInventoryJournalRevision);
     if (durableRevision == std::numeric_limits<uint64_t>::max())
     {
@@ -2814,7 +2882,9 @@ bool ModMain::WriteLocalPlayerRecoveryJournal(const char* reason)
     const std::filesystem::path journalPath = CoopFilesystem::FromUtf8(journalPathString);
     std::error_code error;
     std::filesystem::create_directories(journalPath.parent_path(), error);
-    if (error || !WritePlayerSidecarPayloadWithHash(journalPath, payload))
+    if (error ||
+        !WriteRecoveryJournalRevisionCounter(revisionCounterPath, revision) ||
+        !WritePlayerSidecarPayloadWithHash(journalPath, payload))
     {
         LogCoop("player recovery journal write failed saveKey=" + saveKey);
         return false;
