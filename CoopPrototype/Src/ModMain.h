@@ -1394,6 +1394,7 @@ private:
         uint32_t areaJournalTransferChecksum = 0;
         uint32_t areaJournalTransferRunningChecksum = 0;
         uint32_t areaJournalTransferFlags = 0;
+        uint64_t areaJournalTransferHostTimelineToken = 0;
         uint32_t areaSnapshotLeaseEpoch = 0;
         uint32_t areaSnapshotLevelEpoch = 0;
         uint32_t areaJournalTransferAddress = 0;
@@ -1405,6 +1406,7 @@ private:
         uint64_t areaLeaseExpectedReadySnapshotSequence = 0;
         uint64_t areaSnapshotAreaId = 0;
         uint64_t areaSnapshotHostSaveKeyHash = 0;
+        uint64_t areaSnapshotHostTimelineToken = 0;
         uint64_t areaSnapshotSequence = 0;
         float areaLeaseHandoffWaitSeconds = 0.0f;
         std::string areaLeaseLevelName;
@@ -1418,6 +1420,7 @@ private:
         std::string deferredAreaJournalTransferReason;
         uint64_t deferredAreaJournalTransferHostAccountToken = 0;
         uint64_t deferredAreaJournalTransferHostSaveKeyHash = 0;
+        uint64_t deferredAreaJournalTransferHostTimelineToken = 0;
         std::string pendingRemoteAreaHandoffRequestLevel;
         std::string lastAreaJournalTransferEvent = "-";
         float lastPacketTime = -1.0f;
@@ -2182,6 +2185,7 @@ private:
     bool TryApplyReceivedPlayerStateTransfer(const char* reason);
     void SendHostLoadStartingNotice(const char* reason);
     bool BeginAreaJournalTransfer(const char* reason, const std::string& requestedLevelName = {});
+    bool BeginHostAreaJournalBroadcast(const char* reason, const std::string& requestedLevelName = {});
     bool ShouldSuppressHostAreaJournalForRemoteOwnedLevel(const std::string& levelName) const;
     bool ExportAreaJournalTransferFile(const std::string& levelName, uint32_t transferId, std::string& outPath);
     bool QueueDeferredAreaJournalTransfer(const char* reason, const std::string& requestedLevelName);
@@ -2201,8 +2205,9 @@ private:
     bool TryApplyQueuedAreaStateOverlay(const char* reason);
     bool TryRequestPendingRemoteAreaHandoff(const char* reason);
     void ResetAreaJournalTransferState(const char* lastEvent);
-    std::string GetScopedReceivedAreaJournalRoot(uint64_t hostSaveKeyHash = 0) const;
-    std::string GetScopedServerAreaStateRoot(uint64_t hostSaveKeyHash = 0) const;
+    void ResetRemotePeerAreaJournalState(RemotePeerSession& peer);
+    std::string GetScopedReceivedAreaJournalRoot(uint64_t hostSaveKeyHash = 0, uint64_t hostTimelineToken = 0) const;
+    std::string GetScopedServerAreaStateRoot(uint64_t hostSaveKeyHash = 0, uint64_t hostTimelineToken = 0) const;
     std::string GetHostPlayerStatePathForUsername(const std::string& username) const;
     std::string GetHostPlayerStatePathForUsernameAndSave(const std::string& username, const std::string& saveKey) const;
     std::string GetHostPlayerStatePathForAccount(uint64_t accountToken) const;
@@ -3595,6 +3600,7 @@ private:
     uint32_t m_areaJournalTransferSequence = 0;
     uint32_t m_saveTransferId = 0;
     uint32_t m_saveTransferWorldEpoch = 0;
+    uint64_t m_saveTransferHostTimelineToken = 0;
     uint32_t m_playerStateTransferId = 0;
     uint32_t m_areaJournalTransferId = 0;
     uint32_t m_deferredAreaJournalTransferId = 0;
@@ -3618,11 +3624,13 @@ private:
     uint32_t m_areaJournalTransferRunningChecksum = 0;
     uint32_t m_playerStateTransferFlags = 0;
     uint32_t m_areaJournalTransferFlags = 0;
+    uint64_t m_areaJournalTransferHostTimelineToken = 0;
     uint32_t m_areaSnapshotSequenceCounter = 0;
     uint32_t m_areaSnapshotLeaseEpoch = 0;
     uint32_t m_areaSnapshotLevelEpoch = 0;
     uint64_t m_areaSnapshotAreaId = 0;
     uint64_t m_areaSnapshotHostSaveKeyHash = 0;
+    uint64_t m_areaSnapshotHostTimelineToken = 0;
     uint64_t m_areaSnapshotSequence = 0;
     uint32_t m_playerStateTransferAddress = 0;
     uint32_t m_saveTransferAddress = 0;
@@ -4141,11 +4149,13 @@ private:
     std::string m_deferredAreaJournalTransferReason;
     uint64_t m_deferredAreaJournalTransferHostAccountToken = 0;
     uint64_t m_deferredAreaJournalTransferHostSaveKeyHash = 0;
+    uint64_t m_deferredAreaJournalTransferHostTimelineToken = 0;
     std::string m_pendingAreaOverlayApplyLevel;
     std::string m_pendingAreaOverlayApplyPath;
     std::string m_pendingAreaOverlayApplyReason;
     uint64_t m_pendingAreaOverlayHostAccountToken = 0;
     uint64_t m_pendingAreaOverlayHostSaveKeyHash = 0;
+    uint64_t m_pendingAreaOverlayHostTimelineToken = 0;
     std::string m_pendingRemoteAreaHandoffRequestLevel;
     std::string m_clientLocalAreaEnteredByTransitionLevel;
     std::string m_hostPlayerStateSentUsername;
@@ -4636,6 +4646,9 @@ private:
     bool m_areaJournalTransferComplete = false;
     bool m_deferredAreaJournalTransferPending = false;
     bool m_pendingHostPlayerStateSend = false;
+    // Explicit host loads preload each connected peer independently. Keep
+    // the per-peer player-state sends serialized on the shared transfer slot.
+    std::deque<uint64_t> m_pendingHostPlayerStateAccountTokens;
     bool m_pendingClientPlayerStateUpload = false;
     bool m_pendingReceivedPlayerStateApply = false;
     // The client can upload its recovery journal before applying a completed

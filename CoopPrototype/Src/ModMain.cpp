@@ -3417,6 +3417,8 @@ bool IsReliableTransferStartPayload(uint16_t payloadType, const uint8_t* payload
         if (command != CoopProtocol::AreaJournalTransferCommand::Start &&
             command != CoopProtocol::AreaJournalTransferCommand::Request)
             return false;
+        if (packet.hostTimelineToken == 0)
+            return false;
 
         transferId = packet.transferId;
         return transferId != 0;
@@ -3787,16 +3789,83 @@ bool WriteTextFileWithIntegrityHash(const std::filesystem::path& path, const std
     if (!output)
         return false;
 
+#ifdef _WIN32
+    if (MoveFileExW(
+            tempPath.c_str(),
+            path.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        return true;
+    }
+#else
     std::error_code error;
     std::filesystem::rename(tempPath, path, error);
     if (!error)
         return true;
+#endif
 
-    error.clear();
-    std::filesystem::copy_file(tempPath, path, std::filesystem::copy_options::overwrite_existing, error);
     std::error_code removeError;
     std::filesystem::remove(tempPath, removeError);
-    return !error;
+    return false;
+}
+
+bool AtomicCopyRegularFile(
+    const std::filesystem::path& source,
+    const std::filesystem::path& destination)
+{
+    std::error_code error;
+    const std::filesystem::file_status sourceStatus =
+        std::filesystem::symlink_status(source, error);
+    if (error || sourceStatus.type() != std::filesystem::file_type::regular)
+        return false;
+
+    auto isReplaceable = [](const std::filesystem::path& path)
+    {
+        std::error_code statusError;
+        std::filesystem::file_status status =
+            std::filesystem::symlink_status(path, statusError);
+        if (statusError == std::errc::no_such_file_or_directory)
+        {
+            statusError.clear();
+            status = std::filesystem::file_status(std::filesystem::file_type::not_found);
+        }
+        return !statusError &&
+            (status.type() == std::filesystem::file_type::not_found ||
+                status.type() == std::filesystem::file_type::regular);
+    };
+
+    std::filesystem::path staged = destination;
+    staged += ".tmp";
+    if (!isReplaceable(destination) || !isReplaceable(staged))
+        return false;
+
+    error.clear();
+    std::filesystem::copy_file(
+        source,
+        staged,
+        std::filesystem::copy_options::overwrite_existing,
+        error);
+    if (error)
+        return false;
+
+#ifdef _WIN32
+    if (MoveFileExW(
+            staged.c_str(),
+            destination.c_str(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+        return true;
+    }
+#else
+    error.clear();
+    std::filesystem::rename(staged, destination, error);
+    if (!error)
+        return true;
+#endif
+
+    std::error_code cleanupError;
+    std::filesystem::remove(staged, cleanupError);
+    return false;
 }
 
 template<typename T>
@@ -6093,15 +6162,28 @@ std::string BuildCoopTempPlayerStatePath(uint32_t transferId, const std::string&
     return CoopFilesystem::ToUtf8(tempRoot / fileName);
 }
 
-std::string BuildCoopTempAreaJournalPath(uint32_t transferId, const std::string& levelName)
+std::string BuildCoopTempAreaJournalPath(
+    uint32_t transferId,
+    const std::string& levelName,
+    uint64_t hostTimelineToken,
+    uint64_t peerToken,
+    const char* direction)
 {
     std::filesystem::path tempRoot = CoopFilesystem::EnvironmentPath("TEMP");
     if (tempRoot.empty())
         tempRoot = CoopFilesystem::EnvironmentPath("TMP");
 
-    char fileName[192] = {};
+    char fileName[224] = {};
     const std::string safeLevel = SanitizePathComponent(levelName.empty() ? std::string("unknown") : levelName);
-    std::snprintf(fileName, sizeof(fileName), "PreyCoopAreaJournal_%08X_%s.jsonl", transferId, safeLevel.c_str());
+    std::snprintf(
+        fileName,
+        sizeof(fileName),
+        "PreyCoopAreaJournal_%s_%016llX_%016llX_%08X_%s.jsonl",
+        direction && direction[0] ? direction : "temp",
+        static_cast<unsigned long long>(hostTimelineToken),
+        static_cast<unsigned long long>(peerToken),
+        transferId,
+        safeLevel.c_str());
 
     if (tempRoot.empty())
         return std::string(fileName);
@@ -26410,6 +26492,7 @@ void ModMain::EndCoopLoadGuard(const char* reason)
         m_hostManualLoadPreloadTransferStarted = false;
         m_pendingHostPlayerStateSend = false;
         m_pendingHostPlayerStateAccountToken = 0;
+        m_pendingHostPlayerStateAccountTokens.clear();
         m_pendingHostPlayerStateReason.clear();
         m_pendingHostPlayerStateSaveKey.clear();
         m_hostPlayerStatePreloadSent = false;
@@ -26422,6 +26505,9 @@ void ModMain::EndCoopLoadGuard(const char* reason)
             m_currentHostSaveStateKey != "unknown_save")
         {
             BroadcastHostSaveIdentity("manual host load failed; restored previous timeline", true);
+            BeginHostAreaJournalBroadcast(
+                "manual host load failed; refreshed restored timeline",
+                GetCurrentLevelName());
         }
         LogCoop(
             "manual host load failed; restored save timeline saveKey=" +
@@ -26489,6 +26575,7 @@ void ModMain::EndCoopLoadGuard(const char* reason)
         m_pendingAreaOverlayApplyReason.clear();
         m_pendingAreaOverlayHostAccountToken = 0;
         m_pendingAreaOverlayHostSaveKeyHash = 0;
+        m_pendingAreaOverlayHostTimelineToken = 0;
         m_pendingAreaOverlayApplyDelaySeconds = 0.0f;
     }
     if (!m_reliableSendQueue.empty())
@@ -30123,6 +30210,7 @@ void ModMain::OnCryActionLoadGameFinished(const char* path, int result)
             m_saveTransferStarted = false;
             m_saveTransferComplete = false;
             m_hostManualLoadPreloadTransferStarted = false;
+            m_pendingHostPlayerStateAccountTokens.clear();
         }
         EndCoopLoadGuard("LoadGame failed");
     }
@@ -34101,7 +34189,10 @@ void ModMain::OnArkSaveLoadSaveCurrentLevelState(ArkSaveLoadSystem* saveLoadSyst
         }
         else
         {
-            BeginAreaJournalTransfer("native area save", levelName);
+            if (m_networkMode == CoopNetworkMode::Host)
+                BeginHostAreaJournalBroadcast("native area save", levelName);
+            else
+                BeginAreaJournalTransfer("native area save", levelName);
         }
     }
 }
@@ -51950,6 +52041,7 @@ void ModMain::ResetSaveTransferState(const char* lastEvent)
     m_saveTransferSequence = 0;
     m_saveTransferId = 0;
     m_saveTransferWorldEpoch = 0;
+    m_saveTransferHostTimelineToken = 0;
     m_saveTransferTotalBytes = 0;
     m_saveTransferChunkCount = 0;
     m_saveTransferNextChunk = 0;
@@ -52020,6 +52112,7 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent, bool resetHos
     m_playerStateTransferAddress = 0;
     m_playerStateTransferPort = 0;
     m_pendingHostPlayerStateAccountToken = 0;
+    m_pendingHostPlayerStateAccountTokens.clear();
     m_sentPlayerStateTransferPackets = 0;
     m_receivedPlayerStateTransferPackets = 0;
     m_hostPlayerStateUploadRequests = 0;
@@ -52144,11 +52237,13 @@ void ModMain::ResetAreaJournalTransferState(const char* lastEvent)
     m_areaJournalTransferChecksum = 0;
     m_areaJournalTransferRunningChecksum = kFnv1aOffsetBasis;
     m_areaJournalTransferFlags = 0;
+    m_areaJournalTransferHostTimelineToken = 0;
     m_areaSnapshotSequenceCounter = 0;
     m_areaSnapshotLeaseEpoch = 0;
     m_areaSnapshotLevelEpoch = 0;
     m_areaSnapshotAreaId = 0;
     m_areaSnapshotHostSaveKeyHash = 0;
+    m_areaSnapshotHostTimelineToken = 0;
     m_areaSnapshotSequence = 0;
     m_areaJournalTransferAddress = 0;
     m_areaJournalTransferPort = 0;
@@ -52166,12 +52261,14 @@ void ModMain::ResetAreaJournalTransferState(const char* lastEvent)
     m_deferredAreaJournalTransferReason.clear();
     m_deferredAreaJournalTransferHostAccountToken = 0;
     m_deferredAreaJournalTransferHostSaveKeyHash = 0;
+    m_deferredAreaJournalTransferHostTimelineToken = 0;
     m_pendingAreaOverlayApply = false;
     m_pendingAreaOverlayApplyLevel.clear();
     m_pendingAreaOverlayApplyPath.clear();
     m_pendingAreaOverlayApplyReason.clear();
     m_pendingAreaOverlayHostAccountToken = 0;
     m_pendingAreaOverlayHostSaveKeyHash = 0;
+    m_pendingAreaOverlayHostTimelineToken = 0;
     m_pendingAreaOverlayApplyDelaySeconds = 0.0f;
     m_pendingRemoteAreaHandoffRequestLevel.clear();
     m_areaJournalTransferSending = false;
@@ -52179,6 +52276,56 @@ void ModMain::ResetAreaJournalTransferState(const char* lastEvent)
     m_areaJournalTransferStarted = false;
     m_areaJournalTransferComplete = false;
     m_lastAreaJournalTransferEvent = lastEvent ? lastEvent : "-";
+}
+
+void ModMain::ResetRemotePeerAreaJournalState(RemotePeerSession& peer)
+{
+    for (const std::string* path : {
+            &peer.areaJournalTransferSourcePath,
+            &peer.areaJournalTransferReceivePath,
+            &peer.deferredAreaJournalTransferSourcePath})
+    {
+        if (!path->empty())
+        {
+            std::error_code error;
+            std::filesystem::remove(CoopFilesystem::FromUtf8(*path), error);
+        }
+    }
+
+    peer.areaJournalTransferId = 0;
+    peer.deferredAreaJournalTransferId = 0;
+    peer.areaJournalTransferTotalBytes = 0;
+    peer.areaJournalTransferChunkCount = 0;
+    peer.areaJournalTransferNextChunk = 0;
+    peer.areaJournalTransferReceivedChunks = 0;
+    peer.areaJournalTransferChecksum = 0;
+    peer.areaJournalTransferRunningChecksum = kFnv1aOffsetBasis;
+    peer.areaJournalTransferFlags = 0;
+    peer.areaJournalTransferHostTimelineToken = 0;
+    peer.areaSnapshotLeaseEpoch = 0;
+    peer.areaSnapshotLevelEpoch = 0;
+    peer.areaSnapshotAreaId = 0;
+    peer.areaSnapshotHostSaveKeyHash = 0;
+    peer.areaSnapshotHostTimelineToken = 0;
+    peer.areaSnapshotSequence = 0;
+    peer.areaJournalTransferAddress = 0;
+    peer.areaJournalTransferPort = 0;
+    peer.areaJournalTransferSourcePath.clear();
+    peer.areaJournalTransferReceivePath.clear();
+    peer.areaJournalTransferUsername.clear();
+    peer.areaJournalTransferLevel.clear();
+    peer.deferredAreaJournalTransferSourcePath.clear();
+    peer.deferredAreaJournalTransferLevel.clear();
+    peer.deferredAreaJournalTransferReason.clear();
+    peer.deferredAreaJournalTransferHostAccountToken = 0;
+    peer.deferredAreaJournalTransferHostSaveKeyHash = 0;
+    peer.deferredAreaJournalTransferHostTimelineToken = 0;
+    peer.pendingRemoteAreaHandoffRequestLevel.clear();
+    peer.areaJournalTransferSending = false;
+    peer.areaJournalTransferReceiving = false;
+    peer.areaJournalTransferStarted = false;
+    peer.areaJournalTransferComplete = false;
+    peer.deferredAreaJournalTransferPending = false;
 }
 
 void ModMain::ResetStoryEventState(const char* lastEvent)
@@ -52308,6 +52455,7 @@ void ModMain::ResetAreaObjectEventState(const char* lastEvent)
     m_pendingAreaOverlayApplyReason.clear();
     m_pendingAreaOverlayHostAccountToken = 0;
     m_pendingAreaOverlayHostSaveKeyHash = 0;
+    m_pendingAreaOverlayHostTimelineToken = 0;
     m_pendingAreaOverlayApplyDelaySeconds = 0.0f;
     m_remoteAreaObjectEchoSuppressSeconds = 0.0f;
     m_localAreaObjectCommandMutationDepth = 0;
@@ -58276,6 +58424,14 @@ bool ModMain::BuildWorldSyncPacket(CoopProtocol::WorldSyncPacket& packet, CoopPr
 
 bool ModMain::BuildSaveTransferPacket(CoopProtocol::SaveTransferPacket& packet, CoopProtocol::SaveTransferCommand command, uint32_t transferId)
 {
+    if (m_saveTransferHostTimelineToken == 0 ||
+        m_sessionHostTimelineToken == 0 ||
+        m_saveTransferHostTimelineToken != m_sessionHostTimelineToken)
+    {
+        m_lastSaveTransferEvent = "save transfer packet rejected: wrong host timeline";
+        return false;
+    }
+
     packet.magic = CoopProtocol::kPacketMagic;
     packet.version = CoopProtocol::kProtocolVersion;
     packet.type = static_cast<uint16_t>(CoopProtocol::PacketType::SaveTransfer);
@@ -58283,6 +58439,7 @@ bool ModMain::BuildSaveTransferPacket(CoopProtocol::SaveTransferPacket& packet, 
     packet.command = static_cast<uint32_t>(command);
     packet.transferId = transferId;
     packet.worldEpoch = m_saveTransferWorldEpoch != 0 ? m_saveTransferWorldEpoch : m_localWorldEpoch;
+    packet.hostTimelineToken = m_saveTransferHostTimelineToken;
     packet.totalBytes = m_saveTransferTotalBytes;
     packet.chunkCount = m_saveTransferChunkCount;
     packet.checksum = m_saveTransferChecksum;
@@ -58327,7 +58484,10 @@ bool ModMain::BuildAreaJournalTransferPacket(CoopProtocol::AreaJournalTransferPa
     packet.areaLevelEpoch = m_areaSnapshotLevelEpoch;
     packet.areaId = m_areaSnapshotAreaId;
     packet.hostSaveKeyHash = m_areaSnapshotHostSaveKeyHash;
+    packet.hostTimelineToken = m_areaJournalTransferHostTimelineToken;
     packet.snapshotSequence = m_areaSnapshotSequence;
+    if (packet.hostTimelineToken == 0)
+        return false;
     CopyFixedString(packet.username, sizeof(packet.username), GetLocalUsername());
     CopyFixedString(packet.levelName, sizeof(packet.levelName), m_areaJournalTransferLevel.empty() ? m_localLevelName : m_areaJournalTransferLevel);
     return true;
@@ -58351,7 +58511,7 @@ uint64_t ModMain::CurrentHostSaveKeyHash() const
     return 0;
 }
 
-std::string ModMain::GetScopedReceivedAreaJournalRoot(uint64_t hostSaveKeyHash) const
+std::string ModMain::GetScopedReceivedAreaJournalRoot(uint64_t hostSaveKeyHash, uint64_t hostTimelineToken) const
 {
     const uint64_t hostAccountToken = GetSessionHostAccountToken();
     if (hostSaveKeyHash == 0 &&
@@ -58360,15 +58520,18 @@ std::string ModMain::GetScopedReceivedAreaJournalRoot(uint64_t hostSaveKeyHash) 
     {
         hostSaveKeyHash = HashStoryString(m_currentHostSaveStateKey);
     }
+    if (hostTimelineToken == 0)
+        hostTimelineToken = m_sessionHostTimelineToken;
     const std::filesystem::path root = GetCoopReceivedAreaJournalRoot();
-    if (root.empty() || hostAccountToken == 0 || hostSaveKeyHash == 0)
+    if (root.empty() || hostAccountToken == 0 || hostSaveKeyHash == 0 || hostTimelineToken == 0)
         return {};
     return CoopFilesystem::ToUtf8(
         root / ("host_" + Hex64(hostAccountToken)) /
+        ("timeline_" + Hex64(hostTimelineToken)) /
         ("save_" + Hex64(hostSaveKeyHash)));
 }
 
-std::string ModMain::GetScopedServerAreaStateRoot(uint64_t hostSaveKeyHash) const
+std::string ModMain::GetScopedServerAreaStateRoot(uint64_t hostSaveKeyHash, uint64_t hostTimelineToken) const
 {
     const uint64_t hostAccountToken = GetSessionHostAccountToken();
     if (hostSaveKeyHash == 0 &&
@@ -58377,11 +58540,14 @@ std::string ModMain::GetScopedServerAreaStateRoot(uint64_t hostSaveKeyHash) cons
     {
         hostSaveKeyHash = HashStoryString(m_currentHostSaveStateKey);
     }
+    if (hostTimelineToken == 0)
+        hostTimelineToken = m_sessionHostTimelineToken;
     const std::filesystem::path root = GetCoopServerAreaStateRoot();
-    if (root.empty() || hostAccountToken == 0 || hostSaveKeyHash == 0)
+    if (root.empty() || hostAccountToken == 0 || hostSaveKeyHash == 0 || hostTimelineToken == 0)
         return {};
     return CoopFilesystem::ToUtf8(
         root / ("host_" + Hex64(hostAccountToken)) /
+        ("timeline_" + Hex64(hostTimelineToken)) /
         ("save_" + Hex64(hostSaveKeyHash)));
 }
 
@@ -58406,6 +58572,11 @@ void ModMain::SetCurrentHostSaveStateKey(const std::string& saveKey, bool retain
         // manual load must not re-export the previous timeline under the new
         // save key before the incoming save has finished loading.
         ResetAreaJournalTransferState("host save identity changed");
+        if (m_networkMode == CoopNetworkMode::Host)
+        {
+            for (auto& entry : m_remotePeers)
+                ResetRemotePeerAreaJournalState(entry.second);
+        }
         ResetStoryEventState("host save identity changed");
         ResetAreaObjectEventState("host save identity changed");
     }
@@ -58996,6 +59167,50 @@ bool ModMain::SendWorldSyncTo(const CoopProtocol::WorldSyncPacket& packet, uint3
 
 bool ModMain::SendSaveTransferTo(const CoopProtocol::SaveTransferPacket& packet, uint32_t address, uint16_t port, const char* failurePrefix)
 {
+    if (packet.hostTimelineToken == 0 ||
+        m_sessionHostTimelineToken == 0 ||
+        packet.hostTimelineToken != m_sessionHostTimelineToken)
+    {
+        m_lastSaveTransferEvent = "save transfer send rejected: wrong host timeline";
+        return false;
+    }
+
+    // A host save package is immutable for the load epoch. Queue the same
+    // ordered packet independently for every connected endpoint; the
+    // reliable transport assigns each endpoint its own envelope sequence and
+    // ACK frontier. The flattened remote fields otherwise address only the
+    // active peer.
+    const bool broadcastHostLoad =
+        m_networkMode == CoopNetworkMode::Host &&
+        (m_pendingHostSaveLoadBroadcastAfterLoad ||
+            m_hostManualLoadPreloadTransferStarted);
+    if (broadcastHostLoad && !m_remotePeers.empty())
+    {
+        bool sentAny = false;
+        bool allSent = true;
+        for (const auto& entry : m_remotePeers)
+        {
+            const RemotePeerSession& peer = entry.second;
+            if (peer.address == 0 || peer.port == 0)
+                continue;
+
+            const bool sent = QueueReliablePayloadToEndpoint(
+                static_cast<uint16_t>(CoopProtocol::PacketType::SaveTransfer),
+                &packet,
+                sizeof(packet),
+                peer.address,
+                peer.port,
+                GetLocalAccountToken(),
+                failurePrefix);
+            sentAny = sentAny || sent;
+            allSent = allSent && sent;
+            if (sent)
+                ++m_sentSaveTransferPackets;
+        }
+
+        return sentAny && allSent;
+    }
+
     if (!SendReliablePayloadTo(static_cast<uint16_t>(CoopProtocol::PacketType::SaveTransfer), &packet, sizeof(packet), address, port, failurePrefix))
         return false;
 
@@ -59014,6 +59229,13 @@ bool ModMain::SendPlayerStateTransferTo(const CoopProtocol::PlayerStateTransferP
 
 bool ModMain::SendAreaJournalTransferTo(const CoopProtocol::AreaJournalTransferPacket& packet, uint32_t address, uint16_t port, const char* failurePrefix)
 {
+    if (packet.hostTimelineToken == 0 ||
+        m_sessionHostTimelineToken == 0 ||
+        packet.hostTimelineToken != m_sessionHostTimelineToken)
+    {
+        m_lastAreaJournalTransferEvent = "area journal send rejected: wrong host timeline";
+        return false;
+    }
     if (!SendReliablePayloadTo(static_cast<uint16_t>(CoopProtocol::PacketType::AreaJournalTransfer), &packet, sizeof(packet), address, port, failurePrefix))
         return false;
 
@@ -67679,12 +67901,21 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
             newTransfer =
                 reliableStartTransferId != m_saveTransferId ||
                 startPacket.worldEpoch != m_saveTransferWorldEpoch ||
+                startPacket.hostTimelineToken != m_saveTransferHostTimelineToken ||
                 !m_saveTransferReceiving;
         }
         else if (packet.payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::PlayerStateTransfer))
             newTransfer = reliableStartTransferId != m_playerStateTransferId || !m_playerStateTransferReceiving;
         else if (packet.payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::AreaJournalTransfer))
-            newTransfer = reliableStartTransferId != m_areaJournalTransferId || !m_areaJournalTransferReceiving;
+        {
+            CoopProtocol::AreaJournalTransferPacket startPacket = {};
+            if (packet.payloadSize == sizeof(startPacket))
+                std::memcpy(&startPacket, packet.payload, sizeof(startPacket));
+            newTransfer =
+                reliableStartTransferId != m_areaJournalTransferId ||
+                startPacket.hostTimelineToken != m_areaJournalTransferHostTimelineToken ||
+                !m_areaJournalTransferReceiving;
+        }
 
         if (newTransfer)
         {
@@ -68280,10 +68511,12 @@ void ModMain::StoreActiveRemotePeerContext()
         peer.areaJournalTransferChecksum = m_areaJournalTransferChecksum;
         peer.areaJournalTransferRunningChecksum = m_areaJournalTransferRunningChecksum;
         peer.areaJournalTransferFlags = m_areaJournalTransferFlags;
+        peer.areaJournalTransferHostTimelineToken = m_areaJournalTransferHostTimelineToken;
         peer.areaSnapshotLeaseEpoch = m_areaSnapshotLeaseEpoch;
         peer.areaSnapshotLevelEpoch = m_areaSnapshotLevelEpoch;
         peer.areaSnapshotAreaId = m_areaSnapshotAreaId;
         peer.areaSnapshotHostSaveKeyHash = m_areaSnapshotHostSaveKeyHash;
+        peer.areaSnapshotHostTimelineToken = m_areaSnapshotHostTimelineToken;
         peer.areaSnapshotSequence = m_areaSnapshotSequence;
         peer.areaJournalTransferAddress = m_areaJournalTransferAddress;
         peer.areaJournalTransferPort = m_areaJournalTransferPort;
@@ -68296,6 +68529,7 @@ void ModMain::StoreActiveRemotePeerContext()
         peer.deferredAreaJournalTransferReason = m_deferredAreaJournalTransferReason;
         peer.deferredAreaJournalTransferHostAccountToken = m_deferredAreaJournalTransferHostAccountToken;
         peer.deferredAreaJournalTransferHostSaveKeyHash = m_deferredAreaJournalTransferHostSaveKeyHash;
+        peer.deferredAreaJournalTransferHostTimelineToken = m_deferredAreaJournalTransferHostTimelineToken;
         peer.pendingRemoteAreaHandoffRequestLevel = m_pendingRemoteAreaHandoffRequestLevel;
         peer.lastAreaJournalTransferEvent = m_lastAreaJournalTransferEvent;
         peer.areaJournalTransferSending = m_areaJournalTransferSending;
@@ -68360,10 +68594,12 @@ bool ModMain::ActivateRemotePeerContext(uint64_t accountToken)
         m_areaJournalTransferChecksum = peer.areaJournalTransferChecksum;
         m_areaJournalTransferRunningChecksum = peer.areaJournalTransferRunningChecksum;
         m_areaJournalTransferFlags = peer.areaJournalTransferFlags;
+        m_areaJournalTransferHostTimelineToken = peer.areaJournalTransferHostTimelineToken;
         m_areaSnapshotLeaseEpoch = peer.areaSnapshotLeaseEpoch;
         m_areaSnapshotLevelEpoch = peer.areaSnapshotLevelEpoch;
         m_areaSnapshotAreaId = peer.areaSnapshotAreaId;
         m_areaSnapshotHostSaveKeyHash = peer.areaSnapshotHostSaveKeyHash;
+        m_areaSnapshotHostTimelineToken = peer.areaSnapshotHostTimelineToken;
         m_areaSnapshotSequence = peer.areaSnapshotSequence;
         m_areaJournalTransferAddress = peer.areaJournalTransferAddress;
         m_areaJournalTransferPort = peer.areaJournalTransferPort;
@@ -68376,6 +68612,7 @@ bool ModMain::ActivateRemotePeerContext(uint64_t accountToken)
         m_deferredAreaJournalTransferReason = peer.deferredAreaJournalTransferReason;
         m_deferredAreaJournalTransferHostAccountToken = peer.deferredAreaJournalTransferHostAccountToken;
         m_deferredAreaJournalTransferHostSaveKeyHash = peer.deferredAreaJournalTransferHostSaveKeyHash;
+        m_deferredAreaJournalTransferHostTimelineToken = peer.deferredAreaJournalTransferHostTimelineToken;
         m_pendingRemoteAreaHandoffRequestLevel = peer.pendingRemoteAreaHandoffRequestLevel;
         m_lastAreaJournalTransferEvent = peer.lastAreaJournalTransferEvent;
         m_areaJournalTransferSending = peer.areaJournalTransferSending;
@@ -69496,14 +69733,31 @@ void ModMain::RemoveRemotePeer(uint64_t accountToken, const char* reason, bool a
     const auto it = m_remotePeers.find(accountToken);
     if (it == m_remotePeers.end())
         return;
+    const bool removedActivePeer = m_activeRemotePeerToken == accountToken;
+    if (m_networkMode == CoopNetworkMode::Host)
+    {
+        if (removedActivePeer)
+            ResetAreaJournalTransferState("active remote peer removed");
+        ResetRemotePeerAreaJournalState(it->second);
+    }
     const RemotePeerSession peer = it->second;
 
     // A host save transfer is shared by the active peer context, but its
     // completion state is still owned by the account it targets. Do not let
     // a completed transfer for a departed peer block that account's next
     // ClientNeedsHostWorld request (or affect another connected peer).
+    const bool anotherPeerCanReceiveHostSave = std::any_of(
+        m_remotePeers.begin(),
+        m_remotePeers.end(),
+        [accountToken](const auto& entry)
+        {
+            return entry.first != accountToken &&
+                entry.second.address != 0 &&
+                entry.second.port != 0;
+        });
     if (m_networkMode == CoopNetworkMode::Host &&
-        m_saveTransferAccountToken == accountToken)
+        m_saveTransferAccountToken == accountToken &&
+        !anotherPeerCanReceiveHostSave)
     {
         ResetSaveTransferState("remote peer removed; save transfer reset");
     }
@@ -69589,7 +69843,7 @@ void ModMain::RemoveRemotePeer(uint64_t accountToken, const char* reason, bool a
         ApplyTurretNativeAiAuthorityPolicy(*entity, "peer removal turret fallback");
         QueueLocalTurretSnapshotEventForEntity(*entity, "peer removal turret fallback");
     }
-    if (m_activeRemotePeerToken == accountToken)
+    if (removedActivePeer)
         m_activeRemotePeerToken = 0;
     if (m_primaryRemotePeerToken == accountToken)
     {
@@ -69600,6 +69854,12 @@ void ModMain::RemoveRemotePeer(uint64_t accountToken, const char* reason, bool a
         m_primaryRemotePeerToken = m_remotePeers.empty() ? 0 : m_remotePeers.begin()->first;
         if (m_primaryRemotePeerToken != 0)
             ActivateRemotePeerContext(m_primaryRemotePeerToken);
+    }
+    else if (removedActivePeer &&
+        m_primaryRemotePeerToken != 0 &&
+        m_remotePeers.find(m_primaryRemotePeerToken) != m_remotePeers.end())
+    {
+        ActivateRemotePeerContext(m_primaryRemotePeerToken);
     }
 
     m_hasRemoteEndpoint = !m_remotePeers.empty();
@@ -73136,6 +73396,15 @@ void ModMain::SendHostWorldOffer(bool loadCommand)
     if (m_networkMode != CoopNetworkMode::Host || m_socket == kInvalidNetworkSocket || !m_hasRemoteEndpoint)
         return;
 
+    // The flattened remote fields are only a compatibility view of the
+    // currently active peer. A host load is a session-wide world transition,
+    // so never address its control packet through that one-peer view.
+    if (m_activeRemotePeerToken == 0 || m_remotePeers.find(m_activeRemotePeerToken) == m_remotePeers.end())
+    {
+        if (!m_remotePeers.empty())
+            ActivateRemotePeerContext(m_remotePeers.begin()->first);
+    }
+
     if (loadCommand && !IsGameReady())
     {
         m_hasPendingHostWorldOffer = true;
@@ -73176,15 +73445,65 @@ void ModMain::SendHostWorldOffer(bool loadCommand)
         return;
     }
 
-    if (SendWorldSyncTo(packet, m_remoteAddress, m_remotePort, "host world sync send failed"))
+    // Only an explicit host save load is a session-wide world transition.
+    // Ordinary join offers remain endpoint-scoped so a late joiner cannot
+    // make already-playing peers reload the same package.
+    const bool broadcastToPeers =
+        m_pendingHostSaveLoadBroadcastAfterLoad ||
+        m_hostManualLoadPreloadTransferStarted;
+    bool sentAny = false;
+    uint32_t sentPeers = 0;
+    if (broadcastToPeers)
     {
-        m_lastWorldSyncEvent = loadCommand ? "sent host load command" : "sent host world offer";
+        for (const auto& entry : m_remotePeers)
+        {
+            const RemotePeerSession& peer = entry.second;
+            if (peer.address == 0 || peer.port == 0)
+                continue;
+
+            if (SendWorldSyncTo(packet, peer.address, peer.port, "host world sync send failed"))
+            {
+                sentAny = true;
+                ++sentPeers;
+            }
+        }
+    }
+    else if (SendWorldSyncTo(packet, m_remoteAddress, m_remotePort, "host world sync send failed"))
+    {
+        sentAny = true;
+        sentPeers = 1;
+    }
+
+    if (!sentAny && m_hasRemoteEndpoint && m_remoteAddress != 0 && m_remotePort != 0)
+        sentAny = SendWorldSyncTo(packet, m_remoteAddress, m_remotePort, "host world sync send failed");
+
+    if (sentAny)
+    {
+        m_lastWorldSyncEvent =
+            std::string(loadCommand ? "sent host load command" : "sent host world offer") +
+            " peers=" + std::to_string(sentPeers != 0 ? sentPeers : 1);
         if (loadCommand)
         {
             m_sessionGameplayReady = false;
             m_remoteSessionFlags &= ~CoopProtocol::kSessionFlagWorldReady;
             m_lastClientWorldReadyReceivedEpoch = 0;
             m_lastClientWorldReadyReceivedLevelId = 0;
+
+            if (broadcastToPeers)
+            {
+                // Each peer has its own world-ready gate. Clearing only the
+                // active compatibility context leaves other clients admitted
+                // while their native load is still in flight.
+                for (auto& entry : m_remotePeers)
+                {
+                    RemotePeerSession& peer = entry.second;
+                    peer.sessionReady = false;
+                    peer.sessionFlags &= ~CoopProtocol::kSessionFlagWorldReady;
+                    peer.lastWorldReadyEpoch = 0;
+                    peer.lastWorldReadyLevelId = 0;
+                }
+            }
+
             if (BeginHostSaveTransfer())
             {
                 m_pendingHostSaveLoadBroadcastAfterLoad = false;
@@ -73423,6 +73742,15 @@ bool ModMain::BeginHostManualLoadPreload(const std::string& savePath)
         return false;
     }
 
+    // Select a real peer before reading the flattened compatibility fields;
+    // the active peer can be cleared after a disconnect while other clients
+    // remain connected.
+    if (m_activeRemotePeerToken == 0 || m_remotePeers.find(m_activeRemotePeerToken) == m_remotePeers.end())
+    {
+        if (!m_remotePeers.empty())
+            ActivateRemotePeerContext(m_remotePeers.begin()->first);
+    }
+
     std::string resolvedPath;
     if (!ResolveReadableSaveFile(savePath, resolvedPath))
         return false;
@@ -73450,10 +73778,31 @@ bool ModMain::BeginHostManualLoadPreload(const std::string& savePath)
     m_hostManualLoadPreloadTransferStarted = true;
     m_sessionGameplayReady = false;
     m_remoteSessionFlags &= ~CoopProtocol::kSessionFlagWorldReady;
+    for (auto& entry : m_remotePeers)
+    {
+        RemotePeerSession& peer = entry.second;
+        peer.sessionReady = false;
+        peer.sessionFlags &= ~CoopProtocol::kSessionFlagWorldReady;
+        peer.lastWorldReadyEpoch = 0;
+        peer.lastWorldReadyLevelId = 0;
+    }
     m_hostPlayerStatePreloadSent = false;
     m_hostPlayerStateSentWorldEpoch = 0;
+    m_pendingHostPlayerStateAccountTokens.clear();
+    for (const auto& entry : m_remotePeers)
+    {
+        if (entry.second.accountToken != 0 &&
+            entry.second.address != 0 &&
+            entry.second.port != 0)
+        {
+            m_pendingHostPlayerStateAccountTokens.push_back(entry.second.accountToken);
+        }
+    }
     m_pendingHostPlayerStateSend = true;
-    m_pendingHostPlayerStateAccountToken = m_saveTransferAccountToken;
+    m_pendingHostPlayerStateAccountToken =
+        m_pendingHostPlayerStateAccountTokens.empty()
+            ? m_saveTransferAccountToken
+            : m_pendingHostPlayerStateAccountTokens.front();
     m_pendingHostPlayerStateReason = "manual host load preload";
     m_pendingHostPlayerStateSaveKey = m_currentHostSaveStateKey;
     m_lastWorldSyncEvent =
@@ -73585,6 +73934,12 @@ bool ModMain::RequestHostSaveTransferSnapshot()
 
 bool ModMain::StartHostSaveTransferFromFile(const std::string& sourcePath, uint32_t transferId)
 {
+    if (m_networkMode != CoopNetworkMode::Host || m_sessionHostTimelineToken == 0)
+    {
+        m_lastSaveTransferEvent = "host save transfer rejected: missing host timeline";
+        return false;
+    }
+
     std::string transferSourcePath;
     std::string packageSummary;
     if (!BuildCoopSavePackageFromSlot(sourcePath, transferId, transferSourcePath, packageSummary))
@@ -73622,6 +73977,7 @@ bool ModMain::StartHostSaveTransferFromFile(const std::string& sourcePath, uint3
     m_saveTransferId = transferId;
     if (m_saveTransferWorldEpoch == 0)
         m_saveTransferWorldEpoch = m_localWorldEpoch;
+    m_saveTransferHostTimelineToken = m_sessionHostTimelineToken;
 
     m_saveTransferSourcePath = transferSourcePath;
     m_saveTransferReceivePath.clear();
@@ -73824,6 +74180,14 @@ bool ModMain::TryLoadReceivedHostSave()
 {
     if (m_networkMode != CoopNetworkMode::Client || m_saveTransferReceivePath.empty())
         return false;
+
+    if (m_saveTransferHostTimelineToken == 0 ||
+        m_sessionHostTimelineToken == 0 ||
+        m_saveTransferHostTimelineToken != m_sessionHostTimelineToken)
+    {
+        m_lastSaveTransferEvent = "refused host save load from stale timeline";
+        return false;
+    }
 
     if (!gEnv || !gEnv->pGame || !gEnv->pGame->GetIGameFramework())
     {
@@ -74175,13 +74539,7 @@ uint32_t ModMain::SnapshotLatestHostPlayerStatesForSave(const std::string& saveK
         }
 
         const std::filesystem::path destPath = destRoot / sourcePath.filename();
-        fileError.clear();
-        std::filesystem::copy_file(
-            sourcePath,
-            destPath,
-            std::filesystem::copy_options::overwrite_existing,
-            fileError);
-        if (fileError)
+        if (!AtomicCopyRegularFile(sourcePath, destPath))
         {
             ++failed;
             continue;
@@ -74320,13 +74678,7 @@ uint32_t ModMain::CarryForwardHostPlayerStatesForSave(
             continue;
         }
 
-        fileError.clear();
-        std::filesystem::copy_file(
-            sourcePath,
-            destPath,
-            std::filesystem::copy_options::overwrite_existing,
-            fileError);
-        if (fileError)
+        if (!AtomicCopyRegularFile(sourcePath, destPath))
             ++failed;
         else
             ++copied;
@@ -74399,7 +74751,7 @@ bool ModMain::BeginHostPlayerStateTransfer(const char* reason, const std::string
         std::filesystem::create_directories(accountFsPath.parent_path(), error);
         if (error)
             return;
-        std::filesystem::copy_file(legacyFsPath, accountFsPath, std::filesystem::copy_options::overwrite_existing, error);
+        AtomicCopyRegularFile(legacyFsPath, accountFsPath);
     };
     migrateLegacyState(previousFormatAccountPath, saveScopedPath);
     // Username-keyed state predates persistent PlayerAccountId and cannot be
@@ -75086,15 +75438,7 @@ bool ModMain::CaptureClientDisconnectSnapshot()
     const std::filesystem::path source = CoopFilesystem::FromUtf8(sourcePathString);
     const std::filesystem::path snapshot = CoopFilesystem::FromUtf8(sourcePath);
     std::filesystem::create_directories(snapshot.parent_path(), error);
-    if (!error)
-    {
-        std::filesystem::copy_file(
-            source,
-            snapshot,
-            std::filesystem::copy_options::overwrite_existing,
-            error);
-    }
-    if (error)
+    if (error || !AtomicCopyRegularFile(source, snapshot))
     {
         m_lastPlayerStateTransferEvent =
             "intentional disconnect: immutable sidecar snapshot failed; local fallback armed";
@@ -75479,17 +75823,37 @@ void ModMain::RetirePlayerStateTransferForHostTimeline(uint64_t timelineToken)
     // Reset the active transfer and pending host snapshot, but preserve the
     // explicit-load barrier that BroadcastHostSaveIdentity is servicing.
     ResetPlayerStateTransferState("retired player state for host timeline", false);
+    ResetSaveTransferState("retired save transfer for host timeline");
     m_pendingHostSaveLoadBroadcastAfterLoad = preservePendingLoadBroadcast;
     m_hostManualLoadPreloadTransferStarted = preserveManualPreload;
+    // Area journals share the host save lineage. Retire their active state
+    // before the replacement identity is queued.
+    ResetAreaJournalTransferState("retired area journal for host timeline");
+    for (auto& entry : m_remotePeers)
+        ResetRemotePeerAreaJournalState(entry.second);
 
     size_t rewrittenQueued = 0;
     for (auto it = m_reliableSendQueue.begin(); it != m_reliableSendQueue.end(); ++it)
     {
         bool stale = false;
-        if (it->payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::PlayerStateTransfer) &&
+        if (it->payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::SaveTransfer) &&
+            it->payloadSize == sizeof(CoopProtocol::SaveTransferPacket))
+        {
+            CoopProtocol::SaveTransferPacket packet = {};
+            std::memcpy(&packet, it->payload.data(), sizeof(packet));
+            stale = packet.hostTimelineToken != timelineToken;
+        }
+        else if (it->payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::PlayerStateTransfer) &&
             it->payloadSize == sizeof(CoopProtocol::PlayerStateTransferPacket))
         {
             CoopProtocol::PlayerStateTransferPacket packet = {};
+            std::memcpy(&packet, it->payload.data(), sizeof(packet));
+            stale = packet.hostTimelineToken != timelineToken;
+        }
+        else if (it->payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::AreaJournalTransfer) &&
+            it->payloadSize == sizeof(CoopProtocol::AreaJournalTransferPacket))
+        {
+            CoopProtocol::AreaJournalTransferPacket packet = {};
             std::memcpy(&packet, it->payload.data(), sizeof(packet));
             stale = packet.hostTimelineToken != timelineToken;
         }
@@ -75498,22 +75862,57 @@ void ModMain::RetirePlayerStateTransferForHostTimeline(uint64_t timelineToken)
             // Keep the reliable envelope sequence occupied. Removing an
             // unsent packet would leave a gap and make the peer wait forever
             // for the missing sequence before it can process HostSaveIdentity.
-            CoopProtocol::PlayerStateTransferPacket abortPacket = {};
-            std::memcpy(&abortPacket, it->payload.data(), sizeof(abortPacket));
-            abortPacket.command = static_cast<uint32_t>(
-                CoopProtocol::PlayerStateTransferCommand::Abort);
-            abortPacket.totalBytes = 0;
-            abortPacket.chunkCount = 0;
-            abortPacket.chunkIndex = 0;
-            abortPacket.chunkBytes = 0;
-            abortPacket.checksum = 0;
-            std::memset(abortPacket.data, 0, sizeof(abortPacket.data));
-            std::fill(it->payload.begin(), it->payload.end(), 0);
-            std::memcpy(it->payload.data(), &abortPacket, sizeof(abortPacket));
-            it->payloadSize = sizeof(abortPacket);
+            if (it->payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::SaveTransfer))
+            {
+                CoopProtocol::SaveTransferPacket abortPacket = {};
+                std::memcpy(&abortPacket, it->payload.data(), sizeof(abortPacket));
+                abortPacket.command = static_cast<uint32_t>(
+                    CoopProtocol::SaveTransferCommand::Abort);
+                abortPacket.totalBytes = 0;
+                abortPacket.chunkCount = 0;
+                abortPacket.chunkIndex = 0;
+                abortPacket.chunkBytes = 0;
+                abortPacket.checksum = 0;
+                std::memset(abortPacket.data, 0, sizeof(abortPacket.data));
+                std::fill(it->payload.begin(), it->payload.end(), 0);
+                std::memcpy(it->payload.data(), &abortPacket, sizeof(abortPacket));
+                it->payloadSize = sizeof(abortPacket);
+            }
+            else if (it->payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::PlayerStateTransfer))
+            {
+                CoopProtocol::PlayerStateTransferPacket abortPacket = {};
+                std::memcpy(&abortPacket, it->payload.data(), sizeof(abortPacket));
+                abortPacket.command = static_cast<uint32_t>(
+                    CoopProtocol::PlayerStateTransferCommand::Abort);
+                abortPacket.totalBytes = 0;
+                abortPacket.chunkCount = 0;
+                abortPacket.chunkIndex = 0;
+                abortPacket.chunkBytes = 0;
+                abortPacket.checksum = 0;
+                std::memset(abortPacket.data, 0, sizeof(abortPacket.data));
+                std::fill(it->payload.begin(), it->payload.end(), 0);
+                std::memcpy(it->payload.data(), &abortPacket, sizeof(abortPacket));
+                it->payloadSize = sizeof(abortPacket);
+            }
+            else
+            {
+                CoopProtocol::AreaJournalTransferPacket abortPacket = {};
+                std::memcpy(&abortPacket, it->payload.data(), sizeof(abortPacket));
+                abortPacket.command = static_cast<uint32_t>(
+                    CoopProtocol::AreaJournalTransferCommand::Abort);
+                abortPacket.totalBytes = 0;
+                abortPacket.chunkCount = 0;
+                abortPacket.chunkIndex = 0;
+                abortPacket.chunkBytes = 0;
+                abortPacket.checksum = 0;
+                std::memset(abortPacket.data, 0, sizeof(abortPacket.data));
+                std::fill(it->payload.begin(), it->payload.end(), 0);
+                std::memcpy(it->payload.data(), &abortPacket, sizeof(abortPacket));
+                it->payloadSize = sizeof(abortPacket);
+            }
             it->lastSendTime = -1000.0f;
             it->sendAttempts = 0;
-            it->failurePrefix = "retired stale player-state abort send failed";
+            it->failurePrefix = "retired stale host-transfer abort send failed";
             ++rewrittenQueued;
         }
     }
@@ -75535,9 +75934,7 @@ void ModMain::RetirePlayerStateTransferForHostTimeline(uint64_t timelineToken)
 void ModMain::RetireFailedHostSaveTransferPackets()
 {
     if (m_networkMode != CoopNetworkMode::Host ||
-        m_saveTransferId == 0 ||
-        m_saveTransferAddress == 0 ||
-        m_saveTransferPort == 0)
+        m_saveTransferId == 0)
     {
         return;
     }
@@ -75545,9 +75942,7 @@ void ModMain::RetireFailedHostSaveTransferPackets()
     size_t rewrittenQueued = 0;
     for (PendingReliablePacket& pending : m_reliableSendQueue)
     {
-        if (pending.address != m_saveTransferAddress ||
-            pending.port != m_saveTransferPort ||
-            pending.payloadType != static_cast<uint16_t>(CoopProtocol::PacketType::SaveTransfer) ||
+        if (pending.payloadType != static_cast<uint16_t>(CoopProtocol::PacketType::SaveTransfer) ||
             pending.payloadSize != sizeof(CoopProtocol::SaveTransferPacket))
         {
             continue;
@@ -75556,6 +75951,7 @@ void ModMain::RetireFailedHostSaveTransferPackets()
         CoopProtocol::SaveTransferPacket packet = {};
         std::memcpy(&packet, pending.payload.data(), sizeof(packet));
         if (packet.transferId != m_saveTransferId ||
+            packet.hostTimelineToken != m_saveTransferHostTimelineToken ||
             packet.command == static_cast<uint32_t>(CoopProtocol::SaveTransferCommand::Abort))
         {
             continue;
@@ -76549,6 +76945,28 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
         m_pendingHostPlayerStateSaveKey.clear();
     }
 
+    if (!m_pendingHostPlayerStateSend &&
+        m_networkMode == CoopNetworkMode::Host &&
+        !m_pendingHostPlayerStateAccountTokens.empty())
+    {
+        while (!m_pendingHostPlayerStateAccountTokens.empty())
+        {
+            const uint64_t accountToken = m_pendingHostPlayerStateAccountTokens.front();
+            const auto peerIt = m_remotePeers.find(accountToken);
+            if (peerIt != m_remotePeers.end() &&
+                peerIt->second.address != 0 &&
+                peerIt->second.port != 0)
+            {
+                m_pendingHostPlayerStateAccountToken = accountToken;
+                m_pendingHostPlayerStateReason = "manual host load preload";
+                m_pendingHostPlayerStateSaveKey = m_currentHostSaveStateKey;
+                m_pendingHostPlayerStateSend = true;
+                break;
+            }
+            m_pendingHostPlayerStateAccountTokens.pop_front();
+        }
+    }
+
     if (m_pendingHostPlayerStateSend &&
         m_networkMode == CoopNetworkMode::Host &&
         m_playerStateTransferReceiving &&
@@ -76578,6 +76996,11 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
             ActivateRemotePeerContext(m_pendingHostPlayerStateAccountToken);
         if (BeginHostPlayerStateTransfer(m_pendingHostPlayerStateReason.c_str(), m_pendingHostPlayerStateSaveKey))
         {
+            if (!m_pendingHostPlayerStateAccountTokens.empty() &&
+                m_pendingHostPlayerStateAccountTokens.front() == m_pendingHostPlayerStateAccountToken)
+            {
+                m_pendingHostPlayerStateAccountTokens.pop_front();
+            }
             m_pendingHostPlayerStateSend = false;
             m_pendingHostPlayerStateAccountToken = 0;
             m_pendingHostPlayerStateSaveKey.clear();
@@ -76686,6 +77109,62 @@ bool ModMain::BeginAreaJournalTransfer(const char* reason, const std::string& re
     return true;
 }
 
+bool ModMain::BeginHostAreaJournalBroadcast(
+    const char* reason,
+    const std::string& requestedLevelName)
+{
+    if (m_networkMode != CoopNetworkMode::Host || m_remotePeers.empty())
+        return false;
+
+    const uint64_t restorePeerToken = m_activeRemotePeerToken;
+    StoreActiveRemotePeerContext();
+
+    std::vector<uint64_t> peerTokens;
+    peerTokens.reserve(m_remotePeers.size());
+    for (const auto& entry : m_remotePeers)
+        peerTokens.push_back(entry.first);
+
+    bool queuedAny = false;
+    bool queuedAll = true;
+    for (const uint64_t peerToken : peerTokens)
+    {
+        if (!ActivateRemotePeerContext(peerToken))
+        {
+            queuedAll = false;
+            continue;
+        }
+
+        const bool queued = m_areaJournalTransferSending || m_areaJournalTransferReceiving
+            ? QueueDeferredAreaJournalTransfer(reason, requestedLevelName)
+            : BeginAreaJournalTransfer(reason, requestedLevelName);
+        queuedAny = queuedAny || queued;
+        queuedAll = queuedAll && queued;
+        StoreActiveRemotePeerContext();
+    }
+
+    if (restorePeerToken != 0 &&
+        m_remotePeers.find(restorePeerToken) != m_remotePeers.end())
+    {
+        ActivateRemotePeerContext(restorePeerToken);
+    }
+    else if (m_primaryRemotePeerToken != 0 &&
+        m_remotePeers.find(m_primaryRemotePeerToken) != m_remotePeers.end())
+    {
+        ActivateRemotePeerContext(m_primaryRemotePeerToken);
+    }
+
+    m_lastAreaJournalTransferEvent =
+        std::string(queuedAll && queuedAny
+            ? "queued area journal for all peers"
+            : queuedAny
+                ? "queued area journal for some peers"
+                : "area journal broadcast had no eligible peer") +
+        " reason=" +
+        (reason && reason[0] ? std::string(reason) : std::string("manual"));
+    LogCoop(m_lastAreaJournalTransferEvent);
+    return queuedAny && queuedAll;
+}
+
 bool ModMain::ShouldSuppressHostAreaJournalForRemoteOwnedLevel(const std::string& levelName) const
 {
     const std::string normalizedLevel = NormalizeLevelName(levelName);
@@ -76699,7 +77178,15 @@ bool ModMain::ShouldSuppressHostAreaJournalForRemoteOwnedLevel(const std::string
 bool ModMain::ExportAreaJournalTransferFile(const std::string& levelName, uint32_t transferId, std::string& outPath)
 {
     const std::string normalizedLevel = NormalizeLevelName(levelName.empty() ? GetCurrentLevelName() : levelName);
-    outPath = BuildCoopTempAreaJournalPath(transferId, normalizedLevel);
+    const uint64_t peerToken = m_networkMode == CoopNetworkMode::Host
+        ? GetRemoteAccountToken()
+        : GetLocalAccountToken();
+    outPath = BuildCoopTempAreaJournalPath(
+        transferId,
+        normalizedLevel,
+        m_sessionHostTimelineToken,
+        peerToken,
+        "send");
 
     std::error_code error;
     std::filesystem::create_directories(CoopFilesystem::FromUtf8(outPath).parent_path(), error);
@@ -76758,7 +77245,8 @@ bool ModMain::QueueDeferredAreaJournalTransfer(const char* reason, const std::st
     const std::string levelName = NormalizeLevelName(requestedLevelName.empty() ? GetCurrentLevelName() : requestedLevelName);
     const uint64_t hostAccountToken = GetSessionHostAccountToken();
     const uint64_t hostSaveKeyHash = CurrentHostSaveKeyHash();
-    if (hostAccountToken == 0 || hostSaveKeyHash == 0)
+    const uint64_t hostTimelineToken = m_sessionHostTimelineToken;
+    if (hostAccountToken == 0 || hostSaveKeyHash == 0 || hostTimelineToken == 0)
     {
         m_lastAreaJournalTransferEvent = "deferred area journal skipped: missing host/save scope";
         return false;
@@ -76775,6 +77263,7 @@ bool ModMain::QueueDeferredAreaJournalTransfer(const char* reason, const std::st
     m_deferredAreaJournalTransferReason = reason && reason[0] ? reason : "deferred area journal";
     m_deferredAreaJournalTransferHostAccountToken = hostAccountToken;
     m_deferredAreaJournalTransferHostSaveKeyHash = hostSaveKeyHash;
+    m_deferredAreaJournalTransferHostTimelineToken = hostTimelineToken;
     m_lastAreaJournalTransferEvent =
         "deferred area journal transfer level=" + levelName +
         " reason=" + m_deferredAreaJournalTransferReason;
@@ -76800,8 +77289,10 @@ bool ModMain::TryStartDeferredAreaJournalTransfer(const char* reason)
 
     if (m_deferredAreaJournalTransferHostAccountToken == 0 ||
         m_deferredAreaJournalTransferHostSaveKeyHash == 0 ||
+        m_deferredAreaJournalTransferHostTimelineToken == 0 ||
         m_deferredAreaJournalTransferHostAccountToken != GetSessionHostAccountToken() ||
-        m_deferredAreaJournalTransferHostSaveKeyHash != CurrentHostSaveKeyHash())
+        m_deferredAreaJournalTransferHostSaveKeyHash != CurrentHostSaveKeyHash() ||
+        m_deferredAreaJournalTransferHostTimelineToken != m_sessionHostTimelineToken)
     {
         m_deferredAreaJournalTransferPending = false;
         m_deferredAreaJournalTransferId = 0;
@@ -76810,6 +77301,7 @@ bool ModMain::TryStartDeferredAreaJournalTransfer(const char* reason)
         m_deferredAreaJournalTransferReason.clear();
         m_deferredAreaJournalTransferHostAccountToken = 0;
         m_deferredAreaJournalTransferHostSaveKeyHash = 0;
+        m_deferredAreaJournalTransferHostTimelineToken = 0;
         m_lastAreaJournalTransferEvent = "deferred area journal dropped: host/save scope changed";
         LogCoop(m_lastAreaJournalTransferEvent);
         return false;
@@ -76824,6 +77316,7 @@ bool ModMain::TryStartDeferredAreaJournalTransfer(const char* reason)
         m_deferredAreaJournalTransferReason.clear();
         m_deferredAreaJournalTransferHostAccountToken = 0;
         m_deferredAreaJournalTransferHostSaveKeyHash = 0;
+        m_deferredAreaJournalTransferHostTimelineToken = 0;
         m_lastAreaJournalTransferEvent =
             "deferred area journal dropped: remote owns saved level";
         LogCoop(m_lastAreaJournalTransferEvent);
@@ -76839,6 +77332,7 @@ bool ModMain::TryStartDeferredAreaJournalTransfer(const char* reason)
         m_deferredAreaJournalTransferReason.clear();
         m_deferredAreaJournalTransferHostAccountToken = 0;
         m_deferredAreaJournalTransferHostSaveKeyHash = 0;
+        m_deferredAreaJournalTransferHostTimelineToken = 0;
         m_lastAreaJournalTransferEvent = "deferred area journal dropped: network offline";
         return false;
     }
@@ -76861,6 +77355,7 @@ bool ModMain::TryStartDeferredAreaJournalTransfer(const char* reason)
     m_deferredAreaJournalTransferReason.clear();
     m_deferredAreaJournalTransferHostAccountToken = 0;
     m_deferredAreaJournalTransferHostSaveKeyHash = 0;
+    m_deferredAreaJournalTransferHostTimelineToken = 0;
     m_lastAreaJournalTransferEvent =
         "started deferred area journal transfer level=" + levelName +
         " reason=" + transferReason;
@@ -76872,6 +77367,11 @@ bool ModMain::StartAreaJournalTransferFromFile(const std::string& sourcePath, co
 {
     if (m_areaJournalTransferSending || m_areaJournalTransferReceiving)
         return false;
+    if (m_sessionHostTimelineToken == 0)
+    {
+        m_lastAreaJournalTransferEvent = "area journal transfer rejected: missing host timeline";
+        return false;
+    }
 
     uint32_t fileSize = 0;
     if (!GetFileSizeBytes(sourcePath, fileSize) || fileSize == 0)
@@ -76929,6 +77429,7 @@ bool ModMain::StartAreaJournalTransferFromFile(const std::string& sourcePath, co
     m_areaJournalTransferReceivedChunks = 0;
     m_areaJournalTransferChecksum = checksum;
     m_areaJournalTransferRunningChecksum = kFnv1aOffsetBasis;
+    m_areaJournalTransferHostTimelineToken = m_sessionHostTimelineToken;
     m_areaSnapshotAreaId = HashLevelName(m_areaJournalTransferLevel);
     m_areaSnapshotLevelEpoch =
         (m_areaLeaseActive && IsKnownSameLevel(m_areaJournalTransferLevel, m_areaLeaseLevelName))
@@ -76944,6 +77445,7 @@ bool ModMain::StartAreaJournalTransferFromFile(const std::string& sourcePath, co
     const bool authorityHandoff = m_networkMode == CoopNetworkMode::Client && matchingLease;
     m_areaSnapshotLeaseEpoch = matchingLease ? m_areaLeaseEpoch : 0;
     m_areaSnapshotHostSaveKeyHash = CurrentHostSaveKeyHash();
+    m_areaSnapshotHostTimelineToken = m_areaJournalTransferHostTimelineToken;
     m_areaSnapshotSequence = CoopSerialSequence::Advance(m_areaSnapshotSequenceCounter);
     m_areaJournalTransferFlags = CoopProtocol::kAreaJournalTransferFlagSnapshot;
     if (authorityHandoff)
@@ -77088,10 +77590,25 @@ void ModMain::TickAreaJournalTransferForActivePeer(float frameTime)
     if (!m_areaJournalTransferSending)
         return;
 
-    while (m_reliableSendQueue.size() < kAreaJournalTransferQueueLowWater)
+    const auto queuedForEndpoint = [this]()
+    {
+        return static_cast<size_t>(std::count_if(
+            m_reliableSendQueue.begin(),
+            m_reliableSendQueue.end(),
+            [this](const PendingReliablePacket& pending)
+            {
+                return pending.address == m_areaJournalTransferAddress &&
+                    pending.port == m_areaJournalTransferPort &&
+                    pending.payloadType == static_cast<uint16_t>(
+                        CoopProtocol::PacketType::AreaJournalTransfer);
+            }));
+    };
+    size_t endpointQueueSize = queuedForEndpoint();
+    while (endpointQueueSize < kAreaJournalTransferQueueLowWater)
     {
         if (!QueueNextAreaJournalTransferPacket())
             break;
+        ++endpointQueueSize;
     }
 }
 
@@ -77183,10 +77700,12 @@ bool ModMain::RequestRemoteAreaJournal(const char* reason, const std::string& re
     m_areaJournalTransferChecksum = 0;
     m_areaJournalTransferRunningChecksum = kFnv1aOffsetBasis;
     m_areaJournalTransferFlags = 0;
+    m_areaJournalTransferHostTimelineToken = m_sessionHostTimelineToken;
     m_areaSnapshotLeaseEpoch = 0;
     m_areaSnapshotLevelEpoch = 0;
     m_areaSnapshotAreaId = 0;
     m_areaSnapshotHostSaveKeyHash = CurrentHostSaveKeyHash();
+    m_areaSnapshotHostTimelineToken = m_areaJournalTransferHostTimelineToken;
     m_areaSnapshotSequence = 0;
     m_areaJournalTransferUsername = GetLocalUsername();
     m_areaJournalTransferLevel = NormalizeLevelName(requestedLevelName.empty() ? GetCurrentLevelName() : requestedLevelName);
@@ -77214,20 +77733,28 @@ bool ModMain::StoreReceivedAreaJournalTransfer(const char* reason)
     }
 
     const uint64_t currentSaveHash = CurrentHostSaveKeyHash();
+    const uint64_t currentTimelineToken = m_sessionHostTimelineToken;
     if (m_areaSnapshotHostSaveKeyHash == 0 ||
         currentSaveHash == 0 ||
-        m_areaSnapshotHostSaveKeyHash != currentSaveHash)
+        m_areaSnapshotHostSaveKeyHash != currentSaveHash ||
+        m_areaSnapshotHostTimelineToken == 0 ||
+        currentTimelineToken == 0 ||
+        m_areaSnapshotHostTimelineToken != currentTimelineToken)
     {
         m_lastAreaJournalTransferEvent =
             "cannot store area journal: host save scope changed packet=" +
             Hex64(m_areaSnapshotHostSaveKeyHash) +
-            " current=" + Hex64(currentSaveHash);
+            " current=" + Hex64(currentSaveHash) +
+            " packetTimeline=" + Hex64(m_areaSnapshotHostTimelineToken) +
+            " currentTimeline=" + Hex64(currentTimelineToken);
         LogCoop(m_lastAreaJournalTransferEvent);
         return false;
     }
 
     const std::filesystem::path root = CoopFilesystem::FromUtf8(
-        GetScopedReceivedAreaJournalRoot(m_areaSnapshotHostSaveKeyHash));
+        GetScopedReceivedAreaJournalRoot(
+            m_areaSnapshotHostSaveKeyHash,
+            m_areaSnapshotHostTimelineToken));
     if (root.empty())
     {
         m_lastAreaJournalTransferEvent = "cannot store area journal: no profile root";
@@ -77246,13 +77773,9 @@ bool ModMain::StoreReceivedAreaJournalTransfer(const char* reason)
         return false;
     }
 
-    error.clear();
-    std::filesystem::copy_file(
-        CoopFilesystem::FromUtf8(m_areaJournalTransferReceivePath),
-        dest,
-        std::filesystem::copy_options::overwrite_existing,
-        error);
-    if (error)
+    if (!AtomicCopyRegularFile(
+            CoopFilesystem::FromUtf8(m_areaJournalTransferReceivePath),
+            dest))
     {
         m_lastAreaJournalTransferEvent = "cannot store area journal: copy failed";
         return false;
@@ -77336,14 +77859,20 @@ bool ModMain::MergeReceivedAreaJournalIntoServerState(const char* reason, bool a
         return reject("server area merge rejected: unknown level");
 
     const uint64_t currentSaveHash = CurrentHostSaveKeyHash();
+    const uint64_t currentTimelineToken = m_sessionHostTimelineToken;
     if (m_areaSnapshotHostSaveKeyHash == 0 ||
         currentSaveHash == 0 ||
-        m_areaSnapshotHostSaveKeyHash != currentSaveHash)
+        m_areaSnapshotHostSaveKeyHash != currentSaveHash ||
+        m_areaSnapshotHostTimelineToken == 0 ||
+        currentTimelineToken == 0 ||
+        m_areaSnapshotHostTimelineToken != currentTimelineToken)
     {
         return reject(
             "server area merge rejected: wrong host save scope packet=" +
             Hex64(m_areaSnapshotHostSaveKeyHash) +
-            " current=" + Hex64(currentSaveHash));
+            " current=" + Hex64(currentSaveHash) +
+            " packetTimeline=" + Hex64(m_areaSnapshotHostTimelineToken) +
+            " currentTimeline=" + Hex64(currentTimelineToken));
     }
 
     const std::string localLevelName = NormalizeLevelName(GetCurrentLevelName());
@@ -77372,7 +77901,9 @@ bool ModMain::MergeReceivedAreaJournalIntoServerState(const char* reason, bool a
         return reject("server area merge rejected: checksum failed");
 
     const std::filesystem::path root = CoopFilesystem::FromUtf8(
-        GetScopedServerAreaStateRoot(m_areaSnapshotHostSaveKeyHash));
+        GetScopedServerAreaStateRoot(
+            m_areaSnapshotHostSaveKeyHash,
+            m_areaSnapshotHostTimelineToken));
     if (root.empty())
         return reject("server area merge rejected: no profile root");
 
@@ -77388,14 +77919,10 @@ bool ModMain::MergeReceivedAreaJournalIntoServerState(const char* reason, bool a
     if (error)
         return reject("server area merge rejected: mkdir failed");
 
-    error.clear();
-    std::filesystem::copy_file(source, latestFromOwner, std::filesystem::copy_options::overwrite_existing, error);
-    if (error)
+    if (!AtomicCopyRegularFile(source, latestFromOwner))
         return reject("server area merge rejected: owner copy failed");
 
-    error.clear();
-    std::filesystem::copy_file(source, authoritative, std::filesystem::copy_options::overwrite_existing, error);
-    if (error)
+    if (!AtomicCopyRegularFile(source, authoritative))
         return reject("server area merge rejected: authoritative copy failed");
 
     {
@@ -77412,6 +77939,7 @@ bool ModMain::MergeReceivedAreaJournalIntoServerState(const char* reason, bool a
             << ",\"localLevel\":\"" << JsonEscapeForCoopDump(localLevelName) << "\""
             << ",\"remoteLevel\":\"" << JsonEscapeForCoopDump(remoteLevelName) << "\""
             << ",\"remoteFlags\":\"" << Hex32(m_remoteSessionFlags) << "\""
+            << ",\"hostTimelineToken\":\"" << Hex64(m_areaSnapshotHostTimelineToken) << "\""
             << ",\"bytes\":" << fileSize
             << ",\"checksum\":\"" << Hex32(checksum) << "\""
             << ",\"reason\":\"" << JsonEscapeForCoopDump(reason && reason[0] ? reason : "area journal merge") << "\""
@@ -77496,8 +78024,9 @@ bool ModMain::QueueAreaStateOverlayApply(const std::string& levelName, const std
         !m_currentHostSaveStateKey.empty() && m_currentHostSaveStateKey != "unknown_save"
             ? HashStoryString(m_currentHostSaveStateKey)
             : 0;
+    const uint64_t hostTimelineToken = m_sessionHostTimelineToken;
     if (normalizedLevel == "unknown" || sourcePath.empty() ||
-        hostAccountToken == 0 || hostSaveKeyHash == 0)
+        hostAccountToken == 0 || hostSaveKeyHash == 0 || hostTimelineToken == 0)
     {
         ++m_areaOverlayApplyFailCount;
         m_lastAreaOverlayEvent = "area overlay queue rejected: missing level, path, host, or save scope";
@@ -77520,6 +78049,7 @@ bool ModMain::QueueAreaStateOverlayApply(const std::string& levelName, const std
     m_pendingAreaOverlayApplyReason = reason && reason[0] ? reason : "area overlay";
     m_pendingAreaOverlayHostAccountToken = hostAccountToken;
     m_pendingAreaOverlayHostSaveKeyHash = hostSaveKeyHash;
+    m_pendingAreaOverlayHostTimelineToken = hostTimelineToken;
     m_pendingAreaOverlayApplyDelaySeconds = 0.25f;
     m_lastAreaOverlayEvent =
         "queued area overlay level=" + normalizedLevel +
@@ -77615,10 +78145,13 @@ bool ModMain::TryApplyQueuedAreaStateOverlay(const char* reason)
         !m_currentHostSaveStateKey.empty() && m_currentHostSaveStateKey != "unknown_save"
             ? HashStoryString(m_currentHostSaveStateKey)
             : 0;
+    const uint64_t currentHostTimelineToken = m_sessionHostTimelineToken;
     if (m_pendingAreaOverlayHostAccountToken == 0 ||
         m_pendingAreaOverlayHostSaveKeyHash == 0 ||
+        m_pendingAreaOverlayHostTimelineToken == 0 ||
         m_pendingAreaOverlayHostAccountToken != currentHostAccountToken ||
-        m_pendingAreaOverlayHostSaveKeyHash != currentHostSaveKeyHash)
+        m_pendingAreaOverlayHostSaveKeyHash != currentHostSaveKeyHash ||
+        m_pendingAreaOverlayHostTimelineToken != currentHostTimelineToken)
     {
         ++m_areaOverlayApplyFailCount;
         m_lastAreaOverlayEvent =
@@ -77626,7 +78159,9 @@ bool ModMain::TryApplyQueuedAreaStateOverlay(const char* reason)
             Hex64(m_pendingAreaOverlayHostAccountToken) +
             " currentHost=" + Hex64(currentHostAccountToken) +
             " pendingSave=" + Hex64(m_pendingAreaOverlayHostSaveKeyHash) +
-            " currentSave=" + Hex64(currentHostSaveKeyHash);
+            " currentSave=" + Hex64(currentHostSaveKeyHash) +
+            " pendingTimeline=" + Hex64(m_pendingAreaOverlayHostTimelineToken) +
+            " currentTimeline=" + Hex64(currentHostTimelineToken);
         LogCoop(m_lastAreaOverlayEvent);
         m_pendingAreaOverlayApply = false;
         m_pendingAreaOverlayApplyLevel.clear();
@@ -77634,6 +78169,7 @@ bool ModMain::TryApplyQueuedAreaStateOverlay(const char* reason)
         m_pendingAreaOverlayApplyReason.clear();
         m_pendingAreaOverlayHostAccountToken = 0;
         m_pendingAreaOverlayHostSaveKeyHash = 0;
+        m_pendingAreaOverlayHostTimelineToken = 0;
         m_pendingAreaOverlayApplyDelaySeconds = 0.0f;
         return false;
     }
@@ -77658,6 +78194,7 @@ bool ModMain::TryApplyQueuedAreaStateOverlay(const char* reason)
         m_pendingAreaOverlayApplyReason.clear();
         m_pendingAreaOverlayHostAccountToken = 0;
         m_pendingAreaOverlayHostSaveKeyHash = 0;
+        m_pendingAreaOverlayHostTimelineToken = 0;
         m_pendingAreaOverlayApplyDelaySeconds = 0.0f;
         return false;
     }
@@ -77751,6 +78288,7 @@ bool ModMain::TryApplyQueuedAreaStateOverlay(const char* reason)
     m_pendingAreaOverlayApplyReason.clear();
     m_pendingAreaOverlayHostAccountToken = 0;
     m_pendingAreaOverlayHostSaveKeyHash = 0;
+    m_pendingAreaOverlayHostTimelineToken = 0;
     m_pendingAreaOverlayApplyDelaySeconds = 0.0f;
     return ok;
 }
@@ -77782,6 +78320,42 @@ void ModMain::HandleAreaJournalTransfer(const CoopProtocol::AreaJournalTransferP
     const CoopProtocol::AreaJournalTransferCommand command = static_cast<CoopProtocol::AreaJournalTransferCommand>(packet.command);
     const std::string levelName = NormalizeLevelName(ReadAreaJournalTransferLevelName(packet));
     const std::string username = SanitizeUsername(ReadAreaJournalTransferUsername(packet));
+
+    // Area journals are part of the host save timeline. A packet from an
+    // older same-key load must never be allowed to seed or finish a transfer
+    // in the replacement timeline. Abort remains consumable for an old
+    // transfer, but must not reset a newer transfer already in progress.
+    if (command == CoopProtocol::AreaJournalTransferCommand::Abort)
+    {
+        if (packet.hostTimelineToken == 0)
+            return;
+        if (packet.hostTimelineToken != m_sessionHostTimelineToken &&
+            m_areaJournalTransferHostTimelineToken == m_sessionHostTimelineToken)
+        {
+            m_lastAreaJournalTransferEvent = "ignored stale area journal abort from previous host timeline";
+            return;
+        }
+        if (m_areaJournalTransferId == 0 ||
+            packet.transferId != m_areaJournalTransferId)
+        {
+            m_lastAreaJournalTransferEvent =
+                "ignored area journal abort for inactive transfer";
+            return;
+        }
+        ResetAreaJournalTransferState("peer aborted area journal transfer");
+        return;
+    }
+
+    if (packet.hostTimelineToken == 0 ||
+        m_sessionHostTimelineToken == 0 ||
+        packet.hostTimelineToken != m_sessionHostTimelineToken)
+    {
+        m_lastAreaJournalTransferEvent =
+            "ignored area journal packet from wrong host timeline packet=" +
+            Hex64(packet.hostTimelineToken) +
+            " current=" + Hex64(m_sessionHostTimelineToken);
+        return;
+    }
 
     if (command == CoopProtocol::AreaJournalTransferCommand::Request)
     {
@@ -77870,10 +78444,20 @@ void ModMain::HandleAreaJournalTransfer(const CoopProtocol::AreaJournalTransferP
         m_areaSnapshotLevelEpoch = packet.areaLevelEpoch;
         m_areaSnapshotAreaId = packet.areaId;
         m_areaSnapshotHostSaveKeyHash = packet.hostSaveKeyHash;
+        m_areaJournalTransferHostTimelineToken = packet.hostTimelineToken;
+        m_areaSnapshotHostTimelineToken = packet.hostTimelineToken;
         m_areaSnapshotSequence = packet.snapshotSequence;
         m_areaJournalTransferUsername = username.empty() ? std::string("remote") : username;
         m_areaJournalTransferLevel = levelName;
-        m_areaJournalTransferReceivePath = BuildCoopTempAreaJournalPath(packet.transferId, levelName);
+        const uint64_t sourcePeerToken = m_activePacketSourceAccountToken != 0
+            ? m_activePacketSourceAccountToken
+            : GetRemoteAccountToken();
+        m_areaJournalTransferReceivePath = BuildCoopTempAreaJournalPath(
+            packet.transferId,
+            levelName,
+            packet.hostTimelineToken,
+            sourcePeerToken,
+            "recv");
         m_areaJournalTransferSending = false;
         m_areaJournalTransferReceiving = true;
         m_areaJournalTransferStarted = true;
@@ -77892,12 +78476,6 @@ void ModMain::HandleAreaJournalTransfer(const CoopProtocol::AreaJournalTransferP
         return;
     }
 
-    if (command == CoopProtocol::AreaJournalTransferCommand::Abort)
-    {
-        ResetAreaJournalTransferState("peer aborted area journal transfer");
-        return;
-    }
-
     if (!m_areaJournalTransferReceiving || packet.transferId != m_areaJournalTransferId)
         return;
 
@@ -77905,6 +78483,8 @@ void ModMain::HandleAreaJournalTransfer(const CoopProtocol::AreaJournalTransferP
         packet.areaLevelEpoch != m_areaSnapshotLevelEpoch ||
         packet.areaId != m_areaSnapshotAreaId ||
         packet.hostSaveKeyHash != m_areaSnapshotHostSaveKeyHash ||
+        packet.hostTimelineToken != m_areaJournalTransferHostTimelineToken ||
+        packet.hostTimelineToken != m_areaSnapshotHostTimelineToken ||
         packet.snapshotSequence != m_areaSnapshotSequence ||
         packet.flags != m_areaJournalTransferFlags)
     {
@@ -77979,10 +78559,20 @@ void ModMain::HandleSaveTransfer(const CoopProtocol::SaveTransferPacket& packet)
     const CoopProtocol::SaveTransferCommand command = static_cast<CoopProtocol::SaveTransferCommand>(packet.command);
     if (command == CoopProtocol::SaveTransferCommand::Start)
     {
+        if (packet.hostTimelineToken == 0 ||
+            (m_sessionHostTimelineToken != 0 &&
+                packet.hostTimelineToken != m_sessionHostTimelineToken))
+        {
+            m_lastSaveTransferEvent = "ignored host save transfer start from stale timeline";
+            LogCoop(m_lastSaveTransferEvent);
+            return;
+        }
+
         const std::string incomingLevel = NormalizeLevelName(ReadSaveTransferLevelName(packet));
         const bool sameTransferAlreadyActive =
             packet.transferId == m_saveTransferId &&
             packet.worldEpoch == m_saveTransferWorldEpoch &&
+            packet.hostTimelineToken == m_saveTransferHostTimelineToken &&
             (m_saveTransferReceiving ||
                 m_saveTransferComplete ||
                 m_pendingHostWorldLoadAfterPlayerState ||
@@ -78000,6 +78590,9 @@ void ModMain::HandleSaveTransfer(const CoopProtocol::SaveTransferPacket& packet)
 
         m_saveTransferId = packet.transferId;
         m_saveTransferWorldEpoch = packet.worldEpoch;
+        m_saveTransferHostTimelineToken = packet.hostTimelineToken;
+        if (m_sessionHostTimelineToken == 0)
+            m_sessionHostTimelineToken = packet.hostTimelineToken;
         m_saveTransferTotalBytes = packet.totalBytes;
         m_saveTransferChunkCount = packet.chunkCount;
         m_saveTransferNextChunk = 0;
@@ -78038,12 +78631,32 @@ void ModMain::HandleSaveTransfer(const CoopProtocol::SaveTransferPacket& packet)
 
     if (command == CoopProtocol::SaveTransferCommand::Abort)
     {
+        if (packet.hostTimelineToken == 0 ||
+            (m_sessionHostTimelineToken != 0 &&
+                packet.hostTimelineToken != m_sessionHostTimelineToken) ||
+            (m_saveTransferHostTimelineToken != 0 &&
+                packet.hostTimelineToken != m_saveTransferHostTimelineToken))
+        {
+            m_lastSaveTransferEvent = "ignored stale host save transfer abort";
+            LogCoop(m_lastSaveTransferEvent);
+            return;
+        }
         ResetSaveTransferState("host aborted save transfer");
         return;
     }
 
     if (!m_saveTransferReceiving || packet.transferId != m_saveTransferId)
         return;
+
+    if (packet.hostTimelineToken == 0 ||
+        packet.hostTimelineToken != m_saveTransferHostTimelineToken ||
+        (m_sessionHostTimelineToken != 0 &&
+            packet.hostTimelineToken != m_sessionHostTimelineToken))
+    {
+        m_lastSaveTransferEvent = "ignored host save transfer packet from stale timeline";
+        LogCoop(m_lastSaveTransferEvent);
+        return;
+    }
 
     if (command == CoopProtocol::SaveTransferCommand::Chunk)
     {
@@ -78210,7 +78823,9 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             // Drop any host-state transfer that was queued under the old
             // lineage before accepting the replacement. Old reliable chunks
             // must not complete into a same-key rollback.
+            ResetSaveTransferState("host timeline replaced");
             ResetPlayerStateTransferState("host timeline replaced", false);
+            ResetAreaJournalTransferState("host timeline replaced");
             // A manual load is a new authority timeline even when it reloads
             // the same save key. Keep old journals on disk, but never let
             // their dirty in-memory state follow the rollback.
@@ -78847,12 +79462,9 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
                 return;
             }
 
-            std::filesystem::copy_file(
-                CoopFilesystem::FromUtf8(m_playerStateTransferReceivePath),
-                dest,
-                std::filesystem::copy_options::overwrite_existing,
-                error);
-            if (error)
+            const std::filesystem::path receivedState =
+                CoopFilesystem::FromUtf8(m_playerStateTransferReceivePath);
+            if (!AtomicCopyRegularFile(receivedState, dest))
             {
                 m_lastPlayerStateTransferEvent = "cannot store client player state: copy failed";
                 return;
@@ -78866,14 +79478,17 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
                     const std::filesystem::path scopedDest = CoopFilesystem::FromUtf8(scopedPath);
                     error.clear();
                     std::filesystem::create_directories(scopedDest.parent_path(), error);
-                    if (!error)
+                    if (error)
                     {
-                        error.clear();
-                        std::filesystem::copy_file(
-                            CoopFilesystem::FromUtf8(m_playerStateTransferReceivePath),
-                            scopedDest,
-                            std::filesystem::copy_options::overwrite_existing,
-                            error);
+                        m_lastPlayerStateTransferEvent =
+                            "cannot store client player state: scoped mkdir failed";
+                        return;
+                    }
+                    if (!AtomicCopyRegularFile(receivedState, scopedDest))
+                    {
+                        m_lastPlayerStateTransferEvent =
+                            "cannot store client player state: scoped copy failed";
+                        return;
                     }
                 }
             }
@@ -79167,6 +79782,20 @@ void ModMain::HandleWorldSync(const CoopProtocol::WorldSyncPacket& packet)
                 if (!remoteUsername.empty())
                     m_hostPlayerStateSentUsername = remoteUsername;
                 m_lastPlayerStateTransferEvent = "host player state already sent for remote epoch";
+                return;
+            }
+
+            const bool preloadStateAlreadyQueued =
+                std::find(
+                    m_pendingHostPlayerStateAccountTokens.begin(),
+                    m_pendingHostPlayerStateAccountTokens.end(),
+                    m_activeRemotePeerToken) != m_pendingHostPlayerStateAccountTokens.end();
+            if (preloadStateAlreadyQueued ||
+                (m_hostManualLoadPreloadTransferStarted && m_pendingHostPlayerStateSend))
+            {
+                // The explicit-load preload queue owns this peer's state
+                // send. A world-ready edge must not replace its head with a
+                // later peer and strand the remaining clients.
                 return;
             }
 
