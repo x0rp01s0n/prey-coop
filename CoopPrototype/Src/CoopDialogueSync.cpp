@@ -1727,8 +1727,9 @@ void ModMain::HandleDialogueLease(
         packet.sourcePeerHash == 0 ||
         packet.worldEpoch != m_localWorldEpoch ||
         packet.areaId != m_localLevelId ||
-        !IsCurrentOrRecentHostSaveKeyHash(
-            packet.hostSaveKeyHash) ||
+        packet.hostSaveKeyHash == 0 ||
+        packet.hostSaveKeyHash !=
+            CurrentHostSaveKeyHash() ||
         (packet.targetPeerHash != 0 &&
             packet.targetPeerHash != localPeer) ||
         !sourceMatchesTransport ||

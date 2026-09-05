@@ -7,7 +7,7 @@
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 243;
+constexpr uint16_t kProtocolVersion = 244;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -178,6 +178,7 @@ constexpr uint32_t kWorldSyncFlagNeedsSaveTransfer = 1u << 2;
 constexpr uint32_t kPlayerStateTransferFlagEmptyDefault = 1u << 0;
 constexpr uint32_t kPlayerStateTransferFlagUploadToHost = 1u << 1;
 constexpr uint32_t kPlayerStateTransferFlagHostAuthoritative = 1u << 2;
+constexpr uint32_t kPlayerStateTransferFlagReplaceTimeline = 1u << 3;
 constexpr uint32_t kLivePropTransformFlagHidden = 1u << 0;
 constexpr uint32_t kLivePropTransformFlagRemoved = 1u << 1;
 constexpr uint32_t kLivePropTransformFlagCarried = 1u << 2;
