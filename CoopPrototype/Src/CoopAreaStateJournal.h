@@ -47,6 +47,7 @@ public:
     void NoteEntityRemoved(const std::string& levelName, IEntity& entity);
     void NoteLevelStateSave(const std::string& levelName, LevelStatePhase phase);
     void NoteLevelStateLoad(const std::string& levelName, LevelStatePhase phase);
+    void Reset();
 
     uint32_t GetObservedEventCount() const { return m_observedEventCount; }
     uint32_t GetTrackedEventCount() const { return m_trackedEventCount; }

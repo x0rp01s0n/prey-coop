@@ -135,8 +135,8 @@ void ModMain::HandleTimeDilation(const CoopProtocol::TimeDilationPacket& packet)
     const auto command = static_cast<CoopProtocol::TimeDilationCommand>(packet.command);
     const uint64_t localSave = CurrentHostSaveKeyHash();
     if (packet.sourcePeerHash == 0 || packet.worldEpoch != m_localWorldEpoch ||
-        (packet.hostSaveKeyHash != 0 && localSave != 0 &&
-            !IsCurrentOrRecentHostSaveKeyHash(packet.hostSaveKeyHash)) ||
+        packet.hostSaveKeyHash == 0 || localSave == 0 ||
+        packet.hostSaveKeyHash != localSave ||
         !std::isfinite(packet.scale) || packet.scale <= 0.0f || packet.scale > 4.0f)
     {
         ++m_timeDilationDropped;
