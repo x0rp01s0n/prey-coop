@@ -26677,11 +26677,6 @@ void ModMain::OnCryActionSaveGameRequested(
     const bool internalCoopSnapshot = internalHostSnapshot || internalClientPlayerSnapshot;
     if (!internalCoopSnapshot)
         m_lastSaveLoadPath = path && path[0] ? path : "-";
-    if (m_networkMode == CoopNetworkMode::Host && !internalHostSnapshot)
-    {
-        SetCurrentHostSaveStateKey(BuildHostSaveStateKey(m_lastSaveLoadPath), true);
-        BroadcastHostSaveIdentity("native host save hook");
-    }
     m_lastSaveLoadEvent =
         std::string(internalCoopSnapshot ? "SaveGame internal snapshot reason=" : "SaveGame reason=") +
         std::to_string(reason);
@@ -26712,10 +26707,7 @@ void ModMain::OnCryActionSaveGameRequested(
             LogCoop(m_lastPlayerStateTransferEvent);
         }
         else
-        {
-            SnapshotLatestHostPlayerStatesForSave(m_currentHostSaveStateKey, "native host save hook");
-            RequestRemotePlayerStateUpload("native host save hook");
-        }
+            m_lastPlayerStateTransferEvent = "waiting for native host save result";
     }
     else
     {
@@ -26754,6 +26746,23 @@ void ModMain::OnCryActionSaveGameReturned(
     if (checkpointName && checkpointName[0])
         m_lastSaveLoadEvent += " checkpoint=" + StatusToken(checkpointName);
     LogCoop(m_lastSaveLoadEvent);
+
+    if (result && m_networkMode == CoopNetworkMode::Host && !internalHostSnapshot)
+    {
+        const std::string previousSaveKey = m_currentHostSaveStateKey;
+        const std::string nextSaveKey = BuildHostSaveStateKey(
+            path && path[0] ? std::string(path) : m_lastSaveLoadPath);
+        CarryForwardHostPlayerStatesForSave(
+            previousSaveKey,
+            nextSaveKey,
+            "native host save complete");
+        SetCurrentHostSaveStateKey(nextSaveKey, true);
+        BroadcastHostSaveIdentity("native host save complete");
+        SnapshotLatestHostPlayerStatesForSave(
+            m_currentHostSaveStateKey,
+            "native host save complete");
+        RequestRemotePlayerStateUpload("native host save complete");
+    }
 }
 
 void ModMain::OnCryActionNotifySaveGame(ISaveGame* saveGame)
@@ -74076,6 +74085,148 @@ uint32_t ModMain::SnapshotLatestHostPlayerStatesForSave(const std::string& saveK
         " skippedHistorical=" + std::to_string(skippedHistorical) +
         " failed=" + std::to_string(failed) +
         " saveKey=" + effectiveSaveKey +
+        (reason && reason[0] ? ": " + std::string(reason) : "");
+    LogCoop(m_lastPlayerStateTransferEvent);
+    return copied;
+}
+
+uint32_t ModMain::CarryForwardHostPlayerStatesForSave(
+    const std::string& previousSaveKey,
+    const std::string& nextSaveKey,
+    const char* reason)
+{
+    if (m_networkMode != CoopNetworkMode::Host ||
+        previousSaveKey.empty() ||
+        previousSaveKey == "unknown_save" ||
+        nextSaveKey.empty() ||
+        nextSaveKey == "unknown_save" ||
+        previousSaveKey == nextSaveKey ||
+        previousSaveKey != m_currentHostSaveStateKey)
+    {
+        return 0;
+    }
+
+    const uint64_t hostAccountToken = GetLocalAccountToken();
+    const std::filesystem::path baseRoot = GetCoopServerSaveStateRoot();
+    if (baseRoot.empty() || hostAccountToken == 0)
+        return 0;
+
+    const std::filesystem::path hostRoot =
+        baseRoot / ("host_" + Hex64(hostAccountToken));
+    const std::filesystem::path sourceRoot =
+        hostRoot / SanitizePathComponent(previousSaveKey);
+    const std::filesystem::path destRoot =
+        hostRoot / SanitizePathComponent(nextSaveKey);
+
+    std::error_code error;
+    const std::filesystem::file_status hostRootStatus =
+        std::filesystem::symlink_status(hostRoot, error);
+    if (error || hostRootStatus.type() != std::filesystem::file_type::directory)
+        return 0;
+
+    error.clear();
+    const std::filesystem::file_status sourceRootStatus =
+        std::filesystem::symlink_status(sourceRoot, error);
+    if (error || sourceRootStatus.type() != std::filesystem::file_type::directory)
+        return 0;
+
+    error.clear();
+    std::filesystem::file_status destRootStatus =
+        std::filesystem::symlink_status(destRoot, error);
+    const bool destRootMissing =
+        error == std::errc::no_such_file_or_directory ||
+        (!error && destRootStatus.type() == std::filesystem::file_type::not_found);
+    if (destRootMissing)
+    {
+        error.clear();
+        std::filesystem::create_directory(destRoot, error);
+        if (!error)
+            destRootStatus = std::filesystem::symlink_status(destRoot, error);
+    }
+    if (error || destRootStatus.type() != std::filesystem::file_type::directory)
+    {
+        ++m_hostPlayerStateSnapshotFailures;
+        m_lastPlayerStateTransferEvent = "host player carry-forward failed: destination scope";
+        return 0;
+    }
+
+    uint32_t copied = 0;
+    uint32_t failed = 0;
+    uint32_t invalid = 0;
+    error.clear();
+    for (std::filesystem::directory_iterator it(sourceRoot, error), end;
+         it != end;
+         it.increment(error))
+    {
+        if (error)
+        {
+            ++failed;
+            error.clear();
+            continue;
+        }
+
+        const std::filesystem::path sourcePath = it->path();
+        std::error_code fileError;
+        const std::filesystem::file_status sourceStatus =
+            std::filesystem::symlink_status(sourcePath, fileError);
+        if (fileError || sourceStatus.type() != std::filesystem::file_type::regular)
+            continue;
+
+        const std::string fileName = CoopFilesystem::ToUtf8(sourcePath.filename());
+        if (fileName.rfind("player_account_", 0) != 0 ||
+            sourcePath.extension() != ".state")
+        {
+            continue;
+        }
+
+        uint32_t ignoredSize = 0;
+        bool hasIntegrityHash = false;
+        std::string integrityReason;
+        if (!ValidatePlayerStateIntegrityFile(
+                sourcePath,
+                &ignoredSize,
+                &hasIntegrityHash,
+                &integrityReason) ||
+            !hasIntegrityHash)
+        {
+            ++invalid;
+            continue;
+        }
+
+        const std::filesystem::path destPath = destRoot / sourcePath.filename();
+        fileError.clear();
+        const std::filesystem::file_status destStatus =
+            std::filesystem::symlink_status(destPath, fileError);
+        const bool destMissing =
+            fileError == std::errc::no_such_file_or_directory ||
+            (!fileError && destStatus.type() == std::filesystem::file_type::not_found);
+        if ((!destMissing && fileError) ||
+            (!destMissing && destStatus.type() != std::filesystem::file_type::regular))
+        {
+            ++failed;
+            continue;
+        }
+
+        fileError.clear();
+        std::filesystem::copy_file(
+            sourcePath,
+            destPath,
+            std::filesystem::copy_options::overwrite_existing,
+            fileError);
+        if (fileError)
+            ++failed;
+        else
+            ++copied;
+    }
+
+    m_hostPlayerStateSnapshotCopies += copied;
+    m_hostPlayerStateSnapshotFailures += failed + invalid;
+    m_lastPlayerStateTransferEvent =
+        "carried forward host player states copied=" + std::to_string(copied) +
+        " invalid=" + std::to_string(invalid) +
+        " failed=" + std::to_string(failed) +
+        " from=" + previousSaveKey +
+        " to=" + nextSaveKey +
         (reason && reason[0] ? ": " + std::string(reason) : "");
     LogCoop(m_lastPlayerStateTransferEvent);
     return copied;
