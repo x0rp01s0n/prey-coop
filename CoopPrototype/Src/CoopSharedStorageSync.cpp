@@ -570,7 +570,8 @@ void ModMain::HandleSharedStorage(const CoopProtocol::SharedStoragePacket& packe
     const uint64_t localPeerHash = GetLocalAccountToken();
     if (packet.storageGuid == 0 || packet.areaId != m_localLevelId ||
         packet.worldEpoch != m_localWorldEpoch ||
-        !IsCurrentOrRecentHostSaveKeyHash(packet.hostSaveKeyHash) ||
+        packet.hostSaveKeyHash == 0 ||
+        packet.hostSaveKeyHash != CurrentHostSaveKeyHash() ||
         (packet.targetPeerHash != 0 && packet.targetPeerHash != localPeerHash))
     {
         ++m_sharedStorageDropped;
