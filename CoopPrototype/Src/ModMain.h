@@ -2207,6 +2207,10 @@ private:
     std::string BuildHostSaveStateKey(const std::string& savePathOrName) const;
     std::string BuildLegacyHostSaveStateKey(const std::string& savePathOrName) const;
     bool WriteDefaultHostPlayerStateFile(const std::string& path, const std::string& username);
+    uint32_t CarryForwardHostPlayerStatesForSave(
+        const std::string& previousSaveKey,
+        const std::string& nextSaveKey,
+        const char* reason);
     uint32_t SnapshotLatestHostPlayerStatesForSave(const std::string& saveKey, const char* reason);
     bool IsSessionGameplayReady() const;
     bool IsEnemyReplicationGameplayReady() const;
