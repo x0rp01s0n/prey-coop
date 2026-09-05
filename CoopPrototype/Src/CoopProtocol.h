@@ -7,7 +7,7 @@
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 244;
+constexpr uint16_t kProtocolVersion = 245;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -1348,6 +1348,9 @@ struct PlayerStateTransferPacket
     uint32_t checksum = 0;
     uint32_t flags = 0;
     uint64_t accountToken = 0;
+    // Host-issued lineage identity. It remains stable across ordinary saves
+    // and changes on an explicit rollback/load, including a same-key reload.
+    uint64_t hostTimelineToken = 0;
     char username[kUsernameSize] = {};
     char saveKey[kSaveKeySize] = {};
     uint8_t data[kPlayerStateTransferDataSize] = {};

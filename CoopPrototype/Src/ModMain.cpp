@@ -3650,6 +3650,7 @@ struct RecoveryStateMetadata
 {
     uint64_t accountToken = 0;
     uint64_t hostAccountToken = 0;
+    uint64_t timelineToken = 0;
     uint64_t revision = 0;
     std::string saveKey;
 };
@@ -3679,6 +3680,7 @@ bool ReadRecoveryStateMetadata(
     payload.imbue(std::locale::classic());
     bool accountPresent = false;
     bool hostAccountPresent = false;
+    bool timelinePresent = false;
     bool revisionPresent = false;
     bool saveKeyPresent = false;
     std::string line;
@@ -3724,6 +3726,26 @@ bool ReadRecoveryStateMetadata(
             }
             hostAccountPresent = metadata.hostAccountToken != 0;
         }
+        else if (line.rfind("recoveryTimeline=", 0) == 0)
+        {
+            const std::string value = line.substr(std::strlen("recoveryTimeline="));
+            if (value.empty() || value.size() > 16)
+                return false;
+            metadata.timelineToken = 0;
+            for (const char ch : value)
+            {
+                metadata.timelineToken <<= 4;
+                if (ch >= '0' && ch <= '9')
+                    metadata.timelineToken |= static_cast<uint64_t>(ch - '0');
+                else if (ch >= 'a' && ch <= 'f')
+                    metadata.timelineToken |= static_cast<uint64_t>(10 + ch - 'a');
+                else if (ch >= 'A' && ch <= 'F')
+                    metadata.timelineToken |= static_cast<uint64_t>(10 + ch - 'A');
+                else
+                    return false;
+            }
+            timelinePresent = metadata.timelineToken != 0;
+        }
         else if (line.rfind("recoverySaveKey=", 0) == 0)
         {
             metadata.saveKey = line.substr(std::strlen("recoverySaveKey="));
@@ -3737,7 +3759,7 @@ bool ReadRecoveryStateMetadata(
             revisionPresent = !revision.fail() && metadata.revision != 0;
         }
     }
-    return accountPresent && hostAccountPresent && saveKeyPresent && revisionPresent;
+    return accountPresent && hostAccountPresent && timelinePresent && saveKeyPresent && revisionPresent;
 }
 
 bool WriteTextFileWithIntegrityHash(const std::filesystem::path& path, const std::string& payload)
@@ -26373,6 +26395,53 @@ void ModMain::EndCoopLoadGuard(const char* reason)
         !loadFailed &&
         m_arkLevelTransitionLoadActive;
 
+    if (loadFailed &&
+        m_networkMode == CoopNetworkMode::Host &&
+        m_hostLoadTimelineRotationPending)
+    {
+        const std::string failedSaveKey = m_currentHostSaveStateKey;
+        const uint64_t failedTimelineToken = m_sessionHostTimelineToken;
+        m_sessionHostTimelineToken = m_hostLoadPreviousTimelineToken;
+        SetCurrentHostSaveStateKey(m_hostLoadPreviousSaveKey, true);
+        m_pendingHostSaveLoadBroadcastAfterLoad = false;
+        m_hostManualLoadPreloadTransferStarted = false;
+        m_pendingHostPlayerStateSend = false;
+        m_pendingHostPlayerStateAccountToken = 0;
+        m_pendingHostPlayerStateReason.clear();
+        m_pendingHostPlayerStateSaveKey.clear();
+        m_hostPlayerStatePreloadSent = false;
+        m_hostPlayerStateSentWorldEpoch = 0;
+        m_hostLoadTimelineRotationPending = false;
+        m_hostLoadPreviousSaveKey.clear();
+        m_hostLoadPreviousTimelineToken = 0;
+        if (m_hasRemoteEndpoint && m_sessionHostTimelineToken != 0 &&
+            !m_currentHostSaveStateKey.empty() &&
+            m_currentHostSaveStateKey != "unknown_save")
+        {
+            BroadcastHostSaveIdentity("manual host load failed; restored previous timeline", true);
+        }
+        LogCoop(
+            "manual host load failed; restored save timeline saveKey=" +
+            (m_currentHostSaveStateKey.empty() ? std::string("-") : m_currentHostSaveStateKey) +
+            " oldToken=" + Hex64(failedTimelineToken) +
+            " restoredToken=" + Hex64(m_sessionHostTimelineToken) +
+            " failedSaveKey=" + (failedSaveKey.empty() ? std::string("-") : failedSaveKey));
+    }
+    else if (!loadFailed && m_hostLoadTimelineRotationPending)
+    {
+        // The save key was exposed before native loading so the peer could
+        // preload the selected slot. Delay the destructive journal/dedupe
+        // reset until native loading succeeds; a failed load must leave the
+        // previous live timeline intact.
+        ResetAreaJournalTransferState("host save identity load committed");
+        ResetStoryEventState("host save identity load committed");
+        ResetAreaObjectEventState("host save identity load committed");
+        ReconcileLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey);
+        m_hostLoadTimelineRotationPending = false;
+        m_hostLoadPreviousSaveKey.clear();
+        m_hostLoadPreviousTimelineToken = 0;
+    }
+
     ++m_loadGuardEndCount;
     m_saveLoadGuardActive = false;
     m_waitingForPostLoadContinue = false;
@@ -29983,7 +30052,6 @@ void ModMain::OnCryActionLoadGameRequested(const char* path, bool quick, bool ig
     m_lastSaveLoadPath = path && path[0] ? path : "-";
     if (m_networkMode == CoopNetworkMode::Host || m_pendingAutoStartMode == "host")
     {
-        SetCurrentHostSaveStateKey(BuildHostSaveStateKey(m_lastSaveLoadPath), false);
         const std::string lowerPath = ToLowerAscii(m_lastSaveLoadPath);
         const bool looksLikeSaveFile =
             lowerPath.find("savegames") != std::string::npos ||
@@ -29991,6 +30059,22 @@ void ModMain::OnCryActionLoadGameRequested(const char* path, bool quick, bool ig
             lowerPath.find("autosave") != std::string::npos ||
             lowerPath.find("quicksave") != std::string::npos ||
             lowerPath.find("manual") != std::string::npos;
+        const bool explicitHostLoad =
+            m_networkMode == CoopNetworkMode::Host &&
+            !m_arkLevelTransitionLoadActive &&
+            looksLikeSaveFile;
+        if (explicitHostLoad)
+        {
+            m_hostLoadTimelineRotationPending = true;
+            m_hostLoadPreviousSaveKey = m_currentHostSaveStateKey;
+            m_hostLoadPreviousTimelineToken = m_sessionHostTimelineToken;
+            m_sessionHostTimelineToken = HashStoryString(
+                "host-rollback|" + Hex64(m_sessionHostAccountToken) + "|" +
+                std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+            LogCoop("rotated host timeline for explicit load token=" +
+                Hex64(m_sessionHostTimelineToken));
+        }
+        SetCurrentHostSaveStateKey(BuildHostSaveStateKey(m_lastSaveLoadPath), false);
         m_pendingHostSaveLoadBroadcastAfterLoad =
             m_networkMode == CoopNetworkMode::Host &&
             m_hasRemoteEndpoint &&
@@ -30019,6 +30103,7 @@ void ModMain::OnCryActionLoadGameFinished(const char* path, int result)
     {
         if (m_networkMode == CoopNetworkMode::Host && m_hostManualLoadPreloadTransferStarted)
         {
+            RetireFailedHostSaveTransferPackets();
             CoopProtocol::SaveTransferPacket abortPacket = {};
             if (BuildSaveTransferPacket(
                     abortPacket,
@@ -51847,6 +51932,9 @@ void ModMain::ResetWorldSyncControlState(const char* lastEvent)
     m_pendingHostWorldRequest = false;
     m_hasPendingHostWorldOffer = false;
     m_pendingHostSaveLoadBroadcastAfterLoad = false;
+    m_hostLoadTimelineRotationPending = false;
+    m_hostLoadPreviousSaveKey.clear();
+    m_hostLoadPreviousTimelineToken = 0;
     m_hostManualLoadPreloadTransferStarted = false;
     m_clientParallelHostLoadActive = false;
     m_clientParallelHostLoadConfirmed = false;
@@ -51905,6 +51993,7 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent, bool resetHos
     const std::string preservedDisconnectReason = m_clientDisconnectFlushReason;
     const std::string preservedDisconnectSaveKey = m_clientDisconnectFlushSaveKey;
     const uint64_t preservedDisconnectHostAccountToken = m_clientDisconnectFlushHostAccountToken;
+    const uint64_t preservedDisconnectHostTimelineToken = m_clientDisconnectFlushHostTimelineToken;
     const std::string preservedDisconnectJournalSourcePath = m_clientDisconnectFlushJournalSourcePath;
     const uint64_t preservedDisconnectJournalRevision = m_clientDisconnectFlushJournalRevision;
 
@@ -51943,6 +52032,7 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent, bool resetHos
     m_playerStateTransferUsername.clear();
     m_playerStateTransferAccountToken = 0;
     m_playerStateTransferHostAccountToken = 0;
+    m_playerStateTransferHostTimelineToken = 0;
     m_playerStateTransferSaveKey.clear();
     m_hostPlayerStateSentUsername.clear();
     if (resetHostSaveIdentity)
@@ -51957,6 +52047,7 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent, bool resetHos
     m_pendingClientPlayerStateUploadReason.clear();
     m_pendingClientPlayerStateUploadSaveKey.clear();
     m_pendingClientPlayerStateUploadHostAccountToken = 0;
+    m_pendingClientPlayerStateUploadHostTimelineToken = 0;
     m_clientDisconnectFlushPending = preserveClientDisconnectFlush;
     // The transfer itself was reset, so it is safe to retry it. An already
     // received StoredAck remains terminal and is consumed on the next tick.
@@ -51981,6 +52072,9 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent, bool resetHos
         : std::string();
     m_clientDisconnectFlushHostAccountToken = preserveClientDisconnectFlush
         ? preservedDisconnectHostAccountToken
+        : 0;
+    m_clientDisconnectFlushHostTimelineToken = preserveClientDisconnectFlush
+        ? preservedDisconnectHostTimelineToken
         : 0;
     m_clientDisconnectFlushJournalSourcePath = preserveClientDisconnectFlush
         ? preservedDisconnectJournalSourcePath
@@ -52015,6 +52109,7 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent, bool resetHos
     m_clientRecoveryJournalSourcePath.clear();
     m_clientRecoveryJournalSaveKey.clear();
     m_clientRecoveryJournalHostAccountToken = 0;
+    m_clientRecoveryJournalHostTimelineToken = 0;
     m_clientAwaitingHostPlayerState = false;
     m_hostPlayerStatePreloadSent = false;
     m_receivedPlayerStateInventoryPreparedForNativeLoad = false;
@@ -52270,6 +52365,12 @@ void ModMain::StartHost()
 
     m_networkMode = CoopNetworkMode::Host;
     m_sessionHostAccountToken = GetLocalAccountToken();
+    // This token identifies one live host timeline. Ordinary saves retain it;
+    // a fresh host process deliberately gets a new token so an unacknowledged
+    // journal cannot cross a host restart by accident.
+    m_sessionHostTimelineToken = HashStoryString(
+        "host-timeline|" + Hex64(m_sessionHostAccountToken) + "|" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     m_networkTelemetry.Reset();
     ResetRuntimeCostTelemetry();
     m_networkTickAccumulator = 0.0f;
@@ -52700,6 +52801,7 @@ void ModMain::StartClient()
 
     m_networkMode = CoopNetworkMode::Client;
     m_sessionHostAccountToken = 0;
+    m_sessionHostTimelineToken = 0;
     m_clientConnectStartTime = GetNowSeconds();
     m_networkTelemetry.Reset();
     ResetRuntimeCostTelemetry();
@@ -53127,6 +53229,7 @@ void ModMain::StopNetwork()
         m_clientDisconnectFlushReason.clear();
         m_clientDisconnectFlushSaveKey.clear();
         m_clientDisconnectFlushHostAccountToken = 0;
+        m_clientDisconnectFlushHostTimelineToken = 0;
         m_clientDisconnectFlushJournalSourcePath.clear();
         m_clientDisconnectFlushJournalRevision = 0;
     }
@@ -53211,6 +53314,7 @@ void ModMain::StopNetwork()
 
     m_networkMode = CoopNetworkMode::Off;
     m_sessionHostAccountToken = 0;
+    m_sessionHostTimelineToken = 0;
     m_clientConnectStartTime = -1.0f;
     m_saveLoadGuardActive = false;
     m_waitingForPostLoadContinue = false;
@@ -58197,6 +58301,7 @@ bool ModMain::BuildPlayerStateTransferPacket(CoopProtocol::PlayerStateTransferPa
     packet.checksum = m_playerStateTransferChecksum;
     packet.flags = m_playerStateTransferFlags;
     packet.accountToken = m_playerStateTransferAccountToken;
+    packet.hostTimelineToken = m_playerStateTransferHostTimelineToken;
     CopyFixedString(packet.username, sizeof(packet.username), m_playerStateTransferUsername);
     CopyFixedString(packet.saveKey, sizeof(packet.saveKey), m_playerStateTransferSaveKey);
     return true;
@@ -58282,13 +58387,17 @@ void ModMain::SetCurrentHostSaveStateKey(const std::string& saveKey, bool retain
     if (saveKey == m_currentHostSaveStateKey)
         return;
 
+    const bool deferTimelineTransition =
+        m_hostLoadTimelineRotationPending &&
+        m_networkMode == CoopNetworkMode::Host &&
+        !retainPrevious;
     const bool timelineChanged =
         !retainPrevious &&
         !m_currentHostSaveStateKey.empty() &&
         m_currentHostSaveStateKey != "unknown_save" &&
         !saveKey.empty() &&
         saveKey != "unknown_save";
-    if (timelineChanged)
+    if (timelineChanged && !deferTimelineTransition)
     {
         // Live journals and dedupe sets describe one host save timeline. A
         // manual load must not re-export the previous timeline under the new
@@ -58299,7 +58408,8 @@ void ModMain::SetCurrentHostSaveStateKey(const std::string& saveKey, bool retain
     }
 
     m_currentHostSaveStateKey = saveKey;
-    ReconcileLocalInventoryDirtyForSaveKey(saveKey);
+    if (!deferTimelineTransition)
+        ReconcileLocalInventoryDirtyForSaveKey(saveKey);
 }
 
 uint64_t ModMain::BuildStoryEventId(uint16_t eventKind, uint64_t targetId, int32_t count, uint16_t flags, uint32_t sequence) const
@@ -74441,7 +74551,8 @@ bool ModMain::StartClientNativePlayerSnapshotForUpload(const char* reason, const
         ? m_currentHostSaveStateKey
         : SanitizePathComponent(saveKey);
     const uint64_t hostAccountToken = GetSessionHostAccountToken();
-    if (hostAccountToken == 0 ||
+    const uint64_t hostTimelineToken = m_sessionHostTimelineToken;
+    if (hostAccountToken == 0 || hostTimelineToken == 0 ||
         effectiveSaveKey.empty() ||
         effectiveSaveKey == "unknown_save" ||
         effectiveSaveKey != m_currentHostSaveStateKey)
@@ -74584,6 +74695,7 @@ bool ModMain::StartClientNativePlayerSnapshotForUpload(const char* reason, const
         m_pendingClientPlayerStateUploadReason = reason && reason[0] ? reason : "client player state upload";
         m_pendingClientPlayerStateUploadSaveKey = effectiveSaveKey;
         m_pendingClientPlayerStateUploadHostAccountToken = hostAccountToken;
+        m_pendingClientPlayerStateUploadHostTimelineToken = hostTimelineToken;
         m_playerStateUploadAccumulator = 0.0f;
         m_lastPlayerStateTransferEvent =
             "client native player snapshot deferred: save gate " + joinedGateReasons;
@@ -74627,6 +74739,7 @@ bool ModMain::StartClientNativePlayerSnapshotForUpload(const char* reason, const
         m_pendingClientPlayerStateUploadReason = reason && reason[0] ? reason : "client player state upload";
         m_pendingClientPlayerStateUploadSaveKey = effectiveSaveKey;
         m_pendingClientPlayerStateUploadHostAccountToken = hostAccountToken;
+        m_pendingClientPlayerStateUploadHostTimelineToken = hostTimelineToken;
         m_playerStateUploadAccumulator = 0.0f;
         m_lastPlayerStateTransferEvent =
             "client native player snapshot deferred: SaveGame returned false gen=" +
@@ -74645,6 +74758,7 @@ bool ModMain::StartClientNativePlayerSnapshotForUpload(const char* reason, const
     m_pendingClientPlayerStateUploadReason = reason && reason[0] ? reason : "client player state upload";
     m_pendingClientPlayerStateUploadSaveKey = effectiveSaveKey;
     m_pendingClientPlayerStateUploadHostAccountToken = hostAccountToken;
+    m_pendingClientPlayerStateUploadHostTimelineToken = hostTimelineToken;
     m_lastPlayerStateTransferEvent =
         "client native player snapshot requested gen=" +
         std::to_string(m_clientPlayerSnapshotForUploadStartGeneration) +
@@ -74662,6 +74776,7 @@ bool ModMain::BeginClientPlayerStateUpload(const char* reason, const std::string
         ? m_currentHostSaveStateKey
         : SanitizePathComponent(saveKey);
     if (GetSessionHostAccountToken() == 0 ||
+        m_sessionHostTimelineToken == 0 ||
         effectiveSaveKey.empty() ||
         effectiveSaveKey == "unknown_save" ||
         effectiveSaveKey != m_currentHostSaveStateKey)
@@ -74841,6 +74956,7 @@ bool ModMain::BeginClientIntentionalDisconnect(const char* reason, bool captureI
     m_clientDisconnectFlushReason = reason && reason[0] ? reason : "intentional client disconnect";
     m_clientDisconnectFlushSaveKey = m_currentHostSaveStateKey;
     m_clientDisconnectFlushHostAccountToken = GetSessionHostAccountToken();
+    m_clientDisconnectFlushHostTimelineToken = m_sessionHostTimelineToken;
     m_clientDisconnectFlushJournalSourcePath.clear();
     m_clientDisconnectFlushJournalRevision = 0;
     m_clientDisconnectTransferSourcePath.clear();
@@ -74908,6 +75024,7 @@ bool ModMain::CaptureClientDisconnectSnapshot()
         m_localInventoryDirty = true;
         m_localInventoryDirtySaveKey = m_clientDisconnectFlushSaveKey;
         m_localInventoryDirtyHostAccountToken = GetSessionHostAccountToken();
+        m_localInventoryDirtyHostTimelineToken = m_sessionHostTimelineToken;
         m_localInventoryJournalAccumulator = 0.0f;
         m_lastPlayerStateTransferEvent =
             "intentional disconnect: recovery journal write unavailable; local fallback armed";
@@ -74918,6 +75035,7 @@ bool ModMain::CaptureClientDisconnectSnapshot()
         m_localInventoryDirty = false;
         m_localInventoryDirtySaveKey.clear();
         m_localInventoryDirtyHostAccountToken = 0;
+        m_localInventoryDirtyHostTimelineToken = 0;
     }
 
     const uint32_t transferId =
@@ -75003,6 +75121,8 @@ void ModMain::TickClientIntentionalDisconnect(float frameTime)
 
     if (m_clientDisconnectFlushHostAccountToken == 0 ||
         m_clientDisconnectFlushHostAccountToken != GetSessionHostAccountToken() ||
+        m_clientDisconnectFlushHostTimelineToken == 0 ||
+        m_clientDisconnectFlushHostTimelineToken != m_sessionHostTimelineToken ||
         m_clientDisconnectFlushSaveKey.empty() ||
         m_clientDisconnectFlushSaveKey != m_currentHostSaveStateKey)
     {
@@ -75014,6 +75134,7 @@ void ModMain::TickClientIntentionalDisconnect(float frameTime)
         m_clientDisconnectFlushStoredAckReceived = false;
         m_clientDisconnectFlushCaptureAttempted = false;
         m_clientDisconnectFlushHostAccountToken = 0;
+        m_clientDisconnectFlushHostTimelineToken = 0;
         if (m_nativeWindowCloseDeferred)
             ResumeDeferredNativeWindowClose();
         DisconnectRemotePeer("intentional disconnect; host/save scope changed");
@@ -75061,6 +75182,7 @@ void ModMain::TickClientIntentionalDisconnect(float frameTime)
         m_clientDisconnectFlushJournalSourcePath.clear();
         m_clientDisconnectFlushJournalRevision = 0;
         m_clientDisconnectFlushHostAccountToken = 0;
+        m_clientDisconnectFlushHostTimelineToken = 0;
         m_lastPlayerStateTransferEvent =
             "intentional disconnect: host stored player state; disconnecting";
         LogCoop(m_lastPlayerStateTransferEvent);
@@ -75126,6 +75248,7 @@ void ModMain::TickClientIntentionalDisconnect(float frameTime)
     m_clientDisconnectFlushJournalSourcePath.clear();
     m_clientDisconnectFlushJournalRevision = 0;
     m_clientDisconnectFlushHostAccountToken = 0;
+    m_clientDisconnectFlushHostTimelineToken = 0;
     m_lastPlayerStateTransferEvent =
         "intentional disconnect: stored ack timeout; using local sidecar fallback";
     LogCoop(m_lastPlayerStateTransferEvent);
@@ -75143,10 +75266,11 @@ void ModMain::QueueClientPlayerStateUpload(const char* reason, const std::string
     const bool uploadFromNativeClientSave =
         std::string_view(uploadReason).find("native client save hook") != std::string_view::npos;
     const uint64_t hostAccountToken = GetSessionHostAccountToken();
+    const uint64_t hostTimelineToken = m_sessionHostTimelineToken;
     const std::string effectiveSaveKey = saveKey.empty()
         ? m_currentHostSaveStateKey
         : SanitizePathComponent(saveKey);
-    if (hostAccountToken == 0 ||
+    if (hostAccountToken == 0 || hostTimelineToken == 0 ||
         effectiveSaveKey.empty() ||
         effectiveSaveKey == "unknown_save" ||
         effectiveSaveKey != m_currentHostSaveStateKey)
@@ -75173,6 +75297,7 @@ void ModMain::QueueClientPlayerStateUpload(const char* reason, const std::string
     m_pendingClientPlayerStateUploadReason = uploadReason;
     m_pendingClientPlayerStateUploadSaveKey = effectiveSaveKey;
     m_pendingClientPlayerStateUploadHostAccountToken = hostAccountToken;
+    m_pendingClientPlayerStateUploadHostTimelineToken = hostTimelineToken;
     m_playerStateUploadAccumulator = 0.0f;
     if (!uploadFromNativeClientSave)
         m_lastPlayerStateTransferEvent = "queued client player state upload: " + m_pendingClientPlayerStateUploadReason;
@@ -75189,7 +75314,7 @@ bool ModMain::RequestRemotePlayerStateUpload(const char* reason)
     }
 
     const std::string saveKey = m_currentHostSaveStateKey;
-    if (saveKey.empty() || saveKey == "unknown_save")
+    if (m_sessionHostTimelineToken == 0 || saveKey.empty() || saveKey == "unknown_save")
     {
         m_lastPlayerStateTransferEvent =
             "remote player state upload request rejected: host save scope unavailable";
@@ -75228,6 +75353,7 @@ bool ModMain::RequestRemotePlayerStateUpload(const char* reason)
         packet.transferId =
             lastTransferId == std::numeric_limits<uint32_t>::max() ? 1u : lastTransferId + 1u;
         packet.worldEpoch = m_localWorldEpoch;
+        packet.hostTimelineToken = m_sessionHostTimelineToken;
         packet.accountToken = peer.accountToken;
         CopyFixedString(packet.username, sizeof(packet.username), peer.username);
         CopyFixedString(packet.saveKey, sizeof(packet.saveKey), saveKey);
@@ -75284,6 +75410,9 @@ bool ModMain::BroadcastHostSaveIdentity(const char* reason, bool replaceTimeline
     if (saveKey.empty() || saveKey == "unknown_save")
         return false;
 
+    if (replaceTimeline)
+        RetirePlayerStateTransferForHostTimeline(m_sessionHostTimelineToken);
+
     bool sentAny = false;
     bool allSent = true;
     for (const auto& entry : m_remotePeers)
@@ -75300,6 +75429,7 @@ bool ModMain::BroadcastHostSaveIdentity(const char* reason, bool replaceTimeline
         packet.command = static_cast<uint32_t>(
             CoopProtocol::PlayerStateTransferCommand::HostSaveIdentity);
         packet.worldEpoch = m_localWorldEpoch;
+        packet.hostTimelineToken = m_sessionHostTimelineToken;
         if (replaceTimeline)
             packet.flags |= CoopProtocol::kPlayerStateTransferFlagReplaceTimeline;
         packet.accountToken = peer.accountToken;
@@ -75322,6 +75452,145 @@ bool ModMain::BroadcastHostSaveIdentity(const char* reason, bool replaceTimeline
         (reason && reason[0] ? " reason=" + std::string(reason) : std::string());
     LogCoop(m_lastPlayerStateTransferEvent);
     return sentAny && allSent;
+}
+
+void ModMain::RetirePlayerStateTransferForHostTimeline(uint64_t timelineToken)
+{
+    if (m_networkMode != CoopNetworkMode::Host)
+        return;
+
+    const bool preservePendingLoadBroadcast = m_pendingHostSaveLoadBroadcastAfterLoad;
+    const bool preserveManualPreload = m_hostManualLoadPreloadTransferStarted;
+
+    for (const auto& entry : m_hostPlayerStateUploadReceives)
+    {
+        if (!entry.second.receivePath.empty())
+        {
+            std::error_code error;
+            std::filesystem::remove(
+                CoopFilesystem::FromUtf8(entry.second.receivePath),
+                error);
+        }
+    }
+
+    // Reset the active transfer and pending host snapshot, but preserve the
+    // explicit-load barrier that BroadcastHostSaveIdentity is servicing.
+    ResetPlayerStateTransferState("retired player state for host timeline", false);
+    m_pendingHostSaveLoadBroadcastAfterLoad = preservePendingLoadBroadcast;
+    m_hostManualLoadPreloadTransferStarted = preserveManualPreload;
+
+    size_t rewrittenQueued = 0;
+    for (auto it = m_reliableSendQueue.begin(); it != m_reliableSendQueue.end(); ++it)
+    {
+        bool stale = false;
+        if (it->payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::PlayerStateTransfer) &&
+            it->payloadSize == sizeof(CoopProtocol::PlayerStateTransferPacket))
+        {
+            CoopProtocol::PlayerStateTransferPacket packet = {};
+            std::memcpy(&packet, it->payload.data(), sizeof(packet));
+            stale = packet.hostTimelineToken != timelineToken;
+        }
+        if (stale)
+        {
+            // Keep the reliable envelope sequence occupied. Removing an
+            // unsent packet would leave a gap and make the peer wait forever
+            // for the missing sequence before it can process HostSaveIdentity.
+            CoopProtocol::PlayerStateTransferPacket abortPacket = {};
+            std::memcpy(&abortPacket, it->payload.data(), sizeof(abortPacket));
+            abortPacket.command = static_cast<uint32_t>(
+                CoopProtocol::PlayerStateTransferCommand::Abort);
+            abortPacket.totalBytes = 0;
+            abortPacket.chunkCount = 0;
+            abortPacket.chunkIndex = 0;
+            abortPacket.chunkBytes = 0;
+            abortPacket.checksum = 0;
+            std::memset(abortPacket.data, 0, sizeof(abortPacket.data));
+            std::fill(it->payload.begin(), it->payload.end(), 0);
+            std::memcpy(it->payload.data(), &abortPacket, sizeof(abortPacket));
+            it->payloadSize = sizeof(abortPacket);
+            it->lastSendTime = -1000.0f;
+            it->sendAttempts = 0;
+            it->failurePrefix = "retired stale player-state abort send failed";
+            ++rewrittenQueued;
+        }
+    }
+
+    if (rewrittenQueued != 0)
+    {
+        m_networkTelemetry.UpdateReliableQueue(
+            m_reliableSendQueue.size(),
+            m_reliableSendQueue.empty()
+                ? 0.0f
+                : std::max(0.0f, GetNowSeconds() - m_reliableSendQueue.front().enqueuedTime));
+        m_lastReliableEvent =
+            "rewrote stale host player-state packets as aborts for timeline=" + Hex64(timelineToken) +
+            " count=" + std::to_string(rewrittenQueued);
+        LogCoop(m_lastReliableEvent);
+    }
+}
+
+void ModMain::RetireFailedHostSaveTransferPackets()
+{
+    if (m_networkMode != CoopNetworkMode::Host ||
+        m_saveTransferId == 0 ||
+        m_saveTransferAddress == 0 ||
+        m_saveTransferPort == 0)
+    {
+        return;
+    }
+
+    size_t rewrittenQueued = 0;
+    for (PendingReliablePacket& pending : m_reliableSendQueue)
+    {
+        if (pending.address != m_saveTransferAddress ||
+            pending.port != m_saveTransferPort ||
+            pending.payloadType != static_cast<uint16_t>(CoopProtocol::PacketType::SaveTransfer) ||
+            pending.payloadSize != sizeof(CoopProtocol::SaveTransferPacket))
+        {
+            continue;
+        }
+
+        CoopProtocol::SaveTransferPacket packet = {};
+        std::memcpy(&packet, pending.payload.data(), sizeof(packet));
+        if (packet.transferId != m_saveTransferId ||
+            packet.command == static_cast<uint32_t>(CoopProtocol::SaveTransferCommand::Abort))
+        {
+            continue;
+        }
+
+        // Keep the reliable envelope sequence occupied. Replacing the
+        // failed transfer packet with an Abort lets the peer advance its
+        // ordered stream and stop before any queued Complete can import the
+        // failed save.
+        packet.command = static_cast<uint32_t>(CoopProtocol::SaveTransferCommand::Abort);
+        packet.totalBytes = 0;
+        packet.chunkIndex = 0;
+        packet.chunkCount = 0;
+        packet.chunkBytes = 0;
+        packet.checksum = 0;
+        std::memset(packet.data, 0, sizeof(packet.data));
+        std::fill(pending.payload.begin(), pending.payload.end(), 0);
+        std::memcpy(pending.payload.data(), &packet, sizeof(packet));
+        pending.payloadSize = sizeof(packet);
+        pending.lastSendTime = -1000.0f;
+        pending.sendAttempts = 0;
+        pending.failurePrefix = "retired failed save-transfer abort send failed";
+        ++rewrittenQueued;
+    }
+
+    if (rewrittenQueued != 0)
+    {
+        m_networkTelemetry.UpdateReliableQueue(
+            m_reliableSendQueue.size(),
+            m_reliableSendQueue.empty()
+                ? 0.0f
+                : std::max(0.0f, GetNowSeconds() - m_reliableSendQueue.front().enqueuedTime));
+        m_lastReliableEvent =
+            "rewrote failed save-transfer packets as aborts transfer=" +
+            std::to_string(m_saveTransferId) +
+            " count=" + std::to_string(rewrittenQueued);
+        LogCoop(m_lastReliableEvent);
+    }
 }
 
 bool ModMain::QueueAuthoritativePlayerInventoryRestore(const PlayerSidecarState& state, const char* reason)
@@ -75466,6 +75735,8 @@ bool ModMain::PrepareReceivedPlayerStateForHostLoad(const char* reason)
 
     if (m_playerStateTransferHostAccountToken == 0 ||
         m_playerStateTransferHostAccountToken != GetSessionHostAccountToken() ||
+        m_playerStateTransferHostTimelineToken == 0 ||
+        m_playerStateTransferHostTimelineToken != m_sessionHostTimelineToken ||
         m_playerStateTransferSaveKey.empty() ||
         m_playerStateTransferSaveKey != m_currentHostSaveStateKey)
     {
@@ -75482,7 +75753,8 @@ bool ModMain::PrepareReceivedPlayerStateForHostLoad(const char* reason)
         m_clientRecoveryJournalPending &&
         !m_clientRecoveryJournalSourcePath.empty() &&
         m_clientRecoveryJournalSaveKey == m_currentHostSaveStateKey &&
-        m_clientRecoveryJournalHostAccountToken == GetSessionHostAccountToken();
+        m_clientRecoveryJournalHostAccountToken == GetSessionHostAccountToken() &&
+        m_clientRecoveryJournalHostTimelineToken == m_sessionHostTimelineToken;
     const std::string& sourcePath = useRecoveryJournal
         ? m_clientRecoveryJournalSourcePath
         : m_playerStateTransferReceivePath;
@@ -75809,6 +76081,12 @@ bool ModMain::StartPlayerStateTransferFromFile(const std::string& sourcePath, co
         m_lastPlayerStateTransferEvent = "player state transfer missing account identity";
         return false;
     }
+    m_playerStateTransferHostTimelineToken = m_sessionHostTimelineToken;
+    if (m_playerStateTransferHostTimelineToken == 0)
+    {
+        m_lastPlayerStateTransferEvent = "player state transfer missing host timeline identity";
+        return false;
+    }
     m_playerStateTransferSaveKey = saveKey;
     m_playerStateTransferTotalBytes = fileSize;
     m_playerStateTransferChunkCount = (fileSize + static_cast<uint32_t>(CoopProtocol::kPlayerStateTransferDataSize) - 1u) /
@@ -75919,6 +76197,8 @@ bool ModMain::TryApplyReceivedPlayerStateTransfer(const char* reason)
 
     if (m_playerStateTransferHostAccountToken == 0 ||
         m_playerStateTransferHostAccountToken != GetSessionHostAccountToken() ||
+        m_playerStateTransferHostTimelineToken == 0 ||
+        m_playerStateTransferHostTimelineToken != m_sessionHostTimelineToken ||
         m_playerStateTransferSaveKey.empty() ||
         m_playerStateTransferSaveKey != m_currentHostSaveStateKey)
     {
@@ -76087,6 +76367,7 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
         const std::string acknowledgedSourcePath = m_clientRecoveryJournalSourcePath;
         const std::string acknowledgedSaveKey = m_clientRecoveryJournalSaveKey;
         const uint64_t acknowledgedHostAccountToken = m_clientRecoveryJournalHostAccountToken;
+        const uint64_t acknowledgedHostTimelineToken = m_clientRecoveryJournalHostTimelineToken;
         const bool cleared = ClearLocalPlayerRecoveryJournal(
             acknowledgedSourcePath,
             GetLocalAccountToken(),
@@ -76102,6 +76383,7 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
         const bool newerJournal = currentJournalReadable &&
             currentJournal.accountToken == GetLocalAccountToken() &&
             currentJournal.hostAccountToken == acknowledgedHostAccountToken &&
+            currentJournal.timelineToken == acknowledgedHostTimelineToken &&
             currentJournal.saveKey == acknowledgedSaveKey &&
             currentJournal.revision > acknowledgedRevision;
         const bool newerLocalMutation =
@@ -76121,6 +76403,7 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
             m_clientRecoveryJournalSourcePath.clear();
             m_clientRecoveryJournalSaveKey.clear();
             m_clientRecoveryJournalHostAccountToken = 0;
+            m_clientRecoveryJournalHostTimelineToken = 0;
 
             bool capturedNewerMutation = false;
             if (IsLocalInventoryDirtyForSaveKey(acknowledgedSaveKey) &&
@@ -76137,6 +76420,7 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
                     m_localInventoryDirty = false;
                     m_localInventoryDirtySaveKey.clear();
                     m_localInventoryDirtyHostAccountToken = 0;
+                    m_localInventoryDirtyHostTimelineToken = 0;
                     capturedNewerMutation = true;
                 }
             }
@@ -76157,6 +76441,7 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
             m_clientRecoveryJournalSourcePath.clear();
             m_clientRecoveryJournalSaveKey.clear();
             m_clientRecoveryJournalHostAccountToken = 0;
+            m_clientRecoveryJournalHostTimelineToken = 0;
             if (!cleared)
                 m_lastPlayerStateTransferEvent = "recovery journal ack had no matching source; continuing host apply";
         }
@@ -76181,6 +76466,7 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
             m_localInventoryDirty = false;
             m_localInventoryDirtySaveKey.clear();
             m_localInventoryDirtyHostAccountToken = 0;
+            m_localInventoryDirtyHostTimelineToken = 0;
         }
         RecoverLocalPlayerRecoveryJournal(captureReason);
     }
@@ -76192,6 +76478,7 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
         !m_currentHostSaveStateKey.empty() &&
         m_currentHostSaveStateKey == m_clientRecoveryJournalSaveKey &&
         m_clientRecoveryJournalHostAccountToken == GetSessionHostAccountToken() &&
+        m_clientRecoveryJournalHostTimelineToken == m_sessionHostTimelineToken &&
         !IsLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey) &&
         !m_saveLoadGuardActive &&
         !m_playerStateTransferSending &&
@@ -76317,6 +76604,8 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
     {
         if (m_pendingClientPlayerStateUploadHostAccountToken == 0 ||
             m_pendingClientPlayerStateUploadHostAccountToken != GetSessionHostAccountToken() ||
+            m_pendingClientPlayerStateUploadHostTimelineToken == 0 ||
+            m_pendingClientPlayerStateUploadHostTimelineToken != m_sessionHostTimelineToken ||
             m_pendingClientPlayerStateUploadSaveKey.empty() ||
             m_pendingClientPlayerStateUploadSaveKey != m_currentHostSaveStateKey)
         {
@@ -76324,6 +76613,7 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
             m_pendingClientPlayerStateUploadReason.clear();
             m_pendingClientPlayerStateUploadSaveKey.clear();
             m_pendingClientPlayerStateUploadHostAccountToken = 0;
+            m_pendingClientPlayerStateUploadHostTimelineToken = 0;
             m_clientPlayerSnapshotForUploadPending = false;
             m_clientPlayerSnapshotForUploadWaitSeconds = 0.0f;
             m_clientPlayerSnapshotFragmentWaitStarted = false;
@@ -76346,6 +76636,7 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
             m_pendingClientPlayerStateUploadReason.clear();
             m_pendingClientPlayerStateUploadSaveKey.clear();
             m_pendingClientPlayerStateUploadHostAccountToken = 0;
+            m_pendingClientPlayerStateUploadHostTimelineToken = 0;
             m_lastPlayerStateTransferEvent = "started queued client player state upload";
         }
         return;
@@ -77855,7 +78146,9 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             packet.transferId == m_clientRecoveryJournalTransferId &&
             packet.checksum == m_clientRecoveryJournalChecksum &&
             saveKey == m_clientRecoveryJournalSaveKey &&
-            m_clientRecoveryJournalHostAccountToken == GetSessionHostAccountToken())
+            m_clientRecoveryJournalHostAccountToken == GetSessionHostAccountToken() &&
+            packet.hostTimelineToken == m_clientRecoveryJournalHostTimelineToken &&
+            packet.hostTimelineToken == m_sessionHostTimelineToken)
         {
             m_clientRecoveryJournalStoredAckReceived = true;
             m_lastPlayerStateTransferEvent =
@@ -77871,7 +78164,9 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             packet.transferId != m_clientDisconnectFlushTransferId ||
             packet.checksum != m_clientDisconnectFlushChecksum ||
             saveKey != m_clientDisconnectFlushSaveKey ||
-            m_clientDisconnectFlushHostAccountToken != GetSessionHostAccountToken())
+            m_clientDisconnectFlushHostAccountToken != GetSessionHostAccountToken() ||
+            packet.hostTimelineToken != m_clientDisconnectFlushHostTimelineToken ||
+            packet.hostTimelineToken != m_sessionHostTimelineToken)
         {
             m_lastPlayerStateTransferEvent = "ignored unexpected player state stored ack";
             return;
@@ -77889,7 +78184,8 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
 
     if (command == CoopProtocol::PlayerStateTransferCommand::HostSaveIdentity)
     {
-        if (m_networkMode != CoopNetworkMode::Client || saveKey.empty())
+        if (m_networkMode != CoopNetworkMode::Client || saveKey.empty() ||
+            packet.hostTimelineToken == 0)
         {
             m_lastPlayerStateTransferEvent = "ignored invalid host save identity";
             return;
@@ -77897,6 +78193,30 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
 
         const bool replaceTimeline =
             (packet.flags & CoopProtocol::kPlayerStateTransferFlagReplaceTimeline) != 0;
+        if ((!replaceTimeline && m_sessionHostTimelineToken != 0 &&
+                packet.hostTimelineToken != m_sessionHostTimelineToken) ||
+            (replaceTimeline && m_sessionHostTimelineToken != 0 &&
+                packet.hostTimelineToken == m_sessionHostTimelineToken))
+        {
+            m_lastPlayerStateTransferEvent = "ignored host save identity for stale timeline";
+            LogCoop(m_lastPlayerStateTransferEvent);
+            return;
+        }
+        if (replaceTimeline)
+        {
+            // Drop any host-state transfer that was queued under the old
+            // lineage before accepting the replacement. Old reliable chunks
+            // must not complete into a same-key rollback.
+            ResetPlayerStateTransferState("host timeline replaced", false);
+            // A manual load is a new authority timeline even when it reloads
+            // the same save key. Keep old journals on disk, but never let
+            // their dirty in-memory state follow the rollback.
+            m_localInventoryDirty = false;
+            m_localInventoryDirtySaveKey.clear();
+            m_localInventoryDirtyHostAccountToken = 0;
+            m_localInventoryDirtyHostTimelineToken = 0;
+        }
+        m_sessionHostTimelineToken = packet.hostTimelineToken;
         SetCurrentHostSaveStateKey(saveKey, !replaceTimeline);
         RecoverLocalPlayerRecoveryJournal("host save identity");
         m_lastPlayerStateTransferEvent = "applied host save identity saveKey=" + saveKey;
@@ -77908,6 +78228,13 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
     {
         if (m_networkMode == CoopNetworkMode::Client)
         {
+            if (packet.hostTimelineToken == 0 ||
+                (m_sessionHostTimelineToken != 0 &&
+                    packet.hostTimelineToken != m_sessionHostTimelineToken))
+            {
+                m_lastPlayerStateTransferEvent = "ignored host player state request for stale timeline";
+                return;
+            }
             m_lastPlayerStateTransferEvent = "received host player state upload request";
             QueueClientPlayerStateUpload("host requested player state", saveKey);
         }
@@ -77935,6 +78262,12 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
 
         if (command == CoopProtocol::PlayerStateTransferCommand::Start)
         {
+            if (packet.hostTimelineToken == 0 ||
+                packet.hostTimelineToken != m_sessionHostTimelineToken)
+            {
+                failUpload("rejected client player state upload for stale host timeline");
+                return;
+            }
             if (packet.totalBytes == 0 || packet.chunkCount == 0)
             {
                 failUpload("ignored empty client player state upload");
@@ -77951,6 +78284,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             receive.checksum = packet.checksum;
             receive.runningChecksum = kFnv1aOffsetBasis;
             receive.accountToken = packet.accountToken;
+            receive.hostTimelineToken = packet.hostTimelineToken;
             receive.username = username.empty() ? std::string("Player") : username;
             receive.saveKey = saveKey;
             receive.receivePath = BuildCoopTempPlayerStatePath(
@@ -77993,6 +78327,14 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             return;
         }
         HostPlayerStateUploadReceive& receive = receiveIt->second;
+
+        if (packet.hostTimelineToken == 0 ||
+            packet.hostTimelineToken != receive.hostTimelineToken ||
+            packet.hostTimelineToken != m_sessionHostTimelineToken)
+        {
+            failUpload("client player state packet crossed host timeline");
+            return;
+        }
 
         if (command == CoopProtocol::PlayerStateTransferCommand::Chunk)
         {
@@ -78073,6 +78415,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         const uint32_t storedChecksum = receive.checksum;
         const std::string storedUsername = receive.username;
         const std::string storedSaveKey = receive.saveKey;
+        const uint64_t storedHostTimelineToken = receive.hostTimelineToken;
         if (storedSaveKey.empty() ||
             m_currentHostSaveStateKey.empty() ||
             storedSaveKey != m_currentHostSaveStateKey)
@@ -78082,6 +78425,12 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
                 (storedSaveKey.empty() ? std::string("-") : storedSaveKey) +
                 " current=" +
                 (m_currentHostSaveStateKey.empty() ? std::string("-") : m_currentHostSaveStateKey));
+            return;
+        }
+        if (receive.hostTimelineToken == 0 ||
+            receive.hostTimelineToken != m_sessionHostTimelineToken)
+        {
+            failUpload("rejected client player state for stale host timeline");
             return;
         }
         const std::filesystem::path receivePath = CoopFilesystem::FromUtf8(receive.receivePath);
@@ -78113,6 +78462,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         if (incomingIsRecovery &&
             (incomingRecovery.accountToken != accountToken ||
                 incomingRecovery.hostAccountToken != GetLocalAccountToken() ||
+                incomingRecovery.timelineToken != receive.hostTimelineToken ||
                 incomingRecovery.saveKey != storedSaveKey ||
                 storedSaveKey.empty()))
         {
@@ -78129,6 +78479,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             if (ReadRecoveryStateMetadata(scopedDest, existingRecovery) &&
                 existingRecovery.accountToken == accountToken &&
                 existingRecovery.hostAccountToken == GetLocalAccountToken() &&
+                existingRecovery.timelineToken == receive.hostTimelineToken &&
                 existingRecovery.saveKey == storedSaveKey &&
                 existingRecovery.revision >= incomingRecovery.revision)
             {
@@ -78247,6 +78598,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             ackPacket.worldEpoch = m_localWorldEpoch;
             ackPacket.checksum = storedChecksum;
             ackPacket.accountToken = accountToken;
+            ackPacket.hostTimelineToken = storedHostTimelineToken;
             CopyFixedString(ackPacket.username, sizeof(ackPacket.username), storedUsername);
             CopyFixedString(ackPacket.saveKey, sizeof(ackPacket.saveKey), storedSaveKey);
             if (!SendPlayerStateTransferTo(
@@ -78311,6 +78663,9 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         {
             const uint64_t hostAccountToken = GetSessionHostAccountToken();
             if (hostAccountToken == 0 || saveKey.empty() || saveKey == "unknown_save" ||
+                packet.hostTimelineToken == 0 ||
+                (m_sessionHostTimelineToken != 0 &&
+                    packet.hostTimelineToken != m_sessionHostTimelineToken) ||
                 (!m_currentHostSaveStateKey.empty() &&
                     m_currentHostSaveStateKey != "unknown_save" &&
                     saveKey != m_currentHostSaveStateKey))
@@ -78323,6 +78678,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             if (m_currentHostSaveStateKey.empty() ||
                 m_currentHostSaveStateKey == "unknown_save")
             {
+                m_sessionHostTimelineToken = packet.hostTimelineToken;
                 SetCurrentHostSaveStateKey(saveKey, false);
             }
             RecoverLocalPlayerRecoveryJournal("host player state identity");
@@ -78342,6 +78698,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             m_networkMode == CoopNetworkMode::Client && hostAuthoritative
                 ? GetSessionHostAccountToken()
                 : GetLocalAccountToken();
+        m_playerStateTransferHostTimelineToken = packet.hostTimelineToken;
         m_playerStateTransferSaveKey = saveKey;
         m_playerStateTransferReceivePath = BuildCoopTempPlayerStatePath(packet.transferId, m_playerStateTransferUsername);
         if (m_networkMode == CoopNetworkMode::Client && hostAuthoritative)
@@ -78381,6 +78738,15 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
 
     if (!m_playerStateTransferReceiving || packet.transferId != m_playerStateTransferId)
         return;
+    if (m_networkMode == CoopNetworkMode::Client &&
+        hostAuthoritative &&
+        (packet.hostTimelineToken == 0 ||
+            packet.hostTimelineToken != m_playerStateTransferHostTimelineToken ||
+            packet.hostTimelineToken != m_sessionHostTimelineToken))
+    {
+        m_lastPlayerStateTransferEvent = "ignored host player state packet for stale timeline";
+        return;
+    }
 
     if (command == CoopProtocol::PlayerStateTransferCommand::Chunk)
     {
@@ -78497,7 +78863,8 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             if (m_clientRecoveryJournalPending &&
                 !m_clientRecoveryJournalSourcePath.empty() &&
                 m_clientRecoveryJournalSaveKey == m_currentHostSaveStateKey &&
-                m_clientRecoveryJournalHostAccountToken == GetSessionHostAccountToken())
+                m_clientRecoveryJournalHostAccountToken == GetSessionHostAccountToken() &&
+                m_clientRecoveryJournalHostTimelineToken == m_sessionHostTimelineToken)
             {
                 PlayerSidecarState recoveryState;
                 if (!LoadPlayerSidecarFromPath(m_clientRecoveryJournalSourcePath, recoveryState))

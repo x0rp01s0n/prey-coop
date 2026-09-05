@@ -312,6 +312,33 @@ bool WritePlayerSidecarPayloadWithHash(const std::filesystem::path& path, const 
 {
     std::filesystem::path tempPath = path;
     tempPath += ".tmp";
+    std::error_code statusError;
+    std::filesystem::file_status tempStatus =
+        std::filesystem::symlink_status(tempPath, statusError);
+    if (statusError == std::errc::no_such_file_or_directory)
+    {
+        statusError.clear();
+        tempStatus = std::filesystem::file_status(std::filesystem::file_type::not_found);
+    }
+    if (statusError ||
+        (tempStatus.type() != std::filesystem::file_type::not_found &&
+            tempStatus.type() != std::filesystem::file_type::regular))
+    {
+        return false;
+    }
+    statusError.clear();
+    std::filesystem::file_status destinationStatus =
+        std::filesystem::symlink_status(path, statusError);
+    if (statusError == std::errc::no_such_file_or_directory)
+    {
+        statusError.clear();
+        destinationStatus = std::filesystem::file_status(std::filesystem::file_type::not_found);
+    }
+    if (statusError ||
+        (destinationStatus.type() != std::filesystem::file_type::not_found &&
+            destinationStatus.type() != std::filesystem::file_type::regular))
+        return false;
+
     std::ofstream output(tempPath, std::ios::binary | std::ios::trunc);
     if (!output)
         return false;
@@ -353,6 +380,7 @@ struct RecoveryJournalMetadata
 {
     uint64_t accountToken = 0;
     uint64_t hostAccountToken = 0;
+    uint64_t timelineToken = 0;
     uint64_t revision = 0;
     std::string saveKey;
 };
@@ -402,6 +430,7 @@ bool ParseRecoveryJournalMetadata(
 
     bool hasAccount = false;
     bool hasHostAccount = false;
+    bool hasTimeline = false;
     bool hasSaveKey = false;
     bool hasRevision = false;
     std::istringstream input(payload);
@@ -413,6 +442,8 @@ bool ParseRecoveryJournalMetadata(
             hasAccount = ParseRecoveryJournalUint64(AfterPrefix(line, "recoveryAccount="), metadata.accountToken);
         else if (StartsWith(line, "recoveryHost="))
             hasHostAccount = ParseRecoveryJournalUint64(AfterPrefix(line, "recoveryHost="), metadata.hostAccountToken);
+        else if (StartsWith(line, "recoveryTimeline="))
+            hasTimeline = ParseRecoveryJournalUint64(AfterPrefix(line, "recoveryTimeline="), metadata.timelineToken);
         else if (StartsWith(line, "recoverySaveKey="))
         {
             metadata.saveKey = AfterPrefix(line, "recoverySaveKey=");
@@ -429,7 +460,7 @@ bool ParseRecoveryJournalMetadata(
 
     if (outPayload)
         *outPayload = std::move(payload);
-    return hasAccount && hasHostAccount && hasSaveKey && hasRevision;
+    return hasAccount && hasHostAccount && hasTimeline && hasSaveKey && hasRevision;
 }
 
 uint64_t GetRecoveryJournalDiskMaxRevision(
@@ -437,6 +468,12 @@ uint64_t GetRecoveryJournalDiskMaxRevision(
     uint64_t accountToken)
 {
     if (root.empty() || accountToken == 0)
+        return 0;
+
+    std::error_code rootError;
+    const std::filesystem::file_status rootStatus =
+        std::filesystem::symlink_status(root, rootError);
+    if (rootError || rootStatus.type() != std::filesystem::file_type::directory)
         return 0;
 
     const std::string filePrefix =
@@ -453,7 +490,9 @@ uint64_t GetRecoveryJournalDiskMaxRevision(
 
         const std::filesystem::path candidate = it->path();
         std::error_code fileError;
-        if (!std::filesystem::is_regular_file(candidate, fileError) || fileError)
+        const std::filesystem::file_status status =
+            std::filesystem::symlink_status(candidate, fileError);
+        if (fileError || status.type() != std::filesystem::file_type::regular)
             continue;
 
         const std::string fileName = CoopFilesystem::ToUtf8(candidate.filename());
@@ -2699,6 +2738,7 @@ bool ModMain::HasValidPlayerSidecarRecoveryJournal() const
     const std::string& expectedSaveKey = m_currentHostSaveStateKey;
     return metadata.accountToken == GetLocalAccountToken() &&
         metadata.hostAccountToken == GetSessionHostAccountToken() &&
+        metadata.timelineToken == m_sessionHostTimelineToken &&
         metadata.saveKey == expectedSaveKey &&
         metadata.revision != 0;
 }
@@ -2738,8 +2778,9 @@ bool ModMain::WriteLocalPlayerRecoveryJournal(const char* reason)
 
     const uint64_t accountToken = GetLocalAccountToken();
     const uint64_t hostAccountToken = GetSessionHostAccountToken();
+    const uint64_t timelineToken = m_sessionHostTimelineToken;
     const std::string& saveKey = m_currentHostSaveStateKey;
-    if (hostAccountToken == 0 || saveKey.empty() || saveKey == "unknown_save")
+    if (hostAccountToken == 0 || timelineToken == 0 || saveKey.empty() || saveKey == "unknown_save")
         return false;
     if (m_networkMode == CoopNetworkMode::Client &&
         m_localInventoryDirty &&
@@ -2766,6 +2807,7 @@ bool ModMain::WriteLocalPlayerRecoveryJournal(const char* reason)
         payload.push_back('\n');
     payload += "recoveryAccount=" + HexPlayerAccountToken(accountToken) + "\n";
     payload += "recoveryHost=" + HexPlayerAccountToken(hostAccountToken) + "\n";
+    payload += "recoveryTimeline=" + HexPlayerAccountToken(timelineToken) + "\n";
     payload += "recoverySaveKey=" + saveKey + "\n";
     payload += "recoveryRevision=" + std::to_string(revision) + "\n";
 
@@ -2796,10 +2838,17 @@ bool ModMain::ClearLocalPlayerRecoveryJournal(
     if (sourcePath.empty() || accountToken == 0 || saveKey.empty() || revision == 0)
         return false;
 
+    std::error_code statusError;
+    const std::filesystem::file_status sourceStatus =
+        std::filesystem::symlink_status(CoopFilesystem::FromUtf8(sourcePath), statusError);
+    if (statusError || sourceStatus.type() != std::filesystem::file_type::regular)
+        return false;
+
     RecoveryJournalMetadata metadata;
     if (!ParseRecoveryJournalMetadata(sourcePath, metadata) ||
         metadata.accountToken != accountToken ||
         metadata.hostAccountToken != GetSessionHostAccountToken() ||
+        metadata.timelineToken != m_sessionHostTimelineToken ||
         metadata.saveKey != saveKey ||
         metadata.revision != revision)
         return false;
@@ -2819,6 +2868,7 @@ bool ModMain::ClearLocalPlayerRecoveryJournal(
         m_localInventoryJournalRevision = std::max(m_localInventoryJournalRevision, revision);
         m_localInventoryDirtySaveKey.clear();
         m_localInventoryDirtyHostAccountToken = 0;
+        m_localInventoryDirtyHostTimelineToken = 0;
         m_lastPlayerSidecarEvent =
             "cleared player recovery journal" +
             (reason && reason[0] ? ": " + std::string(reason) : "");
@@ -2839,7 +2889,8 @@ bool ModMain::RecoverLocalPlayerRecoveryJournal(const char* reason)
     if (m_clientRecoveryJournalPending &&
         ((!m_currentHostSaveStateKey.empty() &&
              m_clientRecoveryJournalSaveKey != m_currentHostSaveStateKey) ||
-            m_clientRecoveryJournalHostAccountToken != GetSessionHostAccountToken()))
+            m_clientRecoveryJournalHostAccountToken != GetSessionHostAccountToken() ||
+            m_clientRecoveryJournalHostTimelineToken != m_sessionHostTimelineToken))
     {
         m_clientRecoveryJournalPending = false;
         m_clientRecoveryJournalAwaitingStoredAck = false;
@@ -2850,53 +2901,143 @@ bool ModMain::RecoverLocalPlayerRecoveryJournal(const char* reason)
         m_clientRecoveryJournalSourcePath.clear();
         m_clientRecoveryJournalSaveKey.clear();
         m_clientRecoveryJournalHostAccountToken = 0;
+        m_clientRecoveryJournalHostTimelineToken = 0;
     }
 
-    const std::string pathString = GetPlayerSidecarRecoveryJournalPath();
-    if (pathString.empty())
-        return false;
-
-    RecoveryJournalMetadata metadata;
-    if (!ParseRecoveryJournalMetadata(pathString, metadata) ||
-        metadata.accountToken != GetLocalAccountToken() ||
-        metadata.hostAccountToken != GetSessionHostAccountToken())
-    {
-        return false;
-    }
-
+    const uint64_t accountToken = GetLocalAccountToken();
+    const uint64_t hostAccountToken = GetSessionHostAccountToken();
+    const uint64_t timelineToken = m_sessionHostTimelineToken;
     const std::string& expectedSaveKey = m_currentHostSaveStateKey;
-    if (expectedSaveKey.empty() || expectedSaveKey == "unknown_save")
+    const std::filesystem::path root = GetCoopPlayerStateRoot();
+    if (accountToken == 0 || hostAccountToken == 0 || timelineToken == 0 ||
+        expectedSaveKey.empty() || expectedSaveKey == "unknown_save" || root.empty())
         return false;
-    if (metadata.saveKey != expectedSaveKey || metadata.revision == 0)
+    std::error_code rootError;
+    const std::filesystem::file_status rootStatus =
+        std::filesystem::symlink_status(root, rootError);
+    if (rootError || rootStatus.type() != std::filesystem::file_type::directory)
+    {
+        LogCoop("player recovery journal rejected: player state root is not a real directory");
         return false;
+    }
+
+    const std::string filePrefix =
+        "player_recovery_account_" + HexPlayerAccountToken(accountToken) +
+        "_host_" + HexPlayerAccountToken(hostAccountToken) + "_";
+    std::filesystem::path bestPath;
+    RecoveryJournalMetadata bestMetadata;
+    std::string bestPayload;
+    std::error_code directoryError;
+    for (std::filesystem::directory_iterator it(root, directoryError), end;
+         it != end;
+         it.increment(directoryError))
+    {
+        if (directoryError)
+        {
+            directoryError.clear();
+            continue;
+        }
+        const std::filesystem::path candidate = it->path();
+        std::error_code fileError;
+        const std::filesystem::file_status status =
+            std::filesystem::symlink_status(candidate, fileError);
+        if (fileError || status.type() != std::filesystem::file_type::regular)
+            continue;
+        const std::string fileName = CoopFilesystem::ToUtf8(candidate.filename());
+        if (candidate.extension() != ".state" || !StartsWith(fileName, filePrefix))
+            continue;
+
+        RecoveryJournalMetadata metadata;
+        std::string payload;
+        if (!ParseRecoveryJournalMetadata(CoopFilesystem::ToUtf8(candidate), metadata, &payload) ||
+            metadata.accountToken != accountToken ||
+            metadata.hostAccountToken != hostAccountToken ||
+            metadata.timelineToken != timelineToken)
+        {
+            continue;
+        }
+        if (bestPath.empty() || metadata.revision > bestMetadata.revision ||
+            (metadata.revision == bestMetadata.revision && fileName >
+                CoopFilesystem::ToUtf8(bestPath.filename())))
+        {
+            bestPath = candidate;
+            bestMetadata = metadata;
+            bestPayload = std::move(payload);
+        }
+    }
+
+    if (bestPath.empty())
+        return false;
+
+    std::filesystem::path sourcePath = bestPath;
+    if (bestMetadata.saveKey != expectedSaveKey)
+    {
+        const std::string promotedPath = GetPlayerSidecarRecoveryJournalPath();
+        if (promotedPath.empty())
+            return false;
+        const std::filesystem::path destination = CoopFilesystem::FromUtf8(promotedPath);
+        std::istringstream lines(bestPayload);
+        lines.imbue(std::locale::classic());
+        std::ostringstream rewritten;
+        rewritten.imbue(std::locale::classic());
+        bool replaced = false;
+        std::string line;
+        while (std::getline(lines, line))
+        {
+            if (line.rfind("recoverySaveKey=", 0) == 0)
+            {
+                if (replaced)
+                    return false;
+                rewritten << "recoverySaveKey=" << expectedSaveKey;
+                replaced = true;
+            }
+            else
+                rewritten << line;
+            rewritten << '\n';
+        }
+        if (!replaced || !WritePlayerSidecarPayloadWithHash(destination, rewritten.str()))
+            return false;
+        if (destination != bestPath)
+        {
+            std::error_code removeError;
+            std::filesystem::remove(bestPath, removeError);
+        }
+        LogCoop(
+            "promoted player recovery journal saveKey=" + bestMetadata.saveKey +
+            " to=" + expectedSaveKey + " timeline=" + HexPlayerAccountToken(timelineToken));
+        sourcePath = destination;
+        bestMetadata.saveKey = expectedSaveKey;
+    }
 
     PlayerSidecarState state;
+    const std::string pathString = CoopFilesystem::ToUtf8(sourcePath);
     if (!LoadPlayerSidecarFromPath(pathString, state))
     {
-        LogCoop("player recovery journal rejected: sidecar parse failed saveKey=" + metadata.saveKey);
+        LogCoop("player recovery journal rejected: sidecar parse failed saveKey=" + bestMetadata.saveKey);
         return false;
     }
 
     if (m_clientRecoveryJournalPending &&
         m_clientRecoveryJournalSourcePath == pathString &&
-        m_clientRecoveryJournalRevision == metadata.revision)
+        m_clientRecoveryJournalRevision == bestMetadata.revision)
     {
         return true;
     }
 
-    m_localInventoryJournalRevision = std::max(m_localInventoryJournalRevision, metadata.revision);
+    m_localInventoryJournalRevision = std::max(m_localInventoryJournalRevision, bestMetadata.revision);
     m_clientRecoveryJournalPending = true;
     m_clientRecoveryJournalAwaitingStoredAck = false;
     m_clientRecoveryJournalStoredAckReceived = false;
     m_clientRecoveryJournalTransferId = 0;
     m_clientRecoveryJournalChecksum = 0;
-    m_clientRecoveryJournalRevision = metadata.revision;
+    m_clientRecoveryJournalRevision = bestMetadata.revision;
     m_clientRecoveryJournalSourcePath = pathString;
-    m_clientRecoveryJournalSaveKey = metadata.saveKey;
-    m_clientRecoveryJournalHostAccountToken = metadata.hostAccountToken;
+    m_clientRecoveryJournalSaveKey = bestMetadata.saveKey;
+    m_clientRecoveryJournalHostAccountToken = bestMetadata.hostAccountToken;
+    m_clientRecoveryJournalHostTimelineToken = bestMetadata.timelineToken;
     m_lastPlayerStateTransferEvent =
         "pending newer player recovery journal revision=" +
-        std::to_string(metadata.revision) + " saveKey=" + metadata.saveKey +
+        std::to_string(bestMetadata.revision) + " saveKey=" + bestMetadata.saveKey +
         (reason && reason[0] ? ": " + std::string(reason) : "");
     LogCoop(m_lastPlayerStateTransferEvent);
     return true;
@@ -2907,6 +3048,8 @@ bool ModMain::IsLocalInventoryDirtyForSaveKey(const std::string& saveKey) const
     return m_localInventoryDirty &&
         m_localInventoryDirtyHostAccountToken != 0 &&
         m_localInventoryDirtyHostAccountToken == GetSessionHostAccountToken() &&
+        m_localInventoryDirtyHostTimelineToken != 0 &&
+        m_localInventoryDirtyHostTimelineToken == m_sessionHostTimelineToken &&
         !saveKey.empty() &&
         saveKey != "unknown_save" &&
         m_localInventoryDirtySaveKey == saveKey;
@@ -2920,6 +3063,7 @@ void ModMain::ReconcileLocalInventoryDirtyForSaveKey(const std::string& saveKey)
         saveKey.empty() ||
         saveKey == "unknown_save" ||
         (m_localInventoryDirtyHostAccountToken == GetSessionHostAccountToken() &&
+            m_localInventoryDirtyHostTimelineToken == m_sessionHostTimelineToken &&
             m_localInventoryDirtySaveKey == saveKey))
     {
         return;
@@ -2938,6 +3082,7 @@ void ModMain::ReconcileLocalInventoryDirtyForSaveKey(const std::string& saveKey)
     m_localInventoryDirty = false;
     m_localInventoryDirtySaveKey.clear();
     m_localInventoryDirtyHostAccountToken = 0;
+    m_localInventoryDirtyHostTimelineToken = 0;
     m_localInventoryJournalAccumulator = 0.0f;
 }
 
@@ -2963,6 +3108,7 @@ void ModMain::MarkLocalInventoryDirty(const char* reason)
         ReconcileLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey);
         m_localInventoryDirtySaveKey = m_currentHostSaveStateKey;
         m_localInventoryDirtyHostAccountToken = GetSessionHostAccountToken();
+        m_localInventoryDirtyHostTimelineToken = m_sessionHostTimelineToken;
     }
     m_localInventoryDirty = true;
     ++m_localInventoryDirtyRevision;
@@ -3004,6 +3150,7 @@ void ModMain::CaptureLocalPlayerPickupRecovery(EntityId pickerId, const char* re
         m_localInventoryDirty = false;
         m_localInventoryDirtySaveKey.clear();
         m_localInventoryDirtyHostAccountToken = 0;
+        m_localInventoryDirtyHostTimelineToken = 0;
         m_localInventoryJournalAccumulator = 0.0f;
         return;
     }
@@ -5248,6 +5395,7 @@ void ModMain::TickPlayerSidecar(float frameTime)
                 m_localInventoryDirty = false;
                 m_localInventoryDirtySaveKey.clear();
                 m_localInventoryDirtyHostAccountToken = 0;
+                m_localInventoryDirtyHostTimelineToken = 0;
                 if (m_clientRecoveryJournalPending)
                     RecoverLocalPlayerRecoveryJournal("refreshed recovery journal");
             }

@@ -1337,6 +1337,7 @@ private:
         uint32_t checksum = 0;
         uint32_t runningChecksum = 0;
         uint64_t accountToken = 0;
+        uint64_t hostTimelineToken = 0;
         std::string username;
         std::string saveKey;
         std::string receivePath;
@@ -2175,6 +2176,8 @@ private:
     bool QueueNextPlayerStateTransferPacket();
     void TickPlayerStateTransfer(float frameTime);
     void HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferPacket& packet);
+    void RetirePlayerStateTransferForHostTimeline(uint64_t timelineToken);
+    void RetireFailedHostSaveTransferPackets();
     void ResetPlayerStateTransferState(const char* lastEvent, bool resetHostSaveIdentity = true);
     bool TryApplyReceivedPlayerStateTransfer(const char* reason);
     void SendHostLoadStartingNotice(const char* reason);
@@ -2948,6 +2951,7 @@ private:
     std::string m_lastRemoteUsername;
     uint64_t m_remoteAccountToken = 0;
     uint64_t m_sessionHostAccountToken = 0;
+    uint64_t m_sessionHostTimelineToken = 0;
     uint64_t m_remotePlayerModelArchetypeId = 10739735956144685671ull;
     uint64_t m_lastRuntimeCleanupRemoteAccountToken = 0;
     bool m_duplicateAccountRejected = false;
@@ -4128,6 +4132,7 @@ private:
     std::string m_playerStateTransferUsername;
     uint64_t m_playerStateTransferAccountToken = 0;
     uint64_t m_playerStateTransferHostAccountToken = 0;
+    uint64_t m_playerStateTransferHostTimelineToken = 0;
     std::string m_playerStateTransferSaveKey;
     std::string m_areaJournalTransferUsername;
     std::string m_areaJournalTransferLevel;
@@ -4150,6 +4155,7 @@ private:
     std::string m_pendingClientPlayerStateUploadReason;
     std::string m_pendingClientPlayerStateUploadSaveKey;
     uint64_t m_pendingClientPlayerStateUploadHostAccountToken = 0;
+    uint64_t m_pendingClientPlayerStateUploadHostTimelineToken = 0;
     std::string m_lastSaveTransferEvent = "-";
     std::string m_lastPlayerStateTransferEvent = "-";
     std::string m_lastAreaJournalTransferEvent = "-";
@@ -4602,6 +4608,9 @@ private:
     bool m_hasPendingHostWorldOffer = false;
     bool m_pendingHostSaveLoadBroadcastAfterLoad = false;
     bool m_hostManualLoadPreloadTransferStarted = false;
+    bool m_hostLoadTimelineRotationPending = false;
+    std::string m_hostLoadPreviousSaveKey;
+    uint64_t m_hostLoadPreviousTimelineToken = 0;
     bool m_clientParallelHostLoadActive = false;
     bool m_clientParallelHostLoadConfirmed = false;
     bool m_loadControlNetworkPumpActive = false;
@@ -4655,6 +4664,7 @@ private:
     bool m_localInventoryDirty = false;
     std::string m_localInventoryDirtySaveKey;
     uint64_t m_localInventoryDirtyHostAccountToken = 0;
+    uint64_t m_localInventoryDirtyHostTimelineToken = 0;
     uint64_t m_localInventoryDirtyRevision = 0;
     uint64_t m_localInventoryJournalRevision = 0;
     float m_localInventoryJournalAccumulator = 0.0f;
@@ -4667,6 +4677,7 @@ private:
     std::string m_clientRecoveryJournalSourcePath;
     std::string m_clientRecoveryJournalSaveKey;
     uint64_t m_clientRecoveryJournalHostAccountToken = 0;
+    uint64_t m_clientRecoveryJournalHostTimelineToken = 0;
     bool m_pendingPlayerSidecarApply = false;
     bool m_pendingPlayerSidecarInventoryRestore = false;
     bool m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
@@ -4763,6 +4774,7 @@ private:
     std::string m_clientDisconnectFlushReason;
     std::string m_clientDisconnectFlushSaveKey;
     uint64_t m_clientDisconnectFlushHostAccountToken = 0;
+    uint64_t m_clientDisconnectFlushHostTimelineToken = 0;
     std::string m_clientDisconnectFlushJournalSourcePath;
     uint64_t m_clientDisconnectFlushJournalRevision = 0;
     bool m_nativeWindowCloseDeferred = false;
