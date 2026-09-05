@@ -1789,6 +1789,7 @@ private:
     bool OpenUdpSocket();
     void CloseUdpSocket();
     void TickNetwork(float frameTime);
+    void TickLoadControlNetwork(float frameTime);
     void TickSessionSend(float frameTime);
     void TickClientSend(float frameTime);
     void TickHostSend(float frameTime);
@@ -2144,6 +2145,7 @@ private:
     bool TryLoadHostWorldSave(const CoopProtocol::WorldSyncPacket& packet);
     void ResetWorldSyncControlState(const char* lastEvent);
     bool BeginHostSaveTransfer();
+    bool BeginHostManualLoadPreload(const std::string& savePath);
     bool RequestHostSaveTransferSnapshot();
     void TickSaveTransfer(float frameTime);
     bool StartHostSaveTransferFromFile(const std::string& sourcePath, uint32_t transferId);
@@ -3579,6 +3581,7 @@ private:
     uint32_t m_playerStateTransferSequence = 0;
     uint32_t m_areaJournalTransferSequence = 0;
     uint32_t m_saveTransferId = 0;
+    uint32_t m_saveTransferWorldEpoch = 0;
     uint32_t m_playerStateTransferId = 0;
     uint32_t m_areaJournalTransferId = 0;
     uint32_t m_deferredAreaJournalTransferId = 0;
@@ -4589,6 +4592,11 @@ private:
     bool m_pendingHostWorldRequest = false;
     bool m_hasPendingHostWorldOffer = false;
     bool m_pendingHostSaveLoadBroadcastAfterLoad = false;
+    bool m_hostManualLoadPreloadTransferStarted = false;
+    bool m_clientParallelHostLoadActive = false;
+    bool m_clientParallelHostLoadConfirmed = false;
+    bool m_loadControlNetworkPumpActive = false;
+    bool m_loadControlNetworkPumpRunning = false;
     bool m_hostInternalSnapshotSaveActive = false;
     bool m_hostInternalSnapshotWriteCompleteReceived = false;
     bool m_hostInternalSnapshotWriteCompleteObserved = false;
