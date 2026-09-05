@@ -26498,12 +26498,25 @@ void ModMain::EndCoopLoadGuard(const char* reason)
         SetTransitionPhase("host_save_load_broadcast", reason);
         if (m_hasRemoteEndpoint)
         {
-            m_hasPendingHostWorldOffer = true;
-            m_worldSyncRequestAccumulator = kWorldSyncRequestSeconds;
-            m_hostPlayerStatePreloadSent = false;
-            m_hostPlayerStateSentWorldEpoch = 0;
-            m_pendingHostPlayerStateSaveKey = m_currentHostSaveStateKey;
-            m_lastWorldSyncEvent = "queued host load command after native load";
+            if (m_hostManualLoadPreloadTransferStarted)
+            {
+                // The peer already has the selected slot and its player state.
+                // This offer is only the commit barrier proving that the Host
+                // reached the same epoch; it must not start a second snapshot.
+                SendHostWorldOffer(false);
+                m_lastWorldSyncEvent = "confirmed parallel host load complete";
+                m_hostManualLoadPreloadTransferStarted = false;
+                m_pendingHostSaveLoadBroadcastAfterLoad = false;
+            }
+            else
+            {
+                m_hasPendingHostWorldOffer = true;
+                m_worldSyncRequestAccumulator = kWorldSyncRequestSeconds;
+                m_hostPlayerStatePreloadSent = false;
+                m_hostPlayerStateSentWorldEpoch = 0;
+                m_pendingHostPlayerStateSaveKey = m_currentHostSaveStateKey;
+                m_lastWorldSyncEvent = "queued host load command after native load";
+            }
             LogCoop(m_lastWorldSyncEvent);
         }
     }
@@ -26535,6 +26548,7 @@ void ModMain::EndCoopLoadGuard(const char* reason)
     else if (loadFailed)
     {
         m_pendingHostSaveLoadBroadcastAfterLoad = false;
+        m_hostManualLoadPreloadTransferStarted = false;
     }
 
     m_arkLevelTransitionLoadActive = false;
@@ -29938,6 +29952,8 @@ void ModMain::OnCryActionLoadGameRequested(const char* path, bool quick, bool ig
     m_playerSidecarInventoryNativeRestoreActive = false;
     m_lastNativeInventoryLocalSerializeWasRead = false;
     BeginCoopLoadGuard("CCryAction::LoadGame");
+    if (m_networkMode == CoopNetworkMode::Host && m_pendingHostSaveLoadBroadcastAfterLoad)
+        BeginHostManualLoadPreload(m_lastSaveLoadPath);
 }
 
 void ModMain::OnCryActionLoadGameFinished(const char* path, int result)
@@ -29947,7 +29963,28 @@ void ModMain::OnCryActionLoadGameFinished(const char* path, int result)
 
     m_lastSaveLoadEvent = "LoadGame returned " + std::to_string(result);
     if (result != eLGR_Ok && result != eLGR_Streaming)
+    {
+        if (m_networkMode == CoopNetworkMode::Host && m_hostManualLoadPreloadTransferStarted)
+        {
+            CoopProtocol::SaveTransferPacket abortPacket = {};
+            if (BuildSaveTransferPacket(
+                    abortPacket,
+                    CoopProtocol::SaveTransferCommand::Abort,
+                    m_saveTransferId))
+            {
+                SendSaveTransferTo(
+                    abortPacket,
+                    m_saveTransferAddress,
+                    m_saveTransferPort,
+                    "manual host load preload abort send failed");
+            }
+            m_saveTransferSending = false;
+            m_saveTransferStarted = false;
+            m_saveTransferComplete = false;
+            m_hostManualLoadPreloadTransferStarted = false;
+        }
         EndCoopLoadGuard("LoadGame failed");
+    }
 }
 
 void ModMain::ActivateClientCoopSaveSlot(const std::string& savePath, uint32_t transferId, const char* reason)
@@ -30353,6 +30390,7 @@ void ModMain::OnFlashUILoadtimeUpdate(float frameTime)
     if (m_saveLoadGuardActive)
     {
         const float loadGuardFrameTime = std::max(frameTime, 0.1f);
+        TickLoadControlNetwork(loadGuardFrameTime);
         TickCoopLoadGuard(loadGuardFrameTime, false);
         m_runtimeExtractor.TickControlOnly(loadGuardFrameTime);
     }
@@ -30377,6 +30415,7 @@ void ModMain::OnFlashUILoadtimeRender()
     if (m_saveLoadGuardActive || m_waitingForPostLoadContinue)
     {
         constexpr float kLoadingRenderPumpFrameTime = 0.1f;
+        TickLoadControlNetwork(kLoadingRenderPumpFrameTime);
         TickCoopLoadGuard(kLoadingRenderPumpFrameTime, false);
         m_runtimeExtractor.TickControlOnly(kLoadingRenderPumpFrameTime);
     }
@@ -35502,6 +35541,7 @@ void ModMain::MainUpdate(unsigned updateFlags)
     {
         const bool traceLoadGuard = EnvFlagEnabled("COOP_TRACE_MAIN_LOAD_GUARD");
         const float loadGuardFrameTime = std::max(frameTime, 0.1f);
+        TickLoadControlNetwork(loadGuardFrameTime);
         TickCoopLoadGuard(loadGuardFrameTime);
         if (traceLoadGuard)
             LogCoop("main load guard block after TickCoopLoadGuard guard=" + std::to_string(m_saveLoadGuardActive ? 1 : 0));
@@ -51741,6 +51781,9 @@ void ModMain::ResetWorldSyncControlState(const char* lastEvent)
     m_pendingHostWorldRequest = false;
     m_hasPendingHostWorldOffer = false;
     m_pendingHostSaveLoadBroadcastAfterLoad = false;
+    m_hostManualLoadPreloadTransferStarted = false;
+    m_clientParallelHostLoadActive = false;
+    m_clientParallelHostLoadConfirmed = false;
     m_pendingHostWorldLoadAfterPlayerState = false;
     m_lastWorldSyncEvent = lastEvent ? lastEvent : "-";
 }
@@ -51749,6 +51792,7 @@ void ModMain::ResetSaveTransferState(const char* lastEvent)
 {
     m_saveTransferSequence = 0;
     m_saveTransferId = 0;
+    m_saveTransferWorldEpoch = 0;
     m_saveTransferTotalBytes = 0;
     m_saveTransferChunkCount = 0;
     m_saveTransferNextChunk = 0;
@@ -53463,6 +53507,36 @@ void ModMain::TickNetwork(float frameTime)
     TickLivePropSync(frameTime);
     TickSharedStorage(frameTime);
     TickDialogueLease(frameTime);
+}
+
+void ModMain::TickLoadControlNetwork(float frameTime)
+{
+    if (m_loadControlNetworkPumpRunning ||
+        m_networkMode == CoopNetworkMode::Off ||
+        m_socket == kInvalidNetworkSocket ||
+        !m_saveLoadGuardActive)
+    {
+        return;
+    }
+
+    m_loadControlNetworkPumpRunning = true;
+    m_loadControlNetworkPumpActive = true;
+    TickReceivePackets(m_networkMode == CoopNetworkMode::Host ?
+        "host load-control receive failed" : "client load-control receive failed");
+    if (m_networkMode == CoopNetworkMode::Client && m_primaryRemotePeerToken != 0)
+        ActivateRemotePeerContext(m_primaryRemotePeerToken);
+
+    if (m_networkMode != CoopNetworkMode::Off)
+    {
+        // SessionHello is also a load-time heartbeat. Without it, the peer
+        // that becomes interactive first can time out the one still loading.
+        TickSessionSend(frameTime);
+        TickReliableTransport(frameTime);
+        TickSaveTransfer(frameTime);
+        TickPlayerStateTransfer(frameTime);
+    }
+    m_loadControlNetworkPumpActive = false;
+    m_loadControlNetworkPumpRunning = false;
 }
 
 void ModMain::TickSessionSend(float frameTime)
@@ -58001,7 +58075,7 @@ bool ModMain::BuildSaveTransferPacket(CoopProtocol::SaveTransferPacket& packet, 
     packet.sequence = CoopSerialSequence::Advance(m_saveTransferSequence);
     packet.command = static_cast<uint32_t>(command);
     packet.transferId = transferId;
-    packet.worldEpoch = m_localWorldEpoch;
+    packet.worldEpoch = m_saveTransferWorldEpoch != 0 ? m_saveTransferWorldEpoch : m_localWorldEpoch;
     packet.totalBytes = m_saveTransferTotalBytes;
     packet.chunkCount = m_saveTransferChunkCount;
     packet.checksum = m_saveTransferChecksum;
@@ -67374,7 +67448,15 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
     {
         bool newTransfer = true;
         if (packet.payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::SaveTransfer))
-            newTransfer = reliableStartTransferId != m_saveTransferId || !m_saveTransferReceiving;
+        {
+            CoopProtocol::SaveTransferPacket startPacket = {};
+            if (packet.payloadSize == sizeof(startPacket))
+                std::memcpy(&startPacket, packet.payload, sizeof(startPacket));
+            newTransfer =
+                reliableStartTransferId != m_saveTransferId ||
+                startPacket.worldEpoch != m_saveTransferWorldEpoch ||
+                !m_saveTransferReceiving;
+        }
         else if (packet.payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::PlayerStateTransfer))
             newTransfer = reliableStartTransferId != m_playerStateTransferId || !m_playerStateTransferReceiving;
         else if (packet.payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::AreaJournalTransfer))
@@ -67494,8 +67576,9 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
     }
 
     if (!isCrossWorldControlPayload &&
-        !IsSessionGameplayReady() &&
-        !(isEnemyReplicationPayload && IsEnemyReplicationGameplayReady()))
+        (m_loadControlNetworkPumpActive ||
+            (!IsSessionGameplayReady() &&
+                !(isEnemyReplicationPayload && IsEnemyReplicationGameplayReady()))))
     {
         // There is no receive-side reorder buffer. Holding the sequence here
         // permanently blocks the cross-world save/player-state transfer that
@@ -69491,6 +69574,12 @@ void ModMain::TickReceivePackets(const char* failurePrefix)
             HandleReliableEnvelope(packet, fromAddress.sin_addr.s_addr, fromAddress.sin_port);
             continue;
         }
+
+        // Loading may continue to render while the normal game update is
+        // suspended. Only ordered cross-world control is safe to apply here;
+        // raw gameplay datagrams belong to the retiring world.
+        if (m_loadControlNetworkPumpActive)
+            continue;
 
         if (HandleChatDatagram(
                 header,
@@ -72905,6 +72994,13 @@ void ModMain::SendClientWorldReady()
     if (m_networkMode != CoopNetworkMode::Client || m_socket == kInvalidNetworkSocket)
         return;
 
+    if (m_clientParallelHostLoadActive && !m_clientParallelHostLoadConfirmed)
+    {
+        m_lastWorldSyncEvent = "client load complete; waiting for host load confirmation";
+        LogCoop(m_lastWorldSyncEvent);
+        return;
+    }
+
     sockaddr_in targetAddress = {};
     targetAddress.sin_family = AF_INET;
     targetAddress.sin_port = htons(static_cast<u_short>(m_networkPort));
@@ -72944,6 +73040,8 @@ void ModMain::SendClientWorldReady()
         m_lastClientWorldReadySentLevelId = readyLevelId;
         m_lastWorldSyncEvent = "sent client world ready";
         LogCoop(m_lastWorldSyncEvent);
+        m_clientParallelHostLoadActive = false;
+        m_clientParallelHostLoadConfirmed = false;
     }
 }
 
@@ -73077,6 +73175,60 @@ bool ModMain::TryLoadHostWorldSave(const CoopProtocol::WorldSyncPacket& packet)
     return false;
 }
 
+bool ModMain::BeginHostManualLoadPreload(const std::string& savePath)
+{
+    if (m_networkMode != CoopNetworkMode::Host ||
+        m_socket == kInvalidNetworkSocket ||
+        !m_hasRemoteEndpoint ||
+        m_hostManualLoadPreloadTransferStarted ||
+        m_arkLevelTransitionLoadActive ||
+        m_saveTransferSending ||
+        m_saveTransferSnapshotPending ||
+        m_hostInternalSnapshotSaveActive)
+    {
+        return false;
+    }
+
+    std::string resolvedPath;
+    if (!ResolveReadableSaveFile(savePath, resolvedPath))
+        return false;
+
+    const uint32_t transferId =
+        m_saveTransferId == std::numeric_limits<uint32_t>::max() ? 1u : m_saveTransferId + 1u;
+    uint32_t targetWorldEpoch = m_localWorldEpoch + 1u;
+    if (targetWorldEpoch == 0)
+        targetWorldEpoch = 1;
+
+    m_saveTransferAddress = m_remoteAddress;
+    m_saveTransferPort = m_remotePort;
+    m_saveTransferAccountToken = GetRemoteAccountToken();
+    m_saveTransferWorldEpoch = targetWorldEpoch;
+    if (m_saveTransferAddress == 0 ||
+        m_saveTransferPort == 0 ||
+        m_saveTransferAccountToken == 0 ||
+        !StartHostSaveTransferFromFile(resolvedPath, transferId))
+    {
+        m_saveTransferWorldEpoch = 0;
+        LogCoop("peer preload at native host load start unavailable; keeping post-load fallback");
+        return false;
+    }
+
+    m_hostManualLoadPreloadTransferStarted = true;
+    m_sessionGameplayReady = false;
+    m_remoteSessionFlags &= ~CoopProtocol::kSessionFlagWorldReady;
+    m_hostPlayerStatePreloadSent = false;
+    m_hostPlayerStateSentWorldEpoch = 0;
+    m_pendingHostPlayerStateSend = true;
+    m_pendingHostPlayerStateAccountToken = m_saveTransferAccountToken;
+    m_pendingHostPlayerStateReason = "manual host load preload";
+    m_pendingHostPlayerStateSaveKey = m_currentHostSaveStateKey;
+    m_lastWorldSyncEvent =
+        "started peer preload at native host load start epoch=" +
+        std::to_string(targetWorldEpoch);
+    LogCoop(m_lastWorldSyncEvent);
+    return true;
+}
+
 bool ModMain::BeginHostSaveTransfer()
 {
     if (m_networkMode != CoopNetworkMode::Host || m_socket == kInvalidNetworkSocket || !m_hasRemoteEndpoint)
@@ -73107,6 +73259,7 @@ bool ModMain::BeginHostSaveTransfer()
         return false;
     }
     m_saveTransferId = nextTransferId;
+    m_saveTransferWorldEpoch = m_localWorldEpoch;
     m_saveTransferSourcePath = snapshotName;
     m_saveTransferSnapshotPending = true;
     m_hostInternalSnapshotWriteCompleteReceived = false;
@@ -73233,6 +73386,8 @@ bool ModMain::StartHostSaveTransferFromFile(const std::string& sourcePath, uint3
     }
 
     m_saveTransferId = transferId;
+    if (m_saveTransferWorldEpoch == 0)
+        m_saveTransferWorldEpoch = m_localWorldEpoch;
 
     m_saveTransferSourcePath = transferSourcePath;
     m_saveTransferReceivePath.clear();
@@ -73955,12 +74110,15 @@ bool ModMain::BeginHostPlayerStateTransfer(const char* reason, const std::string
         (reason && reason[0] ? ": " + std::string(reason) : "") +
         " saveKey=" + (saveKey.empty() ? std::string("-") : saveKey) +
         " source=" + sourceKind;
-    m_hostPlayerStateSentWorldEpoch = m_remoteWorldEpoch != 0 ? m_remoteWorldEpoch : m_localWorldEpoch;
+    m_hostPlayerStateSentWorldEpoch =
+        m_hostManualLoadPreloadTransferStarted && m_saveTransferWorldEpoch != 0
+            ? m_saveTransferWorldEpoch
+            : (m_remoteWorldEpoch != 0 ? m_remoteWorldEpoch : m_localWorldEpoch);
     const auto targetPeerIt = m_remotePeers.find(accountToken);
     if (targetPeerIt != m_remotePeers.end())
         targetPeerIt->second.playerStateSentWorldEpoch = m_hostPlayerStateSentWorldEpoch;
     m_hostPlayerStateSentUsername = username;
-    if (reason && std::string_view(reason).find("preload host world") != std::string_view::npos)
+    if (reason && std::string_view(reason).find("preload") != std::string_view::npos)
         m_hostPlayerStatePreloadSent = true;
     LogCoop(m_lastPlayerStateTransferEvent);
     return true;
@@ -76981,6 +77139,7 @@ void ModMain::HandleSaveTransfer(const CoopProtocol::SaveTransferPacket& packet)
         const std::string incomingLevel = NormalizeLevelName(ReadSaveTransferLevelName(packet));
         const bool sameTransferAlreadyActive =
             packet.transferId == m_saveTransferId &&
+            packet.worldEpoch == m_saveTransferWorldEpoch &&
             (m_saveTransferReceiving ||
                 m_saveTransferComplete ||
                 m_pendingHostWorldLoadAfterPlayerState ||
@@ -76997,6 +77156,7 @@ void ModMain::HandleSaveTransfer(const CoopProtocol::SaveTransferPacket& packet)
         }
 
         m_saveTransferId = packet.transferId;
+        m_saveTransferWorldEpoch = packet.worldEpoch;
         m_saveTransferTotalBytes = packet.totalBytes;
         m_saveTransferChunkCount = packet.chunkCount;
         m_saveTransferNextChunk = 0;
@@ -77010,6 +77170,12 @@ void ModMain::HandleSaveTransfer(const CoopProtocol::SaveTransferPacket& packet)
         m_saveTransferReceiving = true;
         m_saveTransferStarted = true;
         m_saveTransferComplete = false;
+        const float now = GetNowSeconds();
+        m_clientParallelHostLoadActive =
+            packet.worldEpoch != 0 &&
+            packet.worldEpoch != m_localWorldEpoch &&
+            m_remoteHostLoadNoticeGraceUntil >= now;
+        m_clientParallelHostLoadConfirmed = false;
         m_pendingHostWorldRequest = false;
         m_joinOverlayStageOverride = "Downloading map";
 
@@ -77835,6 +78001,23 @@ void ModMain::HandleWorldSync(const CoopProtocol::WorldSyncPacket& packet)
             m_lastWorldSyncEvent = "received host load-start notice; timeout grace active";
             ClearPeerTimeoutWarning("host load announced");
             LogCoop(m_lastWorldSyncEvent);
+            return;
+        }
+        if (command == CoopProtocol::WorldSyncCommand::HostWorldOffer &&
+            m_clientParallelHostLoadActive &&
+            packet.worldEpoch != 0 &&
+            packet.worldEpoch == m_saveTransferWorldEpoch)
+        {
+            m_remoteHostLoadNoticeStartTime = -1.0f;
+            m_remoteHostLoadNoticeGraceUntil = -1.0f;
+            m_pendingHostWorldEpoch = packet.worldEpoch;
+            m_pendingHostWorldLevel = packetLevel;
+            m_pendingHostWorldSavePath = packetSavePath;
+            m_clientParallelHostLoadConfirmed = true;
+            m_lastWorldSyncEvent = "received parallel host load completion confirmation";
+            LogCoop(m_lastWorldSyncEvent);
+            if (!m_saveLoadGuardActive && m_localWorldEpoch == packet.worldEpoch)
+                SendClientWorldReady();
             return;
         }
 
