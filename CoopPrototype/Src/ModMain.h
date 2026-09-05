@@ -1395,6 +1395,7 @@ private:
         uint32_t areaJournalTransferRunningChecksum = 0;
         uint32_t areaJournalTransferFlags = 0;
         uint64_t areaJournalTransferHostTimelineToken = 0;
+        uint64_t areaJournalTransferAccountToken = 0;
         uint32_t areaSnapshotLeaseEpoch = 0;
         uint32_t areaSnapshotLevelEpoch = 0;
         uint32_t areaJournalTransferAddress = 0;
@@ -4143,6 +4144,7 @@ private:
     uint64_t m_playerStateTransferHostTimelineToken = 0;
     std::string m_playerStateTransferSaveKey;
     std::string m_areaJournalTransferUsername;
+    uint64_t m_areaJournalTransferAccountToken = 0;
     std::string m_areaJournalTransferLevel;
     std::string m_deferredAreaJournalTransferSourcePath;
     std::string m_deferredAreaJournalTransferLevel;
