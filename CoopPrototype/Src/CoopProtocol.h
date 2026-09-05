@@ -7,7 +7,7 @@
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 245;
+constexpr uint16_t kProtocolVersion = 246;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -20,9 +20,13 @@ constexpr size_t kMaxPacketSize = 1200;
 constexpr size_t kTextChatMaxUtf8Bytes = 768;
 constexpr size_t kTextChatMaxUtf8Chars = 255;
 constexpr size_t kReliablePayloadSize = 1164;
-constexpr size_t kSaveTransferDataSize = 1024;
+// Keep SaveTransfer within the reliable payload after carrying the host
+// timeline identity.
+constexpr size_t kSaveTransferDataSize = 1016;
 constexpr size_t kPlayerStateTransferDataSize = 960;
-constexpr size_t kAreaJournalTransferDataSize = 956;
+// Keep the area packet within the reliable payload after carrying its host
+// timeline identity.
+constexpr size_t kAreaJournalTransferDataSize = 948;
 constexpr uint32_t kAreaJournalTransferFlagSnapshot = 1u << 0;
 constexpr uint32_t kAreaJournalTransferFlagAuthorityHandoff = 1u << 1;
 constexpr size_t kMimicModelPathSize = 192;
@@ -1321,6 +1325,9 @@ struct SaveTransferPacket
     uint32_t command = 0;
     uint32_t transferId = 0;
     uint32_t worldEpoch = 0;
+    // Host-issued lineage identity. A completed package from a superseded
+    // load must never be applied after the host rolls the timeline back.
+    uint64_t hostTimelineToken = 0;
     uint32_t totalBytes = 0;
     uint32_t chunkIndex = 0;
     uint32_t chunkCount = 0;
@@ -1376,6 +1383,9 @@ struct AreaJournalTransferPacket
     uint32_t areaLevelEpoch = 0;
     uint64_t areaId = 0;
     uint64_t hostSaveKeyHash = 0;
+    // Host-issued lineage identity. It remains stable for ordinary saves and
+    // changes whenever the host explicitly loads or rolls back a timeline.
+    uint64_t hostTimelineToken = 0;
     uint64_t snapshotSequence = 0;
     char username[kUsernameSize] = {};
     char levelName[kLevelNameSize] = {};
