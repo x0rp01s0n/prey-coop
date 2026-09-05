@@ -34156,8 +34156,8 @@ void ModMain::OnArkSaveLoadSaveCurrentLevelState(ArkSaveLoadSystem* saveLoadSyst
 
     if (!beforeOriginal &&
         m_networkMode != CoopNetworkMode::Off &&
-        !m_areaJournalTransferSending &&
-        !m_areaJournalTransferReceiving)
+        (m_networkMode == CoopNetworkMode::Host ||
+            (!m_areaJournalTransferSending && !m_areaJournalTransferReceiving)))
     {
         const bool hostOwnsSavedLevel =
             m_networkMode == CoopNetworkMode::Host ||
@@ -52240,6 +52240,7 @@ void ModMain::ResetAreaJournalTransferState(const char* lastEvent)
     m_areaJournalTransferRunningChecksum = kFnv1aOffsetBasis;
     m_areaJournalTransferFlags = 0;
     m_areaJournalTransferHostTimelineToken = 0;
+    m_areaJournalTransferAccountToken = 0;
     m_areaSnapshotSequenceCounter = 0;
     m_areaSnapshotLeaseEpoch = 0;
     m_areaSnapshotLevelEpoch = 0;
@@ -52304,6 +52305,7 @@ void ModMain::ResetRemotePeerAreaJournalState(RemotePeerSession& peer)
     peer.areaJournalTransferRunningChecksum = kFnv1aOffsetBasis;
     peer.areaJournalTransferFlags = 0;
     peer.areaJournalTransferHostTimelineToken = 0;
+    peer.areaJournalTransferAccountToken = 0;
     peer.areaSnapshotLeaseEpoch = 0;
     peer.areaSnapshotLevelEpoch = 0;
     peer.areaSnapshotAreaId = 0;
@@ -68514,6 +68516,7 @@ void ModMain::StoreActiveRemotePeerContext()
         peer.areaJournalTransferRunningChecksum = m_areaJournalTransferRunningChecksum;
         peer.areaJournalTransferFlags = m_areaJournalTransferFlags;
         peer.areaJournalTransferHostTimelineToken = m_areaJournalTransferHostTimelineToken;
+        peer.areaJournalTransferAccountToken = m_areaJournalTransferAccountToken;
         peer.areaSnapshotLeaseEpoch = m_areaSnapshotLeaseEpoch;
         peer.areaSnapshotLevelEpoch = m_areaSnapshotLevelEpoch;
         peer.areaSnapshotAreaId = m_areaSnapshotAreaId;
@@ -68597,6 +68600,7 @@ bool ModMain::ActivateRemotePeerContext(uint64_t accountToken)
         m_areaJournalTransferRunningChecksum = peer.areaJournalTransferRunningChecksum;
         m_areaJournalTransferFlags = peer.areaJournalTransferFlags;
         m_areaJournalTransferHostTimelineToken = peer.areaJournalTransferHostTimelineToken;
+        m_areaJournalTransferAccountToken = peer.areaJournalTransferAccountToken;
         m_areaSnapshotLeaseEpoch = peer.areaSnapshotLeaseEpoch;
         m_areaSnapshotLevelEpoch = peer.areaSnapshotLevelEpoch;
         m_areaSnapshotAreaId = peer.areaSnapshotAreaId;
@@ -77120,6 +77124,23 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
             }
             m_pendingHostPlayerStateSend = false;
             m_pendingHostPlayerStateAccountToken = 0;
+            m_pendingHostPlayerStateReason.clear();
+            m_pendingHostPlayerStateSaveKey.clear();
+        }
+        else
+        {
+            const uint64_t failedAccountToken = m_pendingHostPlayerStateAccountToken;
+            if (!m_pendingHostPlayerStateAccountTokens.empty() &&
+                m_pendingHostPlayerStateAccountTokens.front() == failedAccountToken)
+            {
+                m_pendingHostPlayerStateAccountTokens.pop_front();
+            }
+            m_lastPlayerStateTransferEvent =
+                "skipped failed host player-state preload account=" + Hex64(failedAccountToken);
+            LogCoop(m_lastPlayerStateTransferEvent);
+            m_pendingHostPlayerStateSend = false;
+            m_pendingHostPlayerStateAccountToken = 0;
+            m_pendingHostPlayerStateReason.clear();
             m_pendingHostPlayerStateSaveKey.clear();
         }
     }
@@ -77549,6 +77570,7 @@ bool ModMain::StartAreaJournalTransferFromFile(const std::string& sourcePath, co
     m_areaJournalTransferChecksum = checksum;
     m_areaJournalTransferRunningChecksum = kFnv1aOffsetBasis;
     m_areaJournalTransferHostTimelineToken = m_sessionHostTimelineToken;
+    m_areaJournalTransferAccountToken = GetLocalAccountToken();
     m_areaSnapshotAreaId = HashLevelName(m_areaJournalTransferLevel);
     m_areaSnapshotLevelEpoch =
         (m_areaLeaseActive && IsKnownSameLevel(m_areaJournalTransferLevel, m_areaLeaseLevelName))
@@ -77881,8 +77903,15 @@ bool ModMain::StoreReceivedAreaJournalTransfer(const char* reason)
     }
 
     const std::string safeLevel = SanitizePathComponent(m_areaJournalTransferLevel.empty() ? std::string("unknown") : m_areaJournalTransferLevel);
+    if (m_areaJournalTransferAccountToken == 0)
+    {
+        m_lastAreaJournalTransferEvent = "cannot store area journal: no source account";
+        return false;
+    }
+
     const std::string safeUser = SanitizePathComponent(m_areaJournalTransferUsername.empty() ? std::string("remote") : m_areaJournalTransferUsername);
-    const std::filesystem::path dest = root / safeLevel / ("journal_" + safeUser + ".jsonl");
+    const std::string accountKey = Hex64(m_areaJournalTransferAccountToken);
+    const std::filesystem::path dest = root / safeLevel / ("journal_account_" + accountKey + ".jsonl");
 
     std::error_code error;
     std::filesystem::create_directories(dest.parent_path(), error);
@@ -78027,9 +78056,13 @@ bool ModMain::MergeReceivedAreaJournalIntoServerState(const char* reason, bool a
         return reject("server area merge rejected: no profile root");
 
     const std::string safeLevel = SanitizePathComponent(levelName);
+    if (m_areaJournalTransferAccountToken == 0)
+        return reject("server area merge rejected: no source account");
+
     const std::string owner = SanitizePathComponent(m_areaJournalTransferUsername.empty() ? std::string("remote") : m_areaJournalTransferUsername);
+    const std::string ownerAccount = Hex64(m_areaJournalTransferAccountToken);
     const std::filesystem::path levelRoot = root / safeLevel;
-    const std::filesystem::path latestFromOwner = levelRoot / ("latest_from_" + owner + ".jsonl");
+    const std::filesystem::path latestFromOwner = levelRoot / ("latest_from_account_" + ownerAccount + ".jsonl");
     const std::filesystem::path authoritative = levelRoot / "authoritative.jsonl";
     const std::filesystem::path authorityMeta = levelRoot / "authority.jsonl";
 
@@ -78571,6 +78604,7 @@ void ModMain::HandleAreaJournalTransfer(const CoopProtocol::AreaJournalTransferP
         const uint64_t sourcePeerToken = m_activePacketSourceAccountToken != 0
             ? m_activePacketSourceAccountToken
             : GetRemoteAccountToken();
+        m_areaJournalTransferAccountToken = sourcePeerToken;
         m_areaJournalTransferReceivePath = BuildCoopTempAreaJournalPath(
             packet.transferId,
             levelName,
