@@ -1415,6 +1415,8 @@ private:
         std::string deferredAreaJournalTransferSourcePath;
         std::string deferredAreaJournalTransferLevel;
         std::string deferredAreaJournalTransferReason;
+        uint64_t deferredAreaJournalTransferHostAccountToken = 0;
+        uint64_t deferredAreaJournalTransferHostSaveKeyHash = 0;
         std::string pendingRemoteAreaHandoffRequestLevel;
         std::string lastAreaJournalTransferEvent = "-";
         float lastPacketTime = -1.0f;
@@ -1782,6 +1784,7 @@ private:
     std::string GetLocalUsername() const;
     uint64_t GetLocalAccountToken() const;
     uint64_t GetRemoteAccountToken() const;
+    uint64_t GetSessionHostAccountToken() const;
     void LoadPersistentConfig();
     bool SavePersistentConfig(const char* reason);
     bool IsSessionFriendlyFireEnabled() const;
@@ -2103,7 +2106,6 @@ private:
     bool BuildTimeDilationPacket(CoopProtocol::TimeDilationPacket& packet, CoopProtocol::TimeDilationCommand command, unsigned timers, float scale) const;
     void ResetTimeDilationState(const char* reason);
     uint64_t CurrentHostSaveKeyHash() const;
-    bool IsCurrentOrRecentHostSaveKeyHash(uint64_t hash) const;
     void SetCurrentHostSaveStateKey(const std::string& saveKey, bool retainPrevious);
     bool BuildLivePropTransformPacket(CoopProtocol::LivePropTransformPacket& packet, const LivePropState& state);
     bool CaptureLivePropState(IEntity& entity, bool removed, LivePropState& outState, std::string& reason, bool allowCarryableItem = false) const;
@@ -2160,7 +2162,7 @@ private:
     bool CaptureClientDisconnectSnapshot();
     void ResumeDeferredNativeWindowClose();
     bool RequestRemotePlayerStateUpload(const char* reason);
-    bool BroadcastHostSaveIdentity(const char* reason);
+    bool BroadcastHostSaveIdentity(const char* reason, bool replaceTimeline = false);
     bool StartClientNativePlayerSnapshotForUpload(const char* reason, const std::string& saveKey);
     bool HasUsableNativePlayerSaveCaptureForCurrentLevel(uint32_t minGeneration = 0) const;
     bool ShouldUseNativePlayerStatePreloadMerge() const;
@@ -2173,7 +2175,7 @@ private:
     bool QueueNextPlayerStateTransferPacket();
     void TickPlayerStateTransfer(float frameTime);
     void HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferPacket& packet);
-    void ResetPlayerStateTransferState(const char* lastEvent);
+    void ResetPlayerStateTransferState(const char* lastEvent, bool resetHostSaveIdentity = true);
     bool TryApplyReceivedPlayerStateTransfer(const char* reason);
     void SendHostLoadStartingNotice(const char* reason);
     bool BeginAreaJournalTransfer(const char* reason, const std::string& requestedLevelName = {});
@@ -2196,6 +2198,8 @@ private:
     bool TryApplyQueuedAreaStateOverlay(const char* reason);
     bool TryRequestPendingRemoteAreaHandoff(const char* reason);
     void ResetAreaJournalTransferState(const char* lastEvent);
+    std::string GetScopedReceivedAreaJournalRoot(uint64_t hostSaveKeyHash = 0) const;
+    std::string GetScopedServerAreaStateRoot(uint64_t hostSaveKeyHash = 0) const;
     std::string GetHostPlayerStatePathForUsername(const std::string& username) const;
     std::string GetHostPlayerStatePathForUsernameAndSave(const std::string& username, const std::string& saveKey) const;
     std::string GetHostPlayerStatePathForAccount(uint64_t accountToken) const;
@@ -2939,6 +2943,7 @@ private:
     std::string m_lastRuntimeCleanupRemoteUsername;
     std::string m_lastRemoteUsername;
     uint64_t m_remoteAccountToken = 0;
+    uint64_t m_sessionHostAccountToken = 0;
     uint64_t m_remotePlayerModelArchetypeId = 10739735956144685671ull;
     uint64_t m_lastRuntimeCleanupRemoteAccountToken = 0;
     bool m_duplicateAccountRejected = false;
@@ -4118,29 +4123,29 @@ private:
     std::string m_areaJournalTransferReceivePath;
     std::string m_playerStateTransferUsername;
     uint64_t m_playerStateTransferAccountToken = 0;
+    uint64_t m_playerStateTransferHostAccountToken = 0;
     std::string m_playerStateTransferSaveKey;
     std::string m_areaJournalTransferUsername;
     std::string m_areaJournalTransferLevel;
     std::string m_deferredAreaJournalTransferSourcePath;
     std::string m_deferredAreaJournalTransferLevel;
     std::string m_deferredAreaJournalTransferReason;
+    uint64_t m_deferredAreaJournalTransferHostAccountToken = 0;
+    uint64_t m_deferredAreaJournalTransferHostSaveKeyHash = 0;
     std::string m_pendingAreaOverlayApplyLevel;
     std::string m_pendingAreaOverlayApplyPath;
     std::string m_pendingAreaOverlayApplyReason;
+    uint64_t m_pendingAreaOverlayHostAccountToken = 0;
+    uint64_t m_pendingAreaOverlayHostSaveKeyHash = 0;
     std::string m_pendingRemoteAreaHandoffRequestLevel;
     std::string m_clientLocalAreaEnteredByTransitionLevel;
     std::string m_hostPlayerStateSentUsername;
     std::string m_currentHostSaveStateKey;
-    struct RecentHostSaveKeyHash
-    {
-        uint64_t hash = 0;
-        float expiresAt = -1.0f;
-    };
-    std::deque<RecentHostSaveKeyHash> m_recentHostSaveKeyHashes;
     std::string m_pendingHostPlayerStateReason;
     std::string m_pendingHostPlayerStateSaveKey;
     std::string m_pendingClientPlayerStateUploadReason;
     std::string m_pendingClientPlayerStateUploadSaveKey;
+    uint64_t m_pendingClientPlayerStateUploadHostAccountToken = 0;
     std::string m_lastSaveTransferEvent = "-";
     std::string m_lastPlayerStateTransferEvent = "-";
     std::string m_lastAreaJournalTransferEvent = "-";
@@ -4645,6 +4650,7 @@ private:
     bool m_pendingPlayerSidecarSave = false;
     bool m_localInventoryDirty = false;
     std::string m_localInventoryDirtySaveKey;
+    uint64_t m_localInventoryDirtyHostAccountToken = 0;
     uint64_t m_localInventoryDirtyRevision = 0;
     uint64_t m_localInventoryJournalRevision = 0;
     float m_localInventoryJournalAccumulator = 0.0f;
@@ -4656,10 +4662,15 @@ private:
     uint64_t m_clientRecoveryJournalRevision = 0;
     std::string m_clientRecoveryJournalSourcePath;
     std::string m_clientRecoveryJournalSaveKey;
+    uint64_t m_clientRecoveryJournalHostAccountToken = 0;
     bool m_pendingPlayerSidecarApply = false;
     bool m_pendingPlayerSidecarInventoryRestore = false;
     bool m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
     bool m_pendingPlayerSidecarChipsetRestore = false;
+    uint64_t m_pendingPlayerSidecarInventoryHostAccountToken = 0;
+    std::string m_pendingPlayerSidecarInventorySaveKey;
+    uint64_t m_pendingPlayerSidecarChipsetHostAccountToken = 0;
+    std::string m_pendingPlayerSidecarChipsetSaveKey;
     bool m_playerSidecarInventoryNativeRestoreReady = false;
     bool m_playerSidecarInventoryNativeRestoreActive = false;
     bool m_receivedPlayerStateAbilitiesPreparedForNativeLoad = false;
@@ -4747,6 +4758,7 @@ private:
     std::chrono::steady_clock::time_point m_clientDisconnectFlushDeadline;
     std::string m_clientDisconnectFlushReason;
     std::string m_clientDisconnectFlushSaveKey;
+    uint64_t m_clientDisconnectFlushHostAccountToken = 0;
     std::string m_clientDisconnectFlushJournalSourcePath;
     uint64_t m_clientDisconnectFlushJournalRevision = 0;
     bool m_nativeWindowCloseDeferred = false;

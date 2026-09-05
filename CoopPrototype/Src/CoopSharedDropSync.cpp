@@ -557,7 +557,8 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
                 command == CoopProtocol::SharedDropCommand::PickupCommit ||
                 command == CoopProtocol::SharedDropCommand::Remove));
     if (packet.worldEpoch != m_localWorldEpoch ||
-        !IsCurrentOrRecentHostSaveKeyHash(packet.hostSaveKeyHash) ||
+        packet.hostSaveKeyHash == 0 ||
+        packet.hostSaveKeyHash != CurrentHostSaveKeyHash() ||
         packet.areaId != m_localLevelId || packet.stableSpawnId == 0 || packet.archetypeId == 0 ||
         packet.sourcePeerHash == 0 || packet.sourcePeerHash != remotePeerHash || !roleAllowsCommand ||
         (command == CoopProtocol::SharedDropCommand::Spawn && !IsFiniteTransform(packet)))
