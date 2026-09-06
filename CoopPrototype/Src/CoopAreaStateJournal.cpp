@@ -238,6 +238,20 @@ void CoopAreaStateJournal::NoteLevelStateLoad(const std::string& levelName, Leve
     m_lastEvent = out.str();
 }
 
+void CoopAreaStateJournal::Reset()
+{
+    m_dirtyEntities.clear();
+    m_entityIdToGuid.clear();
+    m_untrackedEntityIds.clear();
+    m_levelStats.clear();
+    m_observedEventCount = 0;
+    m_trackedEventCount = 0;
+    m_guardSkips = 0;
+    m_boundarySaveCount = 0;
+    m_boundaryLoadCount = 0;
+    m_lastEvent = "-";
+}
+
 bool CoopAreaStateJournal::ExportJsonl(std::ostream& output, size_t maxEntityRows) const
 {
     return ExportJsonlFiltered(

@@ -2223,7 +2223,8 @@ void ModMain::HandleHazardEvent(const CoopProtocol::HazardEventPacket& packet)
     ++m_hazardEventReceived;
     if (packet.eventId == 0 || packet.areaId != m_localLevelId ||
         packet.worldEpoch != m_localWorldEpoch ||
-        !IsCurrentOrRecentHostSaveKeyHash(packet.hostSaveKeyHash) ||
+        packet.hostSaveKeyHash == 0 ||
+        packet.hostSaveKeyHash != CurrentHostSaveKeyHash() ||
         !IsFiniteHazardTransform(packet) || packet.archetypeId == 0)
     {
         ++m_hazardEventDropped;
