@@ -51935,6 +51935,8 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent, bool resetHos
     m_hostPlayerStateUploadFailures = 0;
     m_hostPlayerStateUploadReceives.clear();
     m_pendingHostPlayerStateUploadRequests.clear();
+    m_pendingHostPlayerStateUploadRequestSaveKeys.clear();
+    m_deferredHostPlayerStateUploadRequestSaveKeys.clear();
     m_playerStateTransferSourcePath.clear();
     m_clientDisconnectTransferSourcePath = preserveClientDisconnectFlush
         ? preservedDisconnectSourcePath
@@ -69463,6 +69465,8 @@ void ModMain::RemoveRemotePeer(uint64_t accountToken, const char* reason, bool a
     m_reliableEndpointStates.erase(MakeEndpointKey(peer.address, peer.port));
     m_hostPlayerStateUploadReceives.erase(accountToken);
     m_pendingHostPlayerStateUploadRequests.erase(accountToken);
+    m_pendingHostPlayerStateUploadRequestSaveKeys.erase(accountToken);
+    m_deferredHostPlayerStateUploadRequestSaveKeys.erase(accountToken);
     RemoveChatSender(accountToken);
     m_chatTextRates.erase(accountToken);
     m_remotePeers.erase(it);
@@ -75178,12 +75182,58 @@ void ModMain::QueueClientPlayerStateUpload(const char* reason, const std::string
         m_lastPlayerStateTransferEvent = "queued client player state upload: " + m_pendingClientPlayerStateUploadReason;
 }
 
+bool ModMain::SendRemotePlayerStateUploadRequest(
+    const RemotePeerSession& peer,
+    const std::string& saveKey)
+{
+    if (m_networkMode != CoopNetworkMode::Host ||
+        m_socket == kInvalidNetworkSocket ||
+        peer.accountToken == 0 ||
+        peer.address == 0 ||
+        peer.port == 0 ||
+        saveKey.empty() ||
+        saveKey == "unknown_save" ||
+        saveKey != m_currentHostSaveStateKey)
+    {
+        return false;
+    }
+
+    CoopProtocol::PlayerStateTransferPacket packet = {};
+    packet.magic = CoopProtocol::kPacketMagic;
+    packet.version = CoopProtocol::kProtocolVersion;
+    packet.type = static_cast<uint16_t>(CoopProtocol::PacketType::PlayerStateTransfer);
+    packet.sequence = CoopSerialSequence::Advance(m_playerStateTransferSequence);
+    packet.command = static_cast<uint32_t>(CoopProtocol::PlayerStateTransferCommand::Request);
+    packet.transferId =
+        m_playerStateTransferId == std::numeric_limits<uint32_t>::max()
+            ? 1u
+            : m_playerStateTransferId + 1u;
+    packet.worldEpoch = m_localWorldEpoch;
+    packet.accountToken = peer.accountToken;
+    CopyFixedString(packet.username, sizeof(packet.username), peer.username);
+    CopyFixedString(packet.saveKey, sizeof(packet.saveKey), saveKey);
+
+    if (!SendPlayerStateTransferTo(
+            packet,
+            peer.address,
+            peer.port,
+            "player state request send failed"))
+    {
+        return false;
+    }
+
+    m_playerStateTransferId = packet.transferId;
+    ++m_hostPlayerStateUploadRequests;
+    m_pendingHostPlayerStateUploadRequests.insert(peer.accountToken);
+    m_pendingHostPlayerStateUploadRequestSaveKeys[peer.accountToken] = saveKey;
+    return true;
+}
+
 bool ModMain::RequestRemotePlayerStateUpload(const char* reason)
 {
     if (m_networkMode != CoopNetworkMode::Host ||
         m_socket == kInvalidNetworkSocket ||
-        m_remotePeers.empty() ||
-        m_playerStateTransferSending)
+        m_remotePeers.empty())
     {
         return false;
     }
@@ -75198,12 +75248,13 @@ bool ModMain::RequestRemotePlayerStateUpload(const char* reason)
     bool sentAny = false;
     bool allSent = true;
     bool coalescedAny = false;
-    uint32_t lastTransferId = m_playerStateTransferId;
+    bool deferredAny = false;
     for (const auto& entry : m_remotePeers)
     {
         const RemotePeerSession& peer = entry.second;
         if (peer.accountToken == 0 || peer.address == 0 || peer.port == 0)
             continue;
+
         if (m_pendingHostPlayerStateUploadRequests.find(peer.accountToken) !=
                 m_pendingHostPlayerStateUploadRequests.end() ||
             m_hostPlayerStateUploadReceives.find(peer.accountToken) !=
@@ -75215,60 +75266,125 @@ bool ModMain::RequestRemotePlayerStateUpload(const char* reason)
             // mismatch. The current save already snapshots the latest
             // completed sidecar before reaching this path, so one in-flight
             // refresh per peer is sufficient.
-            coalescedAny = true;
+            std::string inFlightSaveKey;
+            if (const auto receiveIt = m_hostPlayerStateUploadReceives.find(peer.accountToken);
+                receiveIt != m_hostPlayerStateUploadReceives.end())
+            {
+                inFlightSaveKey = receiveIt->second.saveKey;
+            }
+            else if (const auto pendingIt = m_pendingHostPlayerStateUploadRequestSaveKeys.find(peer.accountToken);
+                pendingIt != m_pendingHostPlayerStateUploadRequestSaveKeys.end())
+            {
+                inFlightSaveKey = pendingIt->second;
+            }
+
+            if (inFlightSaveKey != saveKey)
+            {
+                m_deferredHostPlayerStateUploadRequestSaveKeys[peer.accountToken] = saveKey;
+                deferredAny = true;
+            }
+            else
+            {
+                coalescedAny = true;
+            }
             continue;
         }
 
-        CoopProtocol::PlayerStateTransferPacket packet = {};
-        packet.magic = CoopProtocol::kPacketMagic;
-        packet.version = CoopProtocol::kProtocolVersion;
-        packet.type = static_cast<uint16_t>(CoopProtocol::PacketType::PlayerStateTransfer);
-        packet.sequence = CoopSerialSequence::Advance(m_playerStateTransferSequence);
-        packet.command = static_cast<uint32_t>(CoopProtocol::PlayerStateTransferCommand::Request);
-        packet.transferId =
-            lastTransferId == std::numeric_limits<uint32_t>::max() ? 1u : lastTransferId + 1u;
-        packet.worldEpoch = m_localWorldEpoch;
-        packet.accountToken = peer.accountToken;
-        CopyFixedString(packet.username, sizeof(packet.username), peer.username);
-        CopyFixedString(packet.saveKey, sizeof(packet.saveKey), saveKey);
+        if (m_playerStateTransferSending)
+        {
+            m_deferredHostPlayerStateUploadRequestSaveKeys[peer.accountToken] = saveKey;
+            deferredAny = true;
+            continue;
+        }
 
-        const bool sent = SendPlayerStateTransferTo(
-            packet,
-            peer.address,
-            peer.port,
-            "player state request send failed");
+        const bool sent = SendRemotePlayerStateUploadRequest(peer, saveKey);
         sentAny = sentAny || sent;
         allSent = allSent && sent;
         if (!sent)
+        {
+            m_deferredHostPlayerStateUploadRequestSaveKeys[peer.accountToken] = saveKey;
+            deferredAny = true;
             continue;
+        }
 
-        lastTransferId = packet.transferId;
-        ++m_hostPlayerStateUploadRequests;
-        m_pendingHostPlayerStateUploadRequests.insert(peer.accountToken);
+        m_deferredHostPlayerStateUploadRequestSaveKeys.erase(peer.accountToken);
     }
 
     if (!sentAny)
     {
-        if (coalescedAny)
+        if (coalescedAny || deferredAny)
         {
             m_lastPlayerStateTransferEvent =
-                "coalesced duplicate remote player state upload request pending=" +
+                std::string(deferredAny ? "deferred superseding" : "coalesced duplicate") +
+                " remote player state upload request pending=" +
                 std::to_string(m_pendingHostPlayerStateUploadRequests.size()) +
+                " deferred=" +
+                std::to_string(m_deferredHostPlayerStateUploadRequestSaveKeys.size()) +
                 (reason && reason[0] ? ": " + std::string(reason) : "");
             LogCoop(m_lastPlayerStateTransferEvent);
         }
-        return coalescedAny;
+        return coalescedAny || deferredAny;
     }
 
-    m_playerStateTransferId = lastTransferId;
     m_lastPlayerStateTransferEvent =
         std::string(allSent ? "requested all remote player state uploads" :
             "requested some remote player state uploads") +
         " pending=" + std::to_string(m_pendingHostPlayerStateUploadRequests.size()) +
+        " deferred=" + std::to_string(m_deferredHostPlayerStateUploadRequestSaveKeys.size()) +
         (coalescedAny ? " coalesced=1" : "") +
+        (deferredAny ? " deferredNewScope=1" : "") +
         (reason && reason[0] ? ": " + std::string(reason) : "");
     LogCoop(m_lastPlayerStateTransferEvent);
     return allSent;
+}
+
+void ModMain::TickDeferredRemotePlayerStateUploadRequests()
+{
+    if (m_networkMode != CoopNetworkMode::Host ||
+        m_socket == kInvalidNetworkSocket ||
+        m_playerStateTransferSending ||
+        m_deferredHostPlayerStateUploadRequestSaveKeys.empty() ||
+        m_currentHostSaveStateKey.empty() ||
+        m_currentHostSaveStateKey == "unknown_save")
+    {
+        return;
+    }
+
+    for (auto it = m_deferredHostPlayerStateUploadRequestSaveKeys.begin();
+         it != m_deferredHostPlayerStateUploadRequestSaveKeys.end();)
+    {
+        const uint64_t accountToken = it->first;
+        const auto peerIt = m_remotePeers.find(accountToken);
+        if (peerIt == m_remotePeers.end())
+        {
+            it = m_deferredHostPlayerStateUploadRequestSaveKeys.erase(it);
+            continue;
+        }
+
+        if (m_pendingHostPlayerStateUploadRequests.find(accountToken) !=
+                m_pendingHostPlayerStateUploadRequests.end() ||
+            m_hostPlayerStateUploadReceives.find(accountToken) !=
+                m_hostPlayerStateUploadReceives.end())
+        {
+            ++it;
+            continue;
+        }
+
+        // Multiple saves may finish while the older upload drains. Always
+        // request the newest current scope rather than replaying an obsolete
+        // intermediate save key.
+        it->second = m_currentHostSaveStateKey;
+        if (!SendRemotePlayerStateUploadRequest(peerIt->second, it->second))
+        {
+            ++it;
+            continue;
+        }
+
+        LogCoop(
+            "started deferred remote player state upload account=" +
+            Hex64(accountToken) + " saveKey=" + it->second);
+        it = m_deferredHostPlayerStateUploadRequestSaveKeys.erase(it);
+    }
 }
 
 bool ModMain::BroadcastHostSaveIdentity(const char* reason, bool replaceTimeline)
@@ -76302,6 +76418,8 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
                 break;
         }
     }
+
+    TickDeferredRemotePlayerStateUploadRequests();
 
     if (m_networkMode != CoopNetworkMode::Client ||
         m_clientAwaitingHostPlayerState ||
@@ -77929,6 +78047,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             }
             m_hostPlayerStateUploadReceives.erase(accountToken);
             m_pendingHostPlayerStateUploadRequests.erase(accountToken);
+            m_pendingHostPlayerStateUploadRequestSaveKeys.erase(accountToken);
             m_lastPlayerStateTransferEvent = event;
             LogCoop(m_lastPlayerStateTransferEvent);
         };
@@ -78219,6 +78338,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         std::filesystem::remove(receivePath, error);
         m_hostPlayerStateUploadReceives.erase(packet.accountToken);
         m_pendingHostPlayerStateUploadRequests.erase(packet.accountToken);
+        m_pendingHostPlayerStateUploadRequestSaveKeys.erase(packet.accountToken);
         ++m_hostPlayerStateUploadCompletions;
         m_lastPlayerStateTransferEvent =
             "stored client player state for " + storedUsername +

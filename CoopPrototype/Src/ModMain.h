@@ -2161,7 +2161,11 @@ private:
     void TickClientIntentionalDisconnect(float frameTime);
     bool CaptureClientDisconnectSnapshot();
     void ResumeDeferredNativeWindowClose();
+    bool SendRemotePlayerStateUploadRequest(
+        const RemotePeerSession& peer,
+        const std::string& saveKey);
     bool RequestRemotePlayerStateUpload(const char* reason);
+    void TickDeferredRemotePlayerStateUploadRequests();
     bool BroadcastHostSaveIdentity(const char* reason, bool replaceTimeline = false);
     bool StartClientNativePlayerSnapshotForUpload(const char* reason, const std::string& saveKey);
     bool HasUsableNativePlayerSaveCaptureForCurrentLevel(uint32_t minGeneration = 0) const;
@@ -4319,6 +4323,8 @@ private:
     std::unordered_map<uint64_t, ChatTextRateState> m_chatTextRates;
     std::unordered_map<uint64_t, HostPlayerStateUploadReceive> m_hostPlayerStateUploadReceives;
     std::unordered_set<uint64_t> m_pendingHostPlayerStateUploadRequests;
+    std::unordered_map<uint64_t, std::string> m_pendingHostPlayerStateUploadRequestSaveKeys;
+    std::unordered_map<uint64_t, std::string> m_deferredHostPlayerStateUploadRequestSaveKeys;
     std::unordered_set<uint64_t> m_kickedAccountTokens;
     std::vector<ServerBrowserEntry> m_serverBrowserEntries;
     uint64_t m_activeRemotePeerToken = 0;
