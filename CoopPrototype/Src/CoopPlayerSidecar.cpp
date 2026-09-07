@@ -1,6 +1,7 @@
 #include "ModMain.h"
 #include "CoopRuntimeConfig.h"
 #include "CoopFilesystem.h"
+#include "CoopProfilePath.h"
 #include "CoopRuntimeLog.h"
 #include "CoopItemClassification.h"
 #include "CoopPtrHygiene.h"
@@ -58,6 +59,7 @@
 
 namespace
 {
+using CoopProfilePath::GetPreyProfileRoot;
 using CoopRuntimeGuards::TryGuardedCall;
 using CoopRuntimeGuards::TryGuardedVoidCall;
 using CoopRuntimeGuards::IsLikelyRuntimeCppObject;
@@ -479,18 +481,6 @@ bool ShouldApplyPlayerSidecarTransform(const IEntity& entity, const Vec3& positi
 bool ShouldApplyPlayerSidecarViewRotation(const ArkPlayer& player, const Quat& rotation)
 {
     return !Quat::IsEquivalent(player.GetViewRotation(), rotation, kPlayerSidecarViewRotationApplyEpsilonRadians);
-}
-
-std::filesystem::path GetPreyProfileRoot()
-{
-    std::filesystem::path root = CoopFilesystem::EnvironmentPath("USERPROFILE");
-    if (root.empty())
-        return {};
-
-    root /= "Saved Games";
-    root /= "Arkane Studios";
-    root /= "Prey";
-    return root;
 }
 
 std::filesystem::path GetPreySaveGamesRoot()

@@ -1,5 +1,6 @@
 #include "ModMain.h"
 #include "CoopFilesystem.h"
+#include "CoopProfilePath.h"
 #include "CoopRuntimeLog.h"
 
 #include <algorithm>
@@ -82,16 +83,11 @@ void LogAssetDump(const std::string& message)
 
 std::filesystem::path GetCoopAssetDumpRoot()
 {
-    std::filesystem::path root = CoopFilesystem::EnvironmentPath("USERPROFILE");
-    if (root.empty())
+    const std::filesystem::path profileRoot = CoopProfilePath::GetPreyProfileRoot();
+    if (profileRoot.empty())
         return std::filesystem::path("CoopPrototype") / "AssetDump";
 
-    root /= "Saved Games";
-    root /= "Arkane Studios";
-    root /= "Prey";
-    root /= "CoopPrototype";
-    root /= "AssetDump";
-    return root;
+    return profileRoot / "CoopPrototype" / "AssetDump";
 }
 
 std::filesystem::path BuildSafeAssetOutputPath(const std::filesystem::path& outputRoot, const std::string& cryPakPath)

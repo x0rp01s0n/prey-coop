@@ -7,6 +7,7 @@
 #include "CoopRuntimeLog.h"
 #include "CoopRuntimeConfig.h"
 #include "CoopFilesystem.h"
+#include "CoopProfilePath.h"
 #include "CoopPtrHygiene.h"
 #include "CoopDamagePolicy.h"
 #include "CoopCampaignAreaFacts.generated.h"
@@ -243,6 +244,7 @@ ModMain* gMod = nullptr;
 
 namespace
 {
+using CoopProfilePath::GetPreyProfileRoot;
 using CoopRuntimeGuards::IsReadableRuntimePointer;
 using CoopRuntimeGuards::IsLikelyRuntimeCppObject;
 using CoopRuntimeGuards::IsRuntimePointerMappedInCurrentProcess;
@@ -3786,18 +3788,6 @@ bool ReadBinaryValue(std::istream& stream, T& value)
 {
     stream.read(reinterpret_cast<char*>(&value), sizeof(T));
     return !!stream;
-}
-
-std::filesystem::path GetPreyProfileRoot()
-{
-    std::filesystem::path root = CoopFilesystem::EnvironmentPath("USERPROFILE");
-    if (root.empty())
-        return {};
-
-    root /= "Saved Games";
-    root /= "Arkane Studios";
-    root /= "Prey";
-    return root;
 }
 
 std::filesystem::path GetPreySaveGamesRoot()

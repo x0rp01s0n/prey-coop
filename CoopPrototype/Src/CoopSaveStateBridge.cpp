@@ -3,6 +3,7 @@
 #include "CoopNativeFragmentPayload.h"
 #include "CoopNativeSideBlob.h"
 #include "CoopFilesystem.h"
+#include "CoopProfilePath.h"
 #include "CoopRuntimeGuards.h"
 
 #include <algorithm>
@@ -121,17 +122,9 @@ std::filesystem::path GetAtlasRootFromEnvironment()
     if (!overrideRoot.empty())
         return overrideRoot;
 
-    const std::filesystem::path userProfile = CoopFilesystem::EnvironmentPath("USERPROFILE");
-    if (!userProfile.empty())
-    {
-        std::filesystem::path root = userProfile;
-        root /= "Saved Games";
-        root /= "Arkane Studios";
-        root /= "Prey";
-        root /= "CoopPrototype";
-        root /= "SaveAtlas";
-        return root;
-    }
+    const std::filesystem::path profileRoot = CoopProfilePath::GetPreyProfileRoot();
+    if (!profileRoot.empty())
+        return profileRoot / "CoopPrototype" / "SaveAtlas";
 
     return std::filesystem::path("CoopPrototype") / "SaveAtlas";
 }
