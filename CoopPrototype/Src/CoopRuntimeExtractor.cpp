@@ -2,6 +2,7 @@
 
 #include "CoopRuntimeConfig.h"
 #include "CoopFilesystem.h"
+#include "CoopProfilePath.h"
 #include "CoopRuntimeLog.h"
 #include "CoopRuntimeGuards.h"
 
@@ -285,16 +286,9 @@ std::string CoopRuntimeExtractor::GetExtractorRootPath() const
     if (!overridePath.empty())
         return CoopFilesystem::ToUtf8(overridePath);
 
-    const std::filesystem::path userProfile = CoopFilesystem::EnvironmentPath("USERPROFILE");
-    if (!userProfile.empty())
-    {
-        std::filesystem::path root = userProfile;
-        root /= "Saved Games";
-        root /= "Arkane Studios";
-        root /= "Prey";
-        root /= "CoopRuntimeExtractor";
-        return CoopFilesystem::ToUtf8(root);
-    }
+    const std::filesystem::path profileRoot = CoopProfilePath::GetPreyProfileRoot();
+    if (!profileRoot.empty())
+        return CoopFilesystem::ToUtf8(profileRoot / "CoopRuntimeExtractor");
 
     return "CoopRuntimeExtractor";
 }

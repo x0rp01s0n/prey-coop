@@ -1,5 +1,6 @@
 #include "ModMain.h"
 #include "CoopFilesystem.h"
+#include "CoopProfilePath.h"
 #include "CoopRuntimeConfig.h"
 #include "CoopRuntimeGuards.h"
 #include "CoopRuntimeLog.h"
@@ -1529,16 +1530,11 @@ std::string BuildProxyAnimationStateCatalog(const std::string& filter)
 
 std::filesystem::path GetCoopAnimationCatalogRoot()
 {
-    std::filesystem::path root = CoopFilesystem::EnvironmentPath("USERPROFILE");
-    if (root.empty())
+    const std::filesystem::path profileRoot = CoopProfilePath::GetPreyProfileRoot();
+    if (profileRoot.empty())
         return std::filesystem::path("CoopPrototype") / "AnimCatalog";
 
-    root /= "Saved Games";
-    root /= "Arkane Studios";
-    root /= "Prey";
-    root /= "CoopPrototype";
-    root /= "AnimCatalog";
-    return root;
+    return profileRoot / "CoopPrototype" / "AnimCatalog";
 }
 
 bool WriteMannequinSnippetCatalog(const std::string& kind, std::string& detail)

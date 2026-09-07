@@ -2,6 +2,7 @@
 
 #include "CoopRuntimeConfig.h"
 #include "CoopFilesystem.h"
+#include "CoopProfilePath.h"
 #include "CoopRuntimeLog.h"
 
 #include <atomic>
@@ -15,6 +16,7 @@
 
 namespace
 {
+using CoopProfilePath::GetPreyProfileRoot;
 constexpr const char* kEnvFlagName = "COOP_PTR_HYGIENE";
 constexpr const char* kMarkerFileName = "CoopPtrHygiene.txt";
 constexpr std::uint64_t kMarkerRecheckIntervalMs = 2000;
@@ -27,22 +29,6 @@ std::atomic<std::uint64_t> g_lastMarkerCheckMs{0};
 bool EnvFlagValue()
 {
     return CoopRuntimeConfig::Flag(kEnvFlagName);
-}
-
-// GetPreyProfileRoot() is intentionally duplicated per translation unit in
-// this codebase (see ModMain.cpp and CoopPlayerSidecar.cpp), so the same
-// 5-line USERPROFILE logic is duplicated here instead of reaching into
-// ModMain internals.
-std::filesystem::path GetPreyProfileRoot()
-{
-    std::filesystem::path root = CoopFilesystem::EnvironmentPath("USERPROFILE");
-    if (root.empty())
-        return {};
-
-    root /= "Saved Games";
-    root /= "Arkane Studios";
-    root /= "Prey";
-    return root;
 }
 
 bool MarkerFilePresent()

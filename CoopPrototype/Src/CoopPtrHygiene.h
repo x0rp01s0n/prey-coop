@@ -17,7 +17,7 @@ namespace CoopPtrHygiene
 //
 // Enabling (any of):
 //   * env var COOP_PTR_HYGIENE=1 before process start
-//   * marker file %USERPROFILE%\Saved Games\Arkane Studios\Prey\CoopPtrHygiene.txt
+//   * marker file <sys_user_folder>\CoopPtrHygiene.txt
 //     (re-checked every 2 s from the render end-frame tick)
 //   * in-game console command: coop_ptr_hygiene on|off|status
 //
