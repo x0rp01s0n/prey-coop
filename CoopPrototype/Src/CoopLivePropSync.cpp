@@ -101,8 +101,9 @@ constexpr float kLivePropCollisionPlayerDistanceSq = 4.0f;
 constexpr float kLivePropXformCarryDiscoveryDistanceSq = 4.0f;
 constexpr float kLivePropCollisionRecentQueueSeconds = 0.012f;
 constexpr uint64_t kLivePropSyntheticGuidMask = 0x8000000000000000ULL;
-constexpr uint64_t kLivePropStableCorpseGuidMask = 0xC000000000000000ULL;
-constexpr uint64_t kLivePropStableCorpseGuidPayloadMask = 0x3FFFFFFFFFFFFFFFULL;
+constexpr uint64_t kLivePropStableCorpseGuidTagMask = 0xFFFF000000000000ULL;
+constexpr uint64_t kLivePropStableCorpseGuidTag = 0xC0DE000000000000ULL;
+constexpr uint64_t kLivePropStableCorpseGuidPayloadMask = 0x0000FFFFFFFFFFFFULL;
 constexpr float kLobbyMainLiftCargoMinX = 312.5f;
 constexpr float kLobbyMainLiftCargoMaxX = 324.5f;
 constexpr float kLobbyMainLiftCargoMinY = 715.5f;
@@ -307,7 +308,7 @@ bool IsSyntheticLivePropGuid(uint64_t guid)
 
 bool IsStableCorpseLivePropGuid(uint64_t guid)
 {
-    return (guid & kLivePropStableCorpseGuidMask) == kLivePropStableCorpseGuidMask;
+    return (guid & kLivePropStableCorpseGuidTagMask) == kLivePropStableCorpseGuidTag;
 }
 
 uint64_t BuildStableCorpseLivePropGuid(uint64_t stableEnemyId)
@@ -315,7 +316,7 @@ uint64_t BuildStableCorpseLivePropGuid(uint64_t stableEnemyId)
     if (stableEnemyId == 0)
         return 0;
 
-    return kLivePropStableCorpseGuidMask |
+    return kLivePropStableCorpseGuidTag |
         (stableEnemyId & kLivePropStableCorpseGuidPayloadMask);
 }
 
