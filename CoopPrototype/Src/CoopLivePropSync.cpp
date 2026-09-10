@@ -101,6 +101,8 @@ constexpr float kLivePropCollisionPlayerDistanceSq = 4.0f;
 constexpr float kLivePropXformCarryDiscoveryDistanceSq = 4.0f;
 constexpr float kLivePropCollisionRecentQueueSeconds = 0.012f;
 constexpr uint64_t kLivePropSyntheticGuidMask = 0x8000000000000000ULL;
+constexpr uint64_t kLivePropStableCorpseGuidMask = 0xC000000000000000ULL;
+constexpr uint64_t kLivePropStableCorpseGuidPayloadMask = 0x3FFFFFFFFFFFFFFFULL;
 constexpr float kLobbyMainLiftCargoMinX = 312.5f;
 constexpr float kLobbyMainLiftCargoMaxX = 324.5f;
 constexpr float kLobbyMainLiftCargoMinY = 715.5f;
@@ -301,6 +303,20 @@ std::string ReadLivePropLevelName(const CoopProtocol::LivePropTransformPacket& p
 bool IsSyntheticLivePropGuid(uint64_t guid)
 {
     return (guid & kLivePropSyntheticGuidMask) != 0;
+}
+
+bool IsStableCorpseLivePropGuid(uint64_t guid)
+{
+    return (guid & kLivePropStableCorpseGuidMask) == kLivePropStableCorpseGuidMask;
+}
+
+uint64_t BuildStableCorpseLivePropGuid(uint64_t stableEnemyId)
+{
+    if (stableEnemyId == 0)
+        return 0;
+
+    return kLivePropStableCorpseGuidMask |
+        (stableEnemyId & kLivePropStableCorpseGuidPayloadMask);
 }
 
 uint64_t BuildSyntheticLivePropGuid(EntityId entityId)
@@ -1219,20 +1235,35 @@ bool ModMain::CaptureLivePropState(IEntity& entity, bool removed, LivePropState&
         return false;
     }
 
-    outState.guid = rawGuid != 0 ? rawGuid : BuildSyntheticLivePropGuid(outState.entityId);
+    outState.carried = IsLocalPlayerCarryingEntity(outState.entityId);
+    std::string corpseReason;
+    const bool corpseNpc = IsLivePropCorpseEntity(entity, outState.carried, corpseReason);
+    if (rawGuid != 0)
+    {
+        outState.guid = rawGuid;
+    }
+    else if (corpseNpc)
+    {
+        const IEntityArchetype* archetype = nullptr;
+        TryGuardedCall(
+            "live prop corpse archetype",
+            [&entity]() { return entity.GetArchetype(); },
+            archetype,
+            &reason);
+        const uint64_t archetypeId = archetype ? archetype->GetId() : 0;
+        outState.guid = BuildStableCorpseLivePropGuid(
+            ResolveEnemyStableId(entity, archetypeId, 0));
+    }
+    else
+    {
+        outState.guid = BuildSyntheticLivePropGuid(outState.entityId);
+    }
     if (outState.guid == 0)
     {
         reason = "zero guid";
         return false;
     }
 
-    bool hidden = false;
-    if (TryGuardedCall("live prop IEntity::IsHidden capture", [&entity]() { return entity.IsHidden(); }, hidden, &reason) && hidden)
-        outState.flags |= CoopProtocol::kLivePropTransformFlagHidden;
-    if (removed)
-        outState.flags |= CoopProtocol::kLivePropTransformFlagRemoved;
-
-    outState.carried = IsLocalPlayerCarryingEntity(outState.entityId);
     if (outState.carried && IsCarrySuppressActiveFor(outState.entityId, outState.guid, NowSeconds()))
         outState.carried = false;
     if (!outState.carried &&
@@ -1242,8 +1273,12 @@ bool ModMain::CaptureLivePropState(IEntity& entity, bool removed, LivePropState&
         return false;
     }
 
-    std::string corpseReason;
-    const bool corpseNpc = IsLivePropCorpseEntity(entity, outState.carried, corpseReason);
+    bool hidden = false;
+    if (TryGuardedCall("live prop IEntity::IsHidden capture", [&entity]() { return entity.IsHidden(); }, hidden, &reason) && hidden)
+        outState.flags |= CoopProtocol::kLivePropTransformFlagHidden;
+    if (removed)
+        outState.flags |= CoopProtocol::kLivePropTransformFlagRemoved;
+
     if (outState.carried && !corpseNpc && EnvFlagDefaultEnabled("COOP_LIVE_PROP_USE_CARRY_TARGET") && ArkPlayer::GetInstancePtr())
     {
         QuatT carryTarget(IDENTITY);
@@ -3239,6 +3274,68 @@ IEntity* ModMain::ResolveLivePropEntity(uint64_t guid, EntityId cachedEntityId, 
     {
         reason = "no entity system";
         return nullptr;
+    }
+
+    if (IsStableCorpseLivePropGuid(guid))
+    {
+        auto matchesStableCorpse = [this, guid, &reason](IEntity* candidate)
+        {
+            if (!candidate)
+                return false;
+
+            EntityId entityId = INVALID_ENTITYID;
+            ArkNpc* npc = nullptr;
+            const IEntityArchetype* archetype = nullptr;
+            uint64_t nativeGuid = 0;
+            if (!TryGuardedCall("live prop stable corpse id", [candidate]() { return candidate->GetId(); }, entityId, &reason) ||
+                entityId == INVALID_ENTITYID ||
+                !TryGuardedCall("live prop stable corpse npc", [candidate]() { return EntityUtils::GetArkNpc(candidate); }, npc, &reason) ||
+                !npc ||
+                !IsLivePropCorpseNpc(npc, IsLocalPlayerCarryingEntity(entityId), reason) ||
+                !TryGuardedCall("live prop stable corpse archetype", [candidate]() { return candidate->GetArchetype(); }, archetype, &reason) ||
+                !archetype ||
+                !TryGuardedCall("live prop stable corpse native guid", [candidate]() { return candidate->GetGuid(); }, nativeGuid, &reason))
+            {
+                return false;
+            }
+
+            return BuildStableCorpseLivePropGuid(
+                ResolveEnemyStableId(*candidate, archetype->GetId(), nativeGuid)) == guid;
+        };
+
+        if (cachedEntityId != INVALID_ENTITYID)
+        {
+            IEntity* cached = nullptr;
+            if (TryGuardedCall("live prop stable corpse cached", [cachedEntityId]() { return gEnv->pEntitySystem->GetEntity(cachedEntityId); }, cached, &reason) &&
+                matchesStableCorpse(cached))
+            {
+                return cached;
+            }
+        }
+
+        IEntityIt* iterator = gEnv->pEntitySystem->GetEntityIterator();
+        if (!iterator)
+        {
+            reason = "no stable corpse iterator";
+            return nullptr;
+        }
+
+        IEntity* found = nullptr;
+        iterator->MoveFirst();
+        while (!iterator->IsEnd())
+        {
+            IEntity* candidate = iterator->Next();
+            if (matchesStableCorpse(candidate))
+            {
+                found = candidate;
+                break;
+            }
+        }
+        iterator->Release();
+
+        if (!found)
+            reason = "stable corpse not found";
+        return found;
     }
 
     if (IsSyntheticLivePropGuid(guid))

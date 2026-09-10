@@ -19446,10 +19446,9 @@ static void CArkItem_Drop_Hook(CArkItem* item, int dropCount, const Vec3* altPos
     s_activeSharedDropSource = previousSource;
     s_activeSharedDropCloneEntityId = previousCloneEntityId;
 
-    // Native Drop can destroy the source or return a short-lived clone (for
-    // example while throwing a corpse). Resolve a fresh engine-owned item by
-    // id before entering shared-drop code; using either pointer from before
-    // the native call here was the source of the Windows purecall reports.
+    // Native Drop can destroy the source or return a short-lived clone.
+    // Resolve a fresh engine-owned item by id before entering shared-drop
+    // code instead of retaining either pointer across the native call.
     if (gMod && localPlayerDrop && droppedEntityId != INVALID_ENTITYID)
         gMod->OnNativeSharedItemDroppedEntity(droppedEntityId, dropCount, "CArkItem::Drop");
 }
