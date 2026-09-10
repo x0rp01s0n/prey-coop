@@ -161,18 +161,64 @@ bool ModMain::SendSharedDropTo(
 
 void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const char* reason)
 {
-    if (!item || m_sharedDropApplyDepth != 0 || m_networkMode == CoopNetworkMode::Off ||
-        !m_hasRemoteEndpoint || !IsSessionGameplayReady())
+    if (!item)
+        return;
+
+    EntityId itemEntityId = INVALID_ENTITYID;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "shared drop source entity id",
+            [item]() { return item->GetEntityId(); },
+            itemEntityId,
+            nullptr) ||
+        itemEntityId == INVALID_ENTITYID)
     {
         return;
     }
 
-    IEntity* entity = nullptr;
+    OnNativeSharedItemDroppedEntity(itemEntityId, droppedCount, reason);
+}
+
+void ModMain::OnNativeSharedItemDroppedEntity(EntityId itemEntityId, int droppedCount, const char* reason)
+{
+    if (itemEntityId == INVALID_ENTITYID || m_sharedDropApplyDepth != 0 ||
+        m_networkMode == CoopNetworkMode::Off || !m_hasRemoteEndpoint ||
+        !IsSessionGameplayReady())
+    {
+        return;
+    }
+
+    if (!gEnv || !gEnv->pEntitySystem)
+    {
+        ++m_sharedDropDropped;
+        m_lastSharedDropEvent = "drop_capture_failed_entity_system";
+        return;
+    }
+
+    // The native drop path may retire its CArkItem and replace it with a clone.
+    // Resolve the post-operation object from the entity system instead of
+    // dereferencing a pointer captured before Drop returned.
+    IEntity* entity = gEnv->pEntitySystem->GetEntity(itemEntityId);
+    CArkItem* item = nullptr;
+    std::string guardReason;
+    if (entity && !CoopRuntimeGuards::TryGuardedCall(
+            "shared drop item lookup",
+            [itemEntityId]() { return CArkItem::GetItemFromEntityId(itemEntityId); },
+            item,
+            &guardReason))
+    {
+        item = nullptr;
+    }
+    if (!entity || !item)
+    {
+        ++m_sharedDropDropped;
+        m_lastSharedDropEvent = "drop_capture_failed_entity_" + std::to_string(itemEntityId) +
+            (guardReason.empty() ? std::string() : "_" + guardReason);
+        return;
+    }
+
     uint64_t archetypeId = 0;
     int count = droppedCount;
-    std::string guardReason;
-    if (!CoopRuntimeGuards::TryGuardedCall("shared drop GetEntity", [item]() { return item->GetEntity(); }, entity, &guardReason) || !entity ||
-        !CoopRuntimeGuards::TryGuardedCall("shared drop GetArchetype", [item]() { return item->GetArchetype(); }, archetypeId, &guardReason) || archetypeId == 0)
+    if (!CoopRuntimeGuards::TryGuardedCall("shared drop GetArchetype", [item]() { return item->GetArchetype(); }, archetypeId, &guardReason) || archetypeId == 0)
     {
         ++m_sharedDropDropped;
         m_lastSharedDropEvent = "drop_capture_failed_" + guardReason;
@@ -243,6 +289,42 @@ void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const 
         "_arch_" + std::to_string(archetypeId) +
         "_count_" + std::to_string(count) +
         "_reason_" + (reason ? reason : "-");
+}
+
+void ModMain::OnNativeRecyclerIngredientSpawned(EntityId itemEntityId, const char* reason)
+{
+    if (m_networkMode != CoopNetworkMode::Host || itemEntityId == INVALID_ENTITYID ||
+        m_sharedDropApplyDepth != 0 || !m_hasRemoteEndpoint || !IsSessionGameplayReady())
+    {
+        return;
+    }
+
+    // SpawnNextIngredient can be called more than once while the recycler is
+    // finishing its animation. Do not publish the same native entity twice.
+    if (m_sharedDropByEntityId.find(itemEntityId) != m_sharedDropByEntityId.end())
+        return;
+
+    CArkItem* item = nullptr;
+    std::string guardReason;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "recycler ingredient item lookup",
+            [itemEntityId]() { return CArkItem::GetItemFromEntityId(itemEntityId); },
+            item,
+            &guardReason) ||
+        !item)
+    {
+        ++m_sharedDropDropped;
+        m_lastSharedDropEvent = "recycler_output_lookup_failed_" + guardReason;
+        return;
+    }
+
+    int count = 1;
+    CoopRuntimeGuards::TryGuardedCall(
+        "recycler ingredient count",
+        [item]() { return item->GetCount(); },
+        count,
+        nullptr);
+    OnNativeSharedItemDroppedEntity(itemEntityId, count, reason);
 }
 
 bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerId, const char* reason)

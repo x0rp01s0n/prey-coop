@@ -8048,6 +8048,7 @@ static auto s_hookCArkItemClone = CArkItem::FClone.MakeHook();
 static auto s_hookCArkItemPickUp = CArkItem::FPickUp.MakeHook();
 static auto s_hookArkPlayerWeaponComponentEquipWeapon = ArkPlayerWeaponComponent::FEquipWeaponOv0.MakeHook();
 static auto s_hookCArkWeaponOnEquip = CArkWeapon::FOnEquip.MakeHook();
+static auto s_hookArkRecyclerSpawnNextIngredient = ArkRecycler::FSpawnNextIngredient.MakeHook();
 static thread_local ArkPlayerWeaponComponent* s_activeLocalWeaponEquipComponent = nullptr;
 static thread_local unsigned s_activeLocalWeaponEquipId = INVALID_ENTITYID;
 static auto s_hookArkPlayerCarryThrowCarriedEntity = ArkPlayerCarry::FThrowCarriedEntity.MakeHook();
@@ -19362,7 +19363,7 @@ static bool CArkItem_TryGiveInventory_Hook(CArkItem* item, IArkInventory* invent
 }
 
 static thread_local const CArkItem* s_activeSharedDropSource = nullptr;
-static thread_local CArkItem* s_activeSharedDropClone = nullptr;
+static thread_local EntityId s_activeSharedDropCloneEntityId = INVALID_ENTITYID;
 
 static CArkItem& CArkItem_Clone_Hook(const CArkItem* item, int count)
 {
@@ -19377,7 +19378,18 @@ static CArkItem& CArkItem_Clone_Hook(const CArkItem* item, int count)
     if (CoopPtrHygiene::Enabled())
         CoopPtrHygiene::LogPtr("item_clone_result", &clone);
     if (item && item == s_activeSharedDropSource)
-        s_activeSharedDropClone = &clone;
+    {
+        // Drop may return after the original item has been retired. Keep only
+        // the clone's stable entity id across that boundary; never retain a
+        // CArkItem pointer for post-Drop use.
+        EntityId cloneEntityId = INVALID_ENTITYID;
+        TryGuardedCall(
+            "shared drop clone entity id",
+            [&clone]() { return clone.GetEntityId(); },
+            cloneEntityId,
+            nullptr);
+        s_activeSharedDropCloneEntityId = cloneEntityId;
+    }
     return clone;
 }
 
@@ -19393,6 +19405,16 @@ static void CArkItem_Drop_Hook(CArkItem* item, int dropCount, const Vec3* altPos
     const EntityId localPlayerId = ArkPlayer::GetInstancePtr()
         ? ArkPlayer::GetInstance().GetEntityId()
         : INVALID_ENTITYID;
+    EntityId sourceItemEntityId = INVALID_ENTITYID;
+    if (item)
+    {
+        TryGuardedCall(
+            "shared drop source entity id before",
+            [item]() { return item->GetEntityId(); },
+            sourceItemEntityId,
+            nullptr);
+    }
+
     unsigned ownerId = 0;
     if (item)
         TryGuardedCall("shared drop owner before", [item]() { return item->GetOwnerId(); }, ownerId, nullptr);
@@ -19402,11 +19424,11 @@ static void CArkItem_Drop_Hook(CArkItem* item, int dropCount, const Vec3* altPos
     {
         ArkInventory* inventory = GetArkInventoryExtensionFromEntity(ArkPlayer::GetInstance().GetEntity());
         bool inventoryContainsItem = false;
-        if (inventory)
+        if (inventory && sourceItemEntityId != INVALID_ENTITYID)
         {
             TryGuardedCall(
                 "shared drop inventory membership before",
-                [inventory, item]() { return inventory->Contains(item->GetEntityId()); },
+                [inventory, sourceItemEntityId]() { return inventory->Contains(sourceItemEntityId); },
                 inventoryContainsItem,
                 nullptr);
         }
@@ -19414,16 +19436,22 @@ static void CArkItem_Drop_Hook(CArkItem* item, int dropCount, const Vec3* altPos
     }
 
     const CArkItem* previousSource = s_activeSharedDropSource;
-    CArkItem* previousClone = s_activeSharedDropClone;
+    const EntityId previousCloneEntityId = s_activeSharedDropCloneEntityId;
     s_activeSharedDropSource = localPlayerDrop ? item : nullptr;
-    s_activeSharedDropClone = nullptr;
+    s_activeSharedDropCloneEntityId = INVALID_ENTITYID;
     s_hookCArkItemDrop.InvokeOrig(item, dropCount, altPosition);
-    CArkItem* droppedItem = s_activeSharedDropClone ? s_activeSharedDropClone : item;
+    const EntityId droppedEntityId = s_activeSharedDropCloneEntityId != INVALID_ENTITYID
+        ? s_activeSharedDropCloneEntityId
+        : sourceItemEntityId;
     s_activeSharedDropSource = previousSource;
-    s_activeSharedDropClone = previousClone;
+    s_activeSharedDropCloneEntityId = previousCloneEntityId;
 
-    if (gMod && localPlayerDrop)
-        gMod->OnNativeSharedItemDropped(droppedItem, dropCount, "CArkItem::Drop");
+    // Native Drop can destroy the source or return a short-lived clone (for
+    // example while throwing a corpse). Resolve a fresh engine-owned item by
+    // id before entering shared-drop code; using either pointer from before
+    // the native call here was the source of the Windows purecall reports.
+    if (gMod && localPlayerDrop && droppedEntityId != INVALID_ENTITYID)
+        gMod->OnNativeSharedItemDroppedEntity(droppedEntityId, dropCount, "CArkItem::Drop");
 }
 
 static bool CArkItem_PickUp_Hook(CArkItem* item, const unsigned pickerId, bool scaleOnLerp)
@@ -19435,7 +19463,9 @@ static bool CArkItem_PickUp_Hook(CArkItem* item, const unsigned pickerId, bool s
         CoopPtrHygiene::LogPtrWith("item_pickup", item, extra);
         CoopPtrHygiene::CheckAbove32("item_pickup", item);
     }
-    const EntityId itemEntityId = item ? item->GetEntityId() : INVALID_ENTITYID;
+    EntityId itemEntityId = INVALID_ENTITYID;
+    if (item)
+        TryGuardedCall("item pickup entity id", [item]() { return item->GetEntityId(); }, itemEntityId, nullptr);
     if (gMod && gMod->ShouldDeferNativeSharedItemPickup(item, pickerId, "CArkItem::PickUp"))
         return false;
 
@@ -19481,6 +19511,19 @@ static void CArkWeapon_OnEquip_Hook(CArkWeapon* weapon)
         weapon->m_ownerId = ArkPlayer::GetInstance().GetEntityId();
     }
     s_hookCArkWeaponOnEquip.InvokeOrig(weapon);
+}
+
+static void ArkRecycler_SpawnNextIngredient_Hook(ArkRecycler* recycler)
+{
+    s_hookArkRecyclerSpawnNextIngredient.InvokeOrig(recycler);
+    if (gMod && recycler)
+    {
+        // ArkRecycler records the freshly spawned world item here. Publishing
+        // the entity id lets the shared-drop layer materialize the exact
+        // vanilla output on peers without touching the recycler's input lease.
+        const EntityId itemEntityId = static_cast<EntityId>(recycler->m_lastIngredientSpawned);
+        gMod->OnNativeRecyclerIngredientSpawned(itemEntityId, "ArkRecycler::SpawnNextIngredient");
+    }
 }
 
 static void CArkItem_ResetCount_Hook(CArkItem* item, int count)
@@ -31706,6 +31749,7 @@ void ModMain::InitHooks()
         s_hookCArkItemDrop.SetHookFunc(&CArkItem_Drop_Hook);
         s_hookCArkItemClone.SetHookFunc(&CArkItem_Clone_Hook);
         s_hookCArkItemPickUp.SetHookFunc(&CArkItem_PickUp_Hook);
+        s_hookArkRecyclerSpawnNextIngredient.SetHookFunc(&ArkRecycler_SpawnNextIngredient_Hook);
         s_hookArkPlayerWeaponComponentEquipWeapon.SetHookFunc(&ArkPlayerWeaponComponent_EquipWeapon_Hook);
         s_hookCArkWeaponOnEquip.SetHookFunc(&CArkWeapon_OnEquip_Hook);
     }

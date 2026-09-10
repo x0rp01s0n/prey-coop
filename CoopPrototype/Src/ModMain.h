@@ -1695,6 +1695,8 @@ public:
     void OnLocalAreaObjectKeycardReaderStateChanged(ArkKeycardReader* reader, uint16_t eventKind, bool value, bool changed, const char* reason);
     void OnLocalAreaObjectContainerStateChanged(ArkInventory* inventory, bool open, const char* reason);
     void OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const char* reason);
+    void OnNativeSharedItemDroppedEntity(EntityId itemEntityId, int droppedCount, const char* reason);
+    void OnNativeRecyclerIngredientSpawned(EntityId itemEntityId, const char* reason);
     bool ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerId, const char* reason);
     void OnNativeSharedItemPicked(EntityId itemEntityId, EntityId pickerId, bool success, const char* reason);
     void CaptureLocalPlayerPickupRecovery(EntityId pickerId, const char* reason);
