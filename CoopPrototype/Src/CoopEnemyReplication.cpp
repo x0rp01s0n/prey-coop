@@ -9598,6 +9598,10 @@ bool ModMain::ApplyEnemyAttentionAuthorityDecisionOnAreaAuthority(
                 state,
                 *entity,
                 reason && reason[0] ? reason : "attention arbitration local handoff");
+            PublishLocalEnemyMimicryStateOnAuthorityHandoff(
+                state,
+                *entity,
+                reason && reason[0] ? reason : "attention arbitration local handoff");
         }
         else
         {
@@ -10560,6 +10564,110 @@ void ModMain::TickHostProxyCombatStimulus(float frameTime)
     m_lastProxyTargetBindings = 0;
     m_lastProxySimpleAttentionTracked = CountHostEnemiesTrackingProxySimple();
     m_lastProxyComplexAttentionTracked = CountHostEnemiesTrackingProxyComplex();
+}
+
+bool ModMain::PublishLocalEnemyMimicryStateOnAuthorityHandoff(
+    EnemyAuthorityState& state,
+    IEntity& entity,
+    const char* reason)
+{
+    if (state.remoteLocomotionAuthority ||
+        state.authorityOwnerAccountToken != GetLocalAccountToken() ||
+        ResolveNpcMannequinKindForRuntime(&entity) != "mimic")
+    {
+        return false;
+    }
+
+    ArkNpc* npc = EntityUtils::GetArkNpc(&entity);
+    if (!npc)
+        return false;
+
+    std::string guardReason;
+    bool isMimicking = false;
+    if (!TryGuardedCall(
+            "authority handoff mimicry IsMimicking",
+            [npc]() { return npc->IsMimicking(); },
+            isMimicking,
+            &guardReason))
+    {
+        return false;
+    }
+
+    IEntity* targetEntity = nullptr;
+    EArkNpcMimicryReason mimicryReason = EArkNpcMimicryReason::none;
+    if (isMimicking)
+    {
+        unsigned targetEntityId = 0;
+        const bool targetRead = TryGuardedCall(
+                "authority handoff mimicry GetMimicingEntityId",
+                [npc]() { return npc->GetMimicingEntityId(); },
+                targetEntityId,
+                &guardReason) &&
+            targetEntityId != 0;
+        if (targetRead && gEnv && gEnv->pEntitySystem)
+            targetEntity = gEnv->pEntitySystem->GetEntity(static_cast<EntityId>(targetEntityId));
+        TryGuardedCall(
+            "authority handoff mimicry GetMimicryReason",
+            [npc]() { return npc->GetMimicryReason(); },
+            mimicryReason,
+            &guardReason);
+        if (!targetEntity &&
+            (state.localMimicryTargetGuid == 0 && state.localMimicryTargetArchetypeId == 0))
+        {
+            AppendEnemySyncTrace(
+                "enemy_fx",
+                "authority_handoff_mimicry_snapshot_missing_target net=" +
+                    std::to_string(state.netId) +
+                    " entity=" + std::to_string(entity.GetId()) +
+                    " reason=" + (reason && reason[0] ? reason : "-") +
+                    " guard=" + (guardReason.empty() ? std::string("-") : guardReason));
+            return false;
+        }
+    }
+
+    const uint32_t previousSequence = state.localMimicryEventSequence;
+    if (isMimicking && !targetEntity)
+    {
+        CoopSerialSequence::Advance(state.localMimicryEventSequence);
+        uint16_t eventFlags = CoopProtocol::kEnemyAbilityFxFlagWorldEvent;
+        if (state.localMimicryIgnorePsi)
+            eventFlags |= CoopProtocol::kEnemyAbilityFxFlagMimicIgnorePsi;
+        QueueLocalEnemyAbilityFxEventForHook(
+            state,
+            entity,
+            CoopProtocol::kEnemyAbilityFxNpcMimicryBegin,
+            static_cast<int>(mimicryReason),
+            CoopProtocol::kInvalidMannequinOrdinal,
+            state.localMimicryEventSequence,
+            state.localMimicryTargetPosition,
+            entity.GetWorldRotation().GetColumn1(),
+            "authority handoff stored-target mimicry snapshot",
+            state.localMimicryTargetGuid,
+            eventFlags,
+            state.localMimicryTargetArchetypeId);
+    }
+    else
+    {
+        QueueLocalEnemyMimicryEventForHook(
+            npc,
+            targetEntity,
+            isMimicking,
+            mimicryReason,
+            isMimicking && state.localMimicryIgnorePsi);
+    }
+    const bool published = state.localMimicryEventSequence != previousSequence;
+    AppendEnemySyncTrace(
+        "enemy_fx",
+        std::string(published
+            ? "authority_handoff_mimicry_snapshot_published"
+            : "authority_handoff_mimicry_snapshot_rejected") +
+            " net=" + std::to_string(state.netId) +
+            " entity=" + std::to_string(entity.GetId()) +
+            " active=" + std::to_string(isMimicking ? 1 : 0) +
+            " epoch=" + std::to_string(state.authorityEpoch) +
+            " reason=" + (reason && reason[0] ? reason : "-") +
+            " guard=" + (guardReason.empty() ? std::string("-") : guardReason));
+    return published;
 }
 
 void ModMain::TickEnemyMimicryStateHeartbeat(float frameTime)

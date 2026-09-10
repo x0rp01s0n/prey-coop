@@ -279,6 +279,23 @@ std::atomic<uint32_t> g_coopNative1534F40Calls{0};
 std::atomic<uint32_t> g_coopNative1534F40OwnerReadFailures{0};
 std::atomic<uint32_t> g_coopNative1534F40NullOwners{0};
 
+uint64_t CreateRuntimeSessionNonce(const void* owner)
+{
+    static std::atomic<uint64_t> counter{0};
+    uint64_t value = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    value ^= static_cast<uint64_t>(GetTickCount64()) << 17;
+    value ^= static_cast<uint64_t>(GetCurrentProcessId()) << 32;
+    value ^= static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(owner));
+    value ^= counter.fetch_add(1, std::memory_order_relaxed) + 1;
+    value ^= value >> 30;
+    value *= 0xBF58476D1CE4E5B9ull;
+    value ^= value >> 27;
+    value *= 0x94D049BB133111EBull;
+    value ^= value >> 31;
+    return value != 0 ? value : 1;
+}
+
 void IncrementBoundedNative1534F40Counter(std::atomic<uint32_t>& counter)
 {
     uint32_t current = counter.load(std::memory_order_relaxed);
@@ -52276,6 +52293,7 @@ void ModMain::StartHost()
     }
 
     m_networkMode = CoopNetworkMode::Host;
+    m_localRuntimeSessionNonce = CreateRuntimeSessionNonce(this);
     m_sessionHostAccountToken = GetLocalAccountToken();
     m_networkTelemetry.Reset();
     ResetRuntimeCostTelemetry();
@@ -52706,6 +52724,7 @@ void ModMain::StartClient()
         return;
 
     m_networkMode = CoopNetworkMode::Client;
+    m_localRuntimeSessionNonce = CreateRuntimeSessionNonce(this);
     m_sessionHostAccountToken = 0;
     m_clientConnectStartTime = GetNowSeconds();
     m_networkTelemetry.Reset();
@@ -54434,6 +54453,7 @@ bool ModMain::BuildSessionHelloPacket(CoopProtocol::SessionHelloPacket& packet)
     packet.type = static_cast<uint16_t>(CoopProtocol::PacketType::SessionHello);
     packet.sequence = CoopSerialSequence::Advance(m_controlSequence);
     packet.accountToken = GetLocalAccountToken();
+    packet.runtimeSessionNonce = m_localRuntimeSessionNonce;
     packet.modelArchetypeId = m_identityConfig.Data().selectedModelArchetypeId;
     packet.modBuild = CoopProtocol::kModBuild;
     packet.levelId = m_localLevelId;
@@ -67537,6 +67557,10 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
         reliablePayloadType == CoopProtocol::PacketType::EnemyMannequinAction ||
         reliablePayloadType == CoopProtocol::PacketType::EnemyRoster ||
         reliablePayloadType == CoopProtocol::PacketType::CorpsePhantomRequest;
+    const bool enemyReplicationReceiveReady =
+        IsEnemyReplicationGameplayReady() ||
+        (reliablePayloadType == CoopProtocol::PacketType::EnemyRoster &&
+            IsEnemyRosterReceiveReady());
     uint32_t reliableStartTransferId = 0;
     const bool isReliableTransferStart = isCrossWorldControlPayload &&
         IsReliableTransferStartPayload(packet.payloadType, packet.payload, packet.payloadSize, reliableStartTransferId);
@@ -67684,7 +67708,7 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
     if (!isCrossWorldControlPayload &&
         (m_loadControlNetworkPumpActive ||
             (!IsSessionGameplayReady() &&
-                !(isEnemyReplicationPayload && IsEnemyReplicationGameplayReady()))))
+                !(isEnemyReplicationPayload && enemyReplicationReceiveReady))))
     {
         // There is no receive-side reorder buffer. Holding the sequence here
         // permanently blocks the cross-world save/player-state transfer that
@@ -68016,7 +68040,7 @@ void ModMain::HandleReliablePayload(uint16_t payloadType, const uint8_t* payload
     }
     case CoopProtocol::PacketType::EnemyRoster:
     {
-        if (payloadSize != sizeof(CoopProtocol::EnemyRosterPacket) || !IsSessionGameplayReady())
+        if (payloadSize != sizeof(CoopProtocol::EnemyRosterPacket) || !IsEnemyRosterReceiveReady())
             return;
 
         CoopProtocol::EnemyRosterPacket packet = {};
@@ -70151,8 +70175,23 @@ void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
         return;
     }*/
 
-    const auto existingIt = m_remotePeers.find(packet.accountToken);
-    const bool newPeer = existingIt == m_remotePeers.end();
+    auto existingIt = m_remotePeers.find(packet.accountToken);
+    bool newPeer = existingIt == m_remotePeers.end();
+    if (!newPeer &&
+        existingIt->second.address == fromAddress &&
+        existingIt->second.port == fromPort &&
+        packet.runtimeSessionNonce != 0 &&
+        existingIt->second.runtimeSessionNonce != 0 &&
+        packet.runtimeSessionNonce != existingIt->second.runtimeSessionNonce)
+    {
+        // Account and UDP endpoint survive a process restart. The reliable
+        // sequence space does not, so retire the old incarnation before
+        // accepting packets from the new one.
+        LogCoop("peer runtime session restarted token=" + Hex64(packet.accountToken));
+        RemoveRemotePeer(packet.accountToken, "peer runtime session restarted", false);
+        existingIt = m_remotePeers.end();
+        newPeer = true;
+    }
     if (!newPeer &&
         (existingIt->second.address != fromAddress || existingIt->second.port != fromPort))
     {
@@ -70253,6 +70292,7 @@ void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
 
     RemotePeerSession& peer = m_remotePeers[packet.accountToken];
     peer.accountToken = packet.accountToken;
+    peer.runtimeSessionNonce = packet.runtimeSessionNonce;
     peer.address = fromAddress;
     peer.port = fromPort;
     peer.modBuild = packet.modBuild;
@@ -70759,7 +70799,7 @@ void ModMain::HandleEnemyRoster(const CoopProtocol::EnemyRosterPacket& packet)
 {
     ++m_enemyRosterReceivedPackets;
     if (m_networkMode != CoopNetworkMode::Client ||
-        !IsSessionGameplayReady() ||
+        !IsEnemyRosterReceiveReady() ||
         packet.enemyNetId == 0 ||
         packet.stableEnemyId == 0 ||
         packet.areaId == 0 ||
@@ -71128,6 +71168,10 @@ void ModMain::HandleTestMimicState(const CoopProtocol::TestMimicStatePacket& pac
                 // latent linear/angular motion before Vanilla takes over.
                 ApplyEntityPhysicsVelocity(*entity, Vec3(ZERO));
                 RestoreLocalEnemyVanillaAuthority(
+                    *authorityState,
+                    *entity,
+                    "client enemy authority grant");
+                PublishLocalEnemyMimicryStateOnAuthorityHandoff(
                     *authorityState,
                     *entity,
                     "client enemy authority grant");
@@ -73120,6 +73164,11 @@ void ModMain::SendClientWorldReady()
 {
     if (m_networkMode != CoopNetworkMode::Client || m_socket == kInvalidNetworkSocket)
         return;
+
+    // ClientWorldReady can make the Host answer with the durable enemy roster
+    // on the next network turn. Open the local gameplay receive gate first so
+    // that reliable snapshot is applied rather than acknowledged and retired.
+    UpdateSessionGate();
 
     if (!m_hasRemoteSession)
     {
@@ -78873,6 +78922,15 @@ void ModMain::HandleWorldSync(const CoopProtocol::WorldSyncPacket& packet)
                     sourcePeer->accountToken);
                 if (sourcePeer->sessionReady)
                 {
+                    // A reconnecting client can acknowledge reliable roster
+                    // packets while its gameplay handlers are still gated by
+                    // loading. Reannounce the current roster only after its
+                    // ClientWorldReady edge so following poses and durable NPC
+                    // states resolve against valid identities.
+                    for (auto& authorityEntry : m_enemyAuthorities)
+                        authorityEntry.second.rosterAnnouncedVersion = 0;
+                    m_lastEnemyRosterEvent =
+                        "reset enemy roster for client world ready";
                     QueueLocalTurretSnapshotEventsToEndpoint(
                         sourcePeer->address,
                         sourcePeer->port,
@@ -79114,6 +79172,19 @@ bool ModMain::IsEnemyReplicationGameplayReady() const
         }
     }
     return false;
+}
+
+bool ModMain::IsEnemyRosterReceiveReady() const
+{
+    return m_networkMode == CoopNetworkMode::Client &&
+        IsGameReady() &&
+        !m_loadControlNetworkPumpActive &&
+        !m_saveLoadGuardActive &&
+        !m_pendingPostLoadResync &&
+        !m_arkLevelTransitionLoadActive &&
+        !m_runtimeTransitionCleanupPrepared &&
+        !m_localLevelName.empty() &&
+        m_localLevelName != "unknown";
 }
 
 void ModMain::ResetAreaLeaseState(const char* reason)

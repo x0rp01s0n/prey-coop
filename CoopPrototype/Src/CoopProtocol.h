@@ -7,7 +7,7 @@
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 245;
+constexpr uint16_t kProtocolVersion = 246;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -588,6 +588,7 @@ struct SessionHelloPacket
     uint16_t type = static_cast<uint16_t>(PacketType::SessionHello);
     uint32_t sequence = 0;
     uint64_t accountToken = 0;
+    uint64_t runtimeSessionNonce = 0;
     uint64_t modelArchetypeId = 0;
     char username[kUsernameSize] = {};
     char password[kPasswordSize] = {};
