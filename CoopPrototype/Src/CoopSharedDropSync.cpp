@@ -335,7 +335,26 @@ bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerI
         return false;
     }
 
-    const auto found = m_sharedDropByEntityId.find(item->GetEntityId());
+    // PickUp can be entered with a retired world-item pointer after a native
+    // Drop/clone transition. Never dereference that pointer while consulting
+    // the shared-drop table; suppress the native call if its identity cannot
+    // be read safely, which keeps the failure terminal instead of crashing.
+    EntityId itemEntityId = INVALID_ENTITYID;
+    std::string guardReason;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "shared drop pickup source entity id",
+            [item]() { return item->GetEntityId(); },
+            itemEntityId,
+            &guardReason) ||
+        itemEntityId == INVALID_ENTITYID)
+    {
+        ++m_sharedDropPickupSuppressions;
+        m_lastSharedDropEvent = "suppressed_invalid_pickup_source" +
+            (guardReason.empty() ? std::string() : "_" + guardReason);
+        return true;
+    }
+
+    const auto found = m_sharedDropByEntityId.find(itemEntityId);
     if (found == m_sharedDropByEntityId.end())
         return false;
     auto recordIt = m_sharedDrops.find(found->second);
