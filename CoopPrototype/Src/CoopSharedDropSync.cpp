@@ -161,64 +161,18 @@ bool ModMain::SendSharedDropTo(
 
 void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const char* reason)
 {
-    if (!item)
-        return;
-
-    EntityId itemEntityId = INVALID_ENTITYID;
-    if (!CoopRuntimeGuards::TryGuardedCall(
-            "shared drop source entity id",
-            [item]() { return item->GetEntityId(); },
-            itemEntityId,
-            nullptr) ||
-        itemEntityId == INVALID_ENTITYID)
+    if (!item || m_sharedDropApplyDepth != 0 || m_networkMode == CoopNetworkMode::Off ||
+        !m_hasRemoteEndpoint || !IsSessionGameplayReady())
     {
         return;
     }
 
-    OnNativeSharedItemDroppedEntity(itemEntityId, droppedCount, reason);
-}
-
-void ModMain::OnNativeSharedItemDroppedEntity(EntityId itemEntityId, int droppedCount, const char* reason)
-{
-    if (itemEntityId == INVALID_ENTITYID || m_sharedDropApplyDepth != 0 ||
-        m_networkMode == CoopNetworkMode::Off || !m_hasRemoteEndpoint ||
-        !IsSessionGameplayReady())
-    {
-        return;
-    }
-
-    if (!gEnv || !gEnv->pEntitySystem)
-    {
-        ++m_sharedDropDropped;
-        m_lastSharedDropEvent = "drop_capture_failed_entity_system";
-        return;
-    }
-
-    // The native drop path may retire its CArkItem and replace it with a clone.
-    // Resolve the post-operation object from the entity system instead of
-    // dereferencing a pointer captured before Drop returned.
-    IEntity* entity = gEnv->pEntitySystem->GetEntity(itemEntityId);
-    CArkItem* item = nullptr;
-    std::string guardReason;
-    if (entity && !CoopRuntimeGuards::TryGuardedCall(
-            "shared drop item lookup",
-            [itemEntityId]() { return CArkItem::GetItemFromEntityId(itemEntityId); },
-            item,
-            &guardReason))
-    {
-        item = nullptr;
-    }
-    if (!entity || !item)
-    {
-        ++m_sharedDropDropped;
-        m_lastSharedDropEvent = "drop_capture_failed_entity_" + std::to_string(itemEntityId) +
-            (guardReason.empty() ? std::string() : "_" + guardReason);
-        return;
-    }
-
+    IEntity* entity = nullptr;
     uint64_t archetypeId = 0;
     int count = droppedCount;
-    if (!CoopRuntimeGuards::TryGuardedCall("shared drop GetArchetype", [item]() { return item->GetArchetype(); }, archetypeId, &guardReason) || archetypeId == 0)
+    std::string guardReason;
+    if (!CoopRuntimeGuards::TryGuardedCall("shared drop GetEntity", [item]() { return item->GetEntity(); }, entity, &guardReason) || !entity ||
+        !CoopRuntimeGuards::TryGuardedCall("shared drop GetArchetype", [item]() { return item->GetArchetype(); }, archetypeId, &guardReason) || archetypeId == 0)
     {
         ++m_sharedDropDropped;
         m_lastSharedDropEvent = "drop_capture_failed_" + guardReason;
@@ -324,7 +278,7 @@ void ModMain::OnNativeRecyclerIngredientSpawned(EntityId itemEntityId, const cha
         [item]() { return item->GetCount(); },
         count,
         nullptr);
-    OnNativeSharedItemDroppedEntity(itemEntityId, count, reason);
+    OnNativeSharedItemDropped(item, count, reason);
 }
 
 bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerId, const char* reason)
@@ -335,26 +289,7 @@ bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerI
         return false;
     }
 
-    // PickUp can be entered with a retired world-item pointer after a native
-    // Drop/clone transition. Never dereference that pointer while consulting
-    // the shared-drop table; suppress the native call if its identity cannot
-    // be read safely, which keeps the failure terminal instead of crashing.
-    EntityId itemEntityId = INVALID_ENTITYID;
-    std::string guardReason;
-    if (!CoopRuntimeGuards::TryGuardedCall(
-            "shared drop pickup source entity id",
-            [item]() { return item->GetEntityId(); },
-            itemEntityId,
-            &guardReason) ||
-        itemEntityId == INVALID_ENTITYID)
-    {
-        ++m_sharedDropPickupSuppressions;
-        m_lastSharedDropEvent = "suppressed_invalid_pickup_source" +
-            (guardReason.empty() ? std::string() : "_" + guardReason);
-        return true;
-    }
-
-    const auto found = m_sharedDropByEntityId.find(itemEntityId);
+    const auto found = m_sharedDropByEntityId.find(item->GetEntityId());
     if (found == m_sharedDropByEntityId.end())
         return false;
     auto recordIt = m_sharedDrops.find(found->second);

@@ -19363,7 +19363,7 @@ static bool CArkItem_TryGiveInventory_Hook(CArkItem* item, IArkInventory* invent
 }
 
 static thread_local const CArkItem* s_activeSharedDropSource = nullptr;
-static thread_local EntityId s_activeSharedDropCloneEntityId = INVALID_ENTITYID;
+static thread_local CArkItem* s_activeSharedDropClone = nullptr;
 
 static CArkItem& CArkItem_Clone_Hook(const CArkItem* item, int count)
 {
@@ -19378,18 +19378,7 @@ static CArkItem& CArkItem_Clone_Hook(const CArkItem* item, int count)
     if (CoopPtrHygiene::Enabled())
         CoopPtrHygiene::LogPtr("item_clone_result", &clone);
     if (item && item == s_activeSharedDropSource)
-    {
-        // Drop may return after the original item has been retired. Keep only
-        // the clone's stable entity id across that boundary; never retain a
-        // CArkItem pointer for post-Drop use.
-        EntityId cloneEntityId = INVALID_ENTITYID;
-        TryGuardedCall(
-            "shared drop clone entity id",
-            [&clone]() { return clone.GetEntityId(); },
-            cloneEntityId,
-            nullptr);
-        s_activeSharedDropCloneEntityId = cloneEntityId;
-    }
+        s_activeSharedDropClone = &clone;
     return clone;
 }
 
@@ -19405,16 +19394,6 @@ static void CArkItem_Drop_Hook(CArkItem* item, int dropCount, const Vec3* altPos
     const EntityId localPlayerId = ArkPlayer::GetInstancePtr()
         ? ArkPlayer::GetInstance().GetEntityId()
         : INVALID_ENTITYID;
-    EntityId sourceItemEntityId = INVALID_ENTITYID;
-    if (item)
-    {
-        TryGuardedCall(
-            "shared drop source entity id before",
-            [item]() { return item->GetEntityId(); },
-            sourceItemEntityId,
-            nullptr);
-    }
-
     unsigned ownerId = 0;
     if (item)
         TryGuardedCall("shared drop owner before", [item]() { return item->GetOwnerId(); }, ownerId, nullptr);
@@ -19424,11 +19403,11 @@ static void CArkItem_Drop_Hook(CArkItem* item, int dropCount, const Vec3* altPos
     {
         ArkInventory* inventory = GetArkInventoryExtensionFromEntity(ArkPlayer::GetInstance().GetEntity());
         bool inventoryContainsItem = false;
-        if (inventory && sourceItemEntityId != INVALID_ENTITYID)
+        if (inventory)
         {
             TryGuardedCall(
                 "shared drop inventory membership before",
-                [inventory, sourceItemEntityId]() { return inventory->Contains(sourceItemEntityId); },
+                [inventory, item]() { return inventory->Contains(item->GetEntityId()); },
                 inventoryContainsItem,
                 nullptr);
         }
@@ -19436,21 +19415,16 @@ static void CArkItem_Drop_Hook(CArkItem* item, int dropCount, const Vec3* altPos
     }
 
     const CArkItem* previousSource = s_activeSharedDropSource;
-    const EntityId previousCloneEntityId = s_activeSharedDropCloneEntityId;
+    CArkItem* previousClone = s_activeSharedDropClone;
     s_activeSharedDropSource = localPlayerDrop ? item : nullptr;
-    s_activeSharedDropCloneEntityId = INVALID_ENTITYID;
+    s_activeSharedDropClone = nullptr;
     s_hookCArkItemDrop.InvokeOrig(item, dropCount, altPosition);
-    const EntityId droppedEntityId = s_activeSharedDropCloneEntityId != INVALID_ENTITYID
-        ? s_activeSharedDropCloneEntityId
-        : sourceItemEntityId;
+    CArkItem* droppedItem = s_activeSharedDropClone ? s_activeSharedDropClone : item;
     s_activeSharedDropSource = previousSource;
-    s_activeSharedDropCloneEntityId = previousCloneEntityId;
+    s_activeSharedDropClone = previousClone;
 
-    // Native Drop can destroy the source or return a short-lived clone.
-    // Resolve a fresh engine-owned item by id before entering shared-drop
-    // code instead of retaining either pointer across the native call.
-    if (gMod && localPlayerDrop && droppedEntityId != INVALID_ENTITYID)
-        gMod->OnNativeSharedItemDroppedEntity(droppedEntityId, dropCount, "CArkItem::Drop");
+    if (gMod && localPlayerDrop)
+        gMod->OnNativeSharedItemDropped(droppedItem, dropCount, "CArkItem::Drop");
 }
 
 static bool CArkItem_PickUp_Hook(CArkItem* item, const unsigned pickerId, bool scaleOnLerp)
@@ -19462,9 +19436,7 @@ static bool CArkItem_PickUp_Hook(CArkItem* item, const unsigned pickerId, bool s
         CoopPtrHygiene::LogPtrWith("item_pickup", item, extra);
         CoopPtrHygiene::CheckAbove32("item_pickup", item);
     }
-    EntityId itemEntityId = INVALID_ENTITYID;
-    if (item)
-        TryGuardedCall("item pickup entity id", [item]() { return item->GetEntityId(); }, itemEntityId, nullptr);
+    const EntityId itemEntityId = item ? item->GetEntityId() : INVALID_ENTITYID;
     if (gMod && gMod->ShouldDeferNativeSharedItemPickup(item, pickerId, "CArkItem::PickUp"))
         return false;
 
