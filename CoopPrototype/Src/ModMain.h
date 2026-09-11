@@ -1356,6 +1356,7 @@ private:
     struct RemotePeerSession
     {
         uint64_t accountToken = 0;
+        uint64_t runtimeSessionNonce = 0;
         uint64_t modelArchetypeId = 0;
         uint64_t levelId = 0;
         uint32_t address = 0;
@@ -2219,6 +2220,7 @@ private:
     uint32_t SnapshotLatestHostPlayerStatesForSave(const std::string& saveKey, const char* reason);
     bool IsSessionGameplayReady() const;
     bool IsEnemyReplicationGameplayReady() const;
+    bool IsEnemyRosterReceiveReady() const;
     bool IsClientAreaAuthorityActive() const;
     void TickAreaLease(float frameTime);
     void TickHostAreaLeaseForActivePeer(float frameTime);
@@ -2790,6 +2792,10 @@ private:
     void TickHostProxyCombatStimulus(float frameTime);
     void TickLocalEnemyAreaAuthoritySync(float frameTime);
     void TickEnemyMimicryStateHeartbeat(float frameTime);
+    bool PublishLocalEnemyMimicryStateOnAuthorityHandoff(
+        EnemyAuthorityState& state,
+        IEntity& entity,
+        const char* reason);
     bool SendAuthoritativeMimicStateNow(const char* failurePrefix);
     bool SendEnemyStateNow(EnemyAuthorityState& state, const char* failurePrefix);
     bool ReadProxyHealth(float& health, float& maxHealth) const;
@@ -2953,6 +2959,7 @@ private:
     std::string m_lastRemoteUsername;
     uint64_t m_remoteAccountToken = 0;
     uint64_t m_sessionHostAccountToken = 0;
+    uint64_t m_localRuntimeSessionNonce = 0;
     uint64_t m_remotePlayerModelArchetypeId = 10739735956144685671ull;
     uint64_t m_lastRuntimeCleanupRemoteAccountToken = 0;
     bool m_duplicateAccountRejected = false;
