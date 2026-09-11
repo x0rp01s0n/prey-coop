@@ -25479,14 +25479,51 @@ void ModMain::OnCoopRuntimeEntityRemoved(IEntity& entity)
             if (const auto authorityIt = m_enemyAuthorities.find(enemyNetId);
                 authorityIt != m_enemyAuthorities.end() && authorityIt->second.entityId == removedEntityId)
             {
-                authorityIt->second.entityId = INVALID_ENTITYID;
-                authorityIt->second.hasLastPosition = false;
-                authorityIt->second.remoteLocomotionAuthority = false;
-                authorityIt->second.remoteAuthorityHasAttention = false;
-                authorityIt->second.authorityAttentionLevel = CoopEnemyAuthorityPolicy::kUnknownAttention;
-                authorityIt->second.attentionCandidates.clear();
-                authorityIt->second.remoteTargetAccountToken = 0;
-                authorityIt->second.remoteTransformNeedsAuthoritySnap = true;
+                EnemyAuthorityState& authorityState = authorityIt->second;
+                bool nativeDead = true;
+                if (authorityState.archetypeId == kMimicArchetype)
+                {
+                    ArkNpc* npc = nullptr;
+                    if (TryGuardedCall(
+                            "Mimic replacement removal GetArkNpc",
+                            [&entity]() { return EntityUtils::GetArkNpc(&entity); },
+                            npc,
+                            nullptr) &&
+                        npc)
+                    {
+                        TryGuardedCall(
+                            "Mimic replacement removal IsDead",
+                            [npc]() { return npc->IsDead(); },
+                            nativeDead,
+                            nullptr);
+                    }
+                }
+                const bool mayReplaceMimicBody =
+                    authorityState.archetypeId == kMimicArchetype &&
+                    !nativeDead &&
+                    !authorityState.sentDeadState &&
+                    (authorityState.rosterFlags & CoopProtocol::kEnemyRosterFlagAlive) != 0 &&
+                    (authorityState.rosterFlags & CoopProtocol::kEnemyRosterFlagRemoved) == 0;
+                authorityState.mimicReplacementOrphanUntilSeconds = mayReplaceMimicBody
+                    ? GetNowSeconds() + 1.0f
+                    : -1000.0f;
+                if (!mayReplaceMimicBody)
+                {
+                    authorityState.localMimicryStateKnown = false;
+                    authorityState.localMimicryActive = false;
+                    authorityState.localMimicryIgnorePsi = false;
+                    authorityState.localMimicryTargetGuid = 0;
+                    authorityState.localMimicryTargetArchetypeId = 0;
+                    authorityState.localMimicryReason = EArkNpcMimicryReason::none;
+                }
+                authorityState.entityId = INVALID_ENTITYID;
+                authorityState.hasLastPosition = false;
+                authorityState.remoteLocomotionAuthority = false;
+                authorityState.remoteAuthorityHasAttention = false;
+                authorityState.authorityAttentionLevel = CoopEnemyAuthorityPolicy::kUnknownAttention;
+                authorityState.attentionCandidates.clear();
+                authorityState.remoteTargetAccountToken = 0;
+                authorityState.remoteTransformNeedsAuthoritySnap = true;
             }
 
             if (const auto puppetIt = m_enemyPuppets.find(enemyNetId);
@@ -86804,9 +86841,8 @@ ModMain::EnemyAuthorityState& ModMain::EnsureEnemyAuthorityState(IEntity& entity
         if (archetypeName && std::string_view(archetypeName).rfind(kArkRobotOperatorArchetypePrefix, 0) == 0)
             ResolveOperatorDispenserStableSpawnIdForEnemy(entityId, "EnsureEnemyAuthorityState");
     }
-    const uint64_t stableEnemyId = ResolveEnemyStableId(entity, archetypeId, nativeGuid);
-    if (nativeGuid == 0 && stableEnemyId != 0)
-        m_enemyStableSpawnIdsByEntity[entityId] = stableEnemyId;
+    uint64_t stableEnemyId = ResolveEnemyStableId(entity, archetypeId, nativeGuid);
+    bool adoptedMimicReplacementIdentity = false;
     uint64_t netId = 0;
 
     const auto netIt = m_enemyNetIdsByEntity.find(entityId);
@@ -86825,6 +86861,69 @@ ModMain::EnemyAuthorityState& ModMain::EnsureEnemyAuthorityState(IEntity& entity
         }
     }
 
+    // Mimic reveal can replace the native body instead of mutating it. The
+    // replacement has a new entity id, name and position-derived fallback id,
+    // while the canonical roster entry is briefly left without a body. Adopt
+    // that single nearby orphan before allocating another network identity;
+    // otherwise one peer keeps the disguised Mimic alive while another owns a
+    // newly numbered revealed body, so authority, damage and death can never
+    // converge.
+    if (netId == 0 &&
+        archetypeId == kMimicArchetype &&
+        gEnv &&
+        gEnv->pEntitySystem)
+    {
+        constexpr float kMimicReplacementRadiusSq = 1.0f;
+        const Vec3 replacementPosition = entity.GetWorldPos();
+        const float now = GetNowSeconds();
+        uint64_t orphanNetId = 0;
+        uint64_t orphanStableEnemyId = 0;
+        size_t orphanCandidates = 0;
+
+        for (const auto& entry : m_enemyAuthorities)
+        {
+            const EnemyAuthorityState& candidate = entry.second;
+            if (candidate.stableEnemyId == 0 ||
+                candidate.archetypeId != archetypeId ||
+                candidate.rosterAreaId != m_localLevelId ||
+                candidate.mimicReplacementOrphanUntilSeconds < now ||
+                candidate.sentDeadState ||
+                (candidate.rosterFlags & CoopProtocol::kEnemyRosterFlagAlive) == 0 ||
+                (candidate.rosterFlags & CoopProtocol::kEnemyRosterFlagRemoved) != 0)
+            {
+                continue;
+            }
+
+            if (candidate.entityId != INVALID_ENTITYID &&
+                gEnv->pEntitySystem->GetEntity(candidate.entityId))
+            {
+                continue;
+            }
+
+            const Vec3 delta = candidate.lastPosition - replacementPosition;
+            const float distanceSq = delta.GetLengthSquared();
+            if (!std::isfinite(distanceSq) || distanceSq > kMimicReplacementRadiusSq)
+                continue;
+
+            ++orphanCandidates;
+            orphanNetId = entry.first;
+            orphanStableEnemyId = candidate.stableEnemyId;
+        }
+
+        if (orphanCandidates == 1)
+        {
+            netId = orphanNetId;
+            stableEnemyId = orphanStableEnemyId;
+            adoptedMimicReplacementIdentity = true;
+            m_enemyAuthorities[netId].mimicReplacementOrphanUntilSeconds = -1000.0f;
+            m_lastEnemyRosterEvent =
+                "rebound Mimic replacement net=" + std::to_string(netId) +
+                " stable=" + std::to_string(stableEnemyId) +
+                " entity=" + std::to_string(entityId);
+            AppendEnemySyncTrace("roster", m_lastEnemyRosterEvent);
+        }
+    }
+
     if (netId == 0)
     {
         const char* entityNameRaw = entity.GetName();
@@ -86840,14 +86939,41 @@ ModMain::EnemyAuthorityState& ModMain::EnsureEnemyAuthorityState(IEntity& entity
             netId = m_nextEnemyNetId++;
         }
 
-        m_enemyNetIdsByEntity[entityId] = netId;
+    }
+
+    // Stable-id lookup and Mimic replacement adoption can both resolve an
+    // existing network identity. Every path must install the reverse binding
+    // used by attention, transform, damage and lifecycle hooks.
+    m_enemyNetIdsByEntity[entityId] = netId;
+    if (stableEnemyId != 0 &&
+        (nativeGuid == 0 || adoptedMimicReplacementIdentity))
+    {
+        m_enemyStableSpawnIdsByEntity[entityId] = stableEnemyId;
     }
 
     EnemyAuthorityState& state = m_enemyAuthorities[netId];
     state.entityId = entityId;
     state.netId = netId;
+    if (!adoptedMimicReplacementIdentity &&
+        state.mimicReplacementOrphanUntilSeconds > -999.0f &&
+        state.mimicReplacementOrphanUntilSeconds < GetNowSeconds())
+    {
+        state.mimicReplacementOrphanUntilSeconds = -1000.0f;
+        state.localMimicryStateKnown = false;
+        state.localMimicryActive = false;
+        state.localMimicryIgnorePsi = false;
+        state.localMimicryTargetGuid = 0;
+        state.localMimicryTargetArchetypeId = 0;
+        state.localMimicryReason = EArkNpcMimicryReason::none;
+    }
     if (state.authorityOwnerAccountToken == 0)
         state.authorityOwnerAccountToken = GetLocalAccountToken();
+    if (adoptedMimicReplacementIdentity)
+    {
+        state.remoteLocomotionAuthority =
+            state.authorityOwnerAccountToken != 0 &&
+            state.authorityOwnerAccountToken != GetLocalAccountToken();
+    }
     if (state.authorityEpoch == 0)
         state.authorityEpoch = 1;
 
