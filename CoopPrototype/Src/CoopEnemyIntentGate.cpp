@@ -663,6 +663,25 @@ void ModMain::RecordRemoteObserverLocalIntentSample(
             state.localReadOnlyAttentionTargetPositionValid = false;
         }
     }
+
+    // Some native combat plans expose the real victim through the current
+    // hook before the attention manager promotes it to top target. Preserve
+    // only that explicit, current local-player edge for the next policy pass;
+    // unrelated untargeted movement/look samples must not renew it.
+    const uint32_t localTargetKinds =
+        EnemyAuthorityState::ReadOnlyIntentAttention |
+        EnemyAuthorityState::ReadOnlyIntentLook |
+        EnemyAuthorityState::ReadOnlyIntentCombat |
+        EnemyAuthorityState::ReadOnlyIntentAbility;
+    if (localPlayer &&
+        targetEntityId == localPlayer->GetId() &&
+        (intentKinds & localTargetKinds) != 0)
+    {
+        constexpr float kExplicitLocalTargetGraceSeconds = 0.50f;
+        state.localNativeAttentionSeconds = std::max(
+            state.localNativeAttentionSeconds,
+            kExplicitLocalTargetGraceSeconds);
+    }
     constexpr float kIntentCombineSeconds = 0.50f;
     const bool priorSampleCurrent =
         nowSeconds >= state.localReadOnlyIntentObservedAtSeconds &&

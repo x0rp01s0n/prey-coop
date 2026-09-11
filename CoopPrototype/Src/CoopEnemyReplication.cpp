@@ -1096,7 +1096,9 @@ uint8_t LocalPlayerEnemyAttentionLevel(const IEntity& enemy)
                     },
                     nativeLevel))
             {
-                return ClampNativeAttentionLevel(nativeLevel);
+                const uint8_t clampedLevel = ClampNativeAttentionLevel(nativeLevel);
+                if (clampedLevel > CoopEnemyAuthorityPolicy::kUnknownAttention)
+                    return clampedLevel;
             }
         }
     }
@@ -1108,7 +1110,11 @@ uint8_t LocalPlayerEnemyAttentionLevel(const IEntity& enemy)
     {
         const ArkPlayerAwarenessComponent::AwarenessState& state = stateIt->second;
         if (!state.m_bHidden)
-            return ClampNativeAttentionLevel(state.m_level);
+        {
+            const uint8_t clampedLevel = ClampNativeAttentionLevel(state.m_level);
+            if (clampedLevel > CoopEnemyAuthorityPolicy::kUnknownAttention)
+                return clampedLevel;
+        }
     }
 
     ArkPlayerUIComponent& ui = playerComponent.GetUIComponent();
@@ -1123,7 +1129,11 @@ uint8_t LocalPlayerEnemyAttentionLevel(const IEntity& enemy)
             marker.m_bShowingMarkerEntry ||
             marker.m_bAwarenessAnimating;
         if (visible)
-            return ClampNativeAttentionLevel(marker.m_awarenessLevel);
+        {
+            const uint8_t clampedLevel = ClampNativeAttentionLevel(marker.m_awarenessLevel);
+            if (clampedLevel > CoopEnemyAuthorityPolicy::kUnknownAttention)
+                return clampedLevel;
+        }
     }
 
     if (ArkNpc* npc = EntityUtils::GetArkNpc(const_cast<IEntity*>(&enemy)))
@@ -1995,7 +2005,8 @@ bool ModMain::LocalPlayerHasEnemyAwarenessForCoop(const IEntity& enemy) const
     bool overrideValue = false;
     if (TryGetDebugEnemyAttentionOverride(enemy, overrideValue))
         return overrideValue;
-    return LocalPlayerHasEnemyAwareness(enemy);
+    return LocalPlayerEnemyAttentionLevelForCoop(enemy) >
+        CoopEnemyAuthorityPolicy::kUnknownAttention;
 }
 
 uint8_t ModMain::LocalPlayerEnemyAttentionLevelForCoop(const IEntity& enemy) const
@@ -2003,7 +2014,19 @@ uint8_t ModMain::LocalPlayerEnemyAttentionLevelForCoop(const IEntity& enemy) con
     uint8_t overrideLevel = CoopEnemyAuthorityPolicy::kUnknownAttention;
     if (TryGetDebugEnemyAttentionLevelOverride(enemy, overrideLevel))
         return overrideLevel;
-    return LocalPlayerEnemyAttentionLevel(enemy);
+
+    const uint8_t nativeLevel = LocalPlayerEnemyAttentionLevel(enemy);
+    const auto netIt = m_enemyNetIdsByEntity.find(enemy.GetId());
+    const auto stateIt = netIt == m_enemyNetIdsByEntity.end()
+        ? m_enemyAuthorities.end()
+        : m_enemyAuthorities.find(netIt->second);
+    const EnemyAuthorityState* state = stateIt == m_enemyAuthorities.end()
+        ? nullptr
+        : &stateIt->second;
+    return nativeLevel == CoopEnemyAuthorityPolicy::kUnknownAttention &&
+            state && state->localNativeAttentionSeconds > 0.0f
+        ? static_cast<uint8_t>(EArkAttentionLevel::noticed)
+        : nativeLevel;
 }
 
 EntityId ModMain::ResolveLocallyRepresentedEnemyTarget(uint64_t accountToken) const
@@ -2042,132 +2065,27 @@ void ModMain::SyncRemoteEnemyPresentationTarget(
     if (!targetChanged && !actionChanged)
         return;
 
-    const EntityId oldTargetEntityId = state.remotePresentationTargetEntityId;
     state.remotePresentationTargetAccountToken = targetAccountToken;
     state.remotePresentationTargetEntityId = targetEntityId;
     if (mannequinSequence != 0)
         state.remotePresentationTargetMannequinSequence = mannequinSequence;
 
-    ArkNpc* npc = EntityUtils::GetArkNpc(&enemy);
-    if (!npc || !CoopRuntimeGuards::IsLikelyRuntimeCppObject(npc, sizeof(void*) * 4))
-        return;
-
-    std::string guardReason;
-    if (targetChanged &&
-        oldTargetEntityId != INVALID_ENTITYID &&
-        oldTargetEntityId != targetEntityId &&
-        IsRemoteProxyEntity(oldTargetEntityId))
-    {
-        TryGuardedVoidCall(
-            "remote enemy presentation target lost",
-            [npc, oldTargetEntityId]() { npc->OnLostAttentionTarget(oldTargetEntityId, false); },
-            &guardReason);
-    }
-
-    const bool targetIsRemoteProxy =
-        targetEntityId != INVALID_ENTITYID &&
-        IsRemoteProxyEntity(targetEntityId);
-    if (!targetIsRemoteProxy)
-        return;
-
-    unsigned topTarget = INVALID_ENTITYID;
-    TryGuardedCall(
-        "remote enemy presentation target read top",
-        [npc]() { return npc->GetTopAttentionTargetEntityId(); },
-        topTarget,
-        &guardReason);
-    if (topTarget == targetEntityId)
-        return;
-
-    EntityId localPlayerEntityId = INVALID_ENTITYID;
-    if (ArkPlayer::GetInstancePtr())
-    {
-        if (const IEntity* localPlayer = ArkPlayer::GetInstance().GetEntity())
-            localPlayerEntityId = localPlayer->GetId();
-    }
-
-    const CoopEnemyControlPolicy::Decision controlDecision =
-        CoopEnemyControlPolicy::Evaluate(BuildLocalEnemyControlPolicyContext(state, enemy));
-    const bool preserveLocalCombatTarget =
-        localPlayerEntityId != INVALID_ENTITYID &&
-        controlDecision.remoteDriven &&
-        !controlDecision.localVanillaAuthority &&
-        controlDecision.preserveLocalCombat &&
-        controlDecision.localFocus;
-
-    // Exact authority actions may update the authority target, but must not replace
-    // a native local attention edge. The awareness component can remain non-zero
-    // while Vanilla briefly drops its top target between combat plans, so preserve
-    // the real local player for the whole attentive interval rather than only while
-    // it happens to be the current top target.
-    if (localPlayerEntityId != INVALID_ENTITYID &&
-        (topTarget == localPlayerEntityId || preserveLocalCombatTarget))
-    {
-        bool targetRestored = topTarget == localPlayerEntityId;
-        if (!targetRestored)
-        {
-            if (topTarget != INVALID_ENTITYID && IsRemoteProxyEntity(topTarget))
-            {
-                TryGuardedVoidCall(
-                    "remote enemy presentation evict proxy before local restore",
-                    [npc, topTarget]() { npc->OnLostAttentionTarget(topTarget, false); },
-                    &guardReason);
-            }
-            TryGuardedVoidCall(
-                "remote enemy presentation restore local target",
-                [npc, localPlayerEntityId]()
-                {
-                    ArkNpc::FOnNewAttentionTarget(npc, localPlayerEntityId, false);
-                },
-                &guardReason);
-            unsigned restoredTopTarget = INVALID_ENTITYID;
-            if (TryGuardedCall(
-                    "remote enemy presentation reread restored top",
-                    [npc]() { return npc->GetTopAttentionTargetEntityId(); },
-                    restoredTopTarget,
-                    &guardReason))
-            {
-                topTarget = restoredTopTarget;
-                targetRestored = restoredTopTarget == localPlayerEntityId;
-            }
-        }
-        m_lastEnemyAuthorityEvent =
-            "preserved local native attention during remote enemy presentation sync net=" +
-            std::to_string(state.netId) +
-            " entity=" + std::to_string(enemy.GetId()) +
-            " account=" + std::to_string(targetAccountToken) +
-            " remoteTarget=" + std::to_string(targetEntityId) +
-            " localTarget=" + std::to_string(localPlayerEntityId) +
-            " restored=" + std::to_string(targetRestored ? 1 : 0) +
-            " actionSeq=" + std::to_string(mannequinSequence) +
-            " route=read_only_local_mix" +
-            " reason=" + (reason && reason[0] ? std::string(reason) : std::string("-")) +
-            (guardReason.empty() ? std::string() : " guard=" + guardReason);
-        AppendEnemySyncTrace("attention", m_lastEnemyAuthorityEvent);
-        return;
-    }
-
-    if (IEntity* targetEntity = gEnv->pEntitySystem->GetEntity(targetEntityId))
-        RegisterProxyComplexAttention(*targetEntity);
-    TryGuardedVoidCall(
-        "remote enemy presentation target proxy update",
-        [npc, targetEntityId]() { npc->OnAttentionProxyUpdated(targetEntityId); },
-        &guardReason);
-    const bool targetApplied = TryGuardedVoidCall(
-        "remote enemy presentation target new target",
-        [npc, targetEntityId]() { ArkNpc::FOnNewAttentionTarget(npc, targetEntityId, false); },
-        &guardReason);
+    // The authority target is presentation metadata, not local perception
+    // state. Installing the remote-player proxy as this process's native top
+    // attention target makes Vanilla compete against the real local player;
+    // a nearby observer then needs repeated movement stimuli before the NPC
+    // notices them. Exact action mirroring and target routing already consume
+    // remotePresentationTargetEntityId directly, so this path must not mutate
+    // the native attention graph at all.
 
     m_lastEnemyAuthorityEvent =
-        "synced remote enemy presentation target net=" + std::to_string(state.netId) +
+        "stored remote enemy presentation target net=" + std::to_string(state.netId) +
         " entity=" + std::to_string(enemy.GetId()) +
         " account=" + std::to_string(targetAccountToken) +
         " target=" + std::to_string(targetEntityId) +
-        " previousTop=" + std::to_string(topTarget) +
         " actionSeq=" + std::to_string(mannequinSequence) +
-        " applied=" + std::to_string(targetApplied ? 1 : 0) +
-        " reason=" + (reason && reason[0] ? std::string(reason) : std::string("-")) +
-        (guardReason.empty() ? std::string() : " guard=" + guardReason);
+        " nativeMutation=0" +
+        " reason=" + (reason && reason[0] ? std::string(reason) : std::string("-"));
     AppendEnemySyncTrace("attention", m_lastEnemyAuthorityEvent);
 }
 
@@ -2254,24 +2172,6 @@ void ModMain::OnNativeNpcAttentionTargetChanged(
         // a save-load/already-attentive fallback.
         state->localNativeAttentionSeconds = kEnemyNativeAttentionEdgeGraceSeconds;
 
-        // A previously installed authority-presentation proxy may still
-        // compete with the real local player inside Vanilla's attention set.
-        // Remove only that presentation target when Vanilla promotes the real
-        // player. SyncRemoteEnemyPresentationTarget already preserves a local
-        // top target, so subsequent authority snapshots cannot steal it back.
-        const EntityId remotePresentationTargetEntityId =
-            state->remotePresentationTargetEntityId;
-        if (remotePresentationTargetEntityId != INVALID_ENTITYID &&
-            remotePresentationTargetEntityId != localPlayerId &&
-            IsRemoteProxyEntity(remotePresentationTargetEntityId))
-        {
-            TryGuardedVoidCall(
-                "local enemy attention evict presentation proxy",
-                [npc, remotePresentationTargetEntityId]()
-                {
-                    npc->OnLostAttentionTarget(remotePresentationTargetEntityId, false);
-                });
-        }
     }
     else if (!localPlayerIsTopTarget &&
         ((!gained && targetIsLocalPlayer) || (gained && !targetIsLocalPlayer)))
