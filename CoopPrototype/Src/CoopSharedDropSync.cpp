@@ -245,6 +245,42 @@ void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const 
         "_reason_" + (reason ? reason : "-");
 }
 
+void ModMain::OnNativeRecyclerIngredientSpawned(EntityId itemEntityId, const char* reason)
+{
+    if (m_networkMode != CoopNetworkMode::Host || itemEntityId == INVALID_ENTITYID ||
+        m_sharedDropApplyDepth != 0 || !m_hasRemoteEndpoint || !IsSessionGameplayReady())
+    {
+        return;
+    }
+
+    // SpawnNextIngredient can be called more than once while the recycler is
+    // finishing its animation. Do not publish the same native entity twice.
+    if (m_sharedDropByEntityId.find(itemEntityId) != m_sharedDropByEntityId.end())
+        return;
+
+    CArkItem* item = nullptr;
+    std::string guardReason;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "recycler ingredient item lookup",
+            [itemEntityId]() { return CArkItem::GetItemFromEntityId(itemEntityId); },
+            item,
+            &guardReason) ||
+        !item)
+    {
+        ++m_sharedDropDropped;
+        m_lastSharedDropEvent = "recycler_output_lookup_failed_" + guardReason;
+        return;
+    }
+
+    int count = 1;
+    CoopRuntimeGuards::TryGuardedCall(
+        "recycler ingredient count",
+        [item]() { return item->GetCount(); },
+        count,
+        nullptr);
+    OnNativeSharedItemDropped(item, count, reason);
+}
+
 bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerId, const char* reason)
 {
     if (!item || m_sharedDropApplyDepth != 0 || m_networkMode == CoopNetworkMode::Off ||

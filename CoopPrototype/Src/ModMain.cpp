@@ -8048,6 +8048,7 @@ static auto s_hookCArkItemClone = CArkItem::FClone.MakeHook();
 static auto s_hookCArkItemPickUp = CArkItem::FPickUp.MakeHook();
 static auto s_hookArkPlayerWeaponComponentEquipWeapon = ArkPlayerWeaponComponent::FEquipWeaponOv0.MakeHook();
 static auto s_hookCArkWeaponOnEquip = CArkWeapon::FOnEquip.MakeHook();
+static auto s_hookArkRecyclerSpawnNextIngredient = ArkRecycler::FSpawnNextIngredient.MakeHook();
 static thread_local ArkPlayerWeaponComponent* s_activeLocalWeaponEquipComponent = nullptr;
 static thread_local unsigned s_activeLocalWeaponEquipId = INVALID_ENTITYID;
 static auto s_hookArkPlayerCarryThrowCarriedEntity = ArkPlayerCarry::FThrowCarriedEntity.MakeHook();
@@ -19481,6 +19482,19 @@ static void CArkWeapon_OnEquip_Hook(CArkWeapon* weapon)
         weapon->m_ownerId = ArkPlayer::GetInstance().GetEntityId();
     }
     s_hookCArkWeaponOnEquip.InvokeOrig(weapon);
+}
+
+static void ArkRecycler_SpawnNextIngredient_Hook(ArkRecycler* recycler)
+{
+    s_hookArkRecyclerSpawnNextIngredient.InvokeOrig(recycler);
+    if (gMod && recycler)
+    {
+        // ArkRecycler records the freshly spawned world item here. Publishing
+        // the entity id lets the shared-drop layer materialize the exact
+        // vanilla output on peers without touching the recycler's input lease.
+        const EntityId itemEntityId = static_cast<EntityId>(recycler->m_lastIngredientSpawned);
+        gMod->OnNativeRecyclerIngredientSpawned(itemEntityId, "ArkRecycler::SpawnNextIngredient");
+    }
 }
 
 static void CArkItem_ResetCount_Hook(CArkItem* item, int count)
@@ -31706,6 +31720,7 @@ void ModMain::InitHooks()
         s_hookCArkItemDrop.SetHookFunc(&CArkItem_Drop_Hook);
         s_hookCArkItemClone.SetHookFunc(&CArkItem_Clone_Hook);
         s_hookCArkItemPickUp.SetHookFunc(&CArkItem_PickUp_Hook);
+        s_hookArkRecyclerSpawnNextIngredient.SetHookFunc(&ArkRecycler_SpawnNextIngredient_Hook);
         s_hookArkPlayerWeaponComponentEquipWeapon.SetHookFunc(&ArkPlayerWeaponComponent_EquipWeapon_Hook);
         s_hookCArkWeaponOnEquip.SetHookFunc(&CArkWeapon_OnEquip_Hook);
     }
