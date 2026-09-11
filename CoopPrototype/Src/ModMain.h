@@ -962,6 +962,9 @@ private:
         Vec3 remoteMoveDirection = Vec3(0.0f, 1.0f, 0.0f);
         Vec3 localNativeMoveDirection = Vec3(0.0f, 1.0f, 0.0f);
         float lastDamage = 0.0f;
+        // Set only by the native removal callback and consumed by an
+        // immediate same-position Mimic body replacement.
+        float mimicReplacementOrphanUntilSeconds = -1000.0f;
         float remoteSpeed = 0.0f;
         float localNativeMoveSpeed = 0.0f;
         float localNativeMovementSeconds = 0.0f;
