@@ -247,7 +247,7 @@ void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const 
 
 void ModMain::OnNativeRecyclerIngredientSpawned(EntityId itemEntityId, const char* reason)
 {
-    if (m_networkMode != CoopNetworkMode::Host || itemEntityId == INVALID_ENTITYID ||
+    if (m_networkMode == CoopNetworkMode::Off || itemEntityId == INVALID_ENTITYID ||
         m_sharedDropApplyDepth != 0 || !m_hasRemoteEndpoint || !IsSessionGameplayReady())
     {
         return;
