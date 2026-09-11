@@ -8089,7 +8089,7 @@ bool ModMain::ShouldBlockRemoteDrivenEnemyLook(void* lookManagerPtr, const char*
     }
 
     auto* manager = reinterpret_cast<ArkNpcLookDesireManager*>(lookManagerPtr);
-    if (!CoopRuntimeGuards::IsLikelyRuntimeCppObject(manager, sizeof(void*) * 4))
+    if (!CoopRuntimeGuards::IsReadableRuntimePointer(manager, sizeof(*manager)))
         return false;
 
     ArkNpc* npc = nullptr;
@@ -8268,7 +8268,7 @@ bool ModMain::ShouldBlockRemoteDrivenEnemyFacing(void* facingManagerPtr, const c
     }
 
     auto* manager = reinterpret_cast<ArkNpcFacingDesireManager*>(facingManagerPtr);
-    if (!CoopRuntimeGuards::IsLikelyRuntimeCppObject(manager, sizeof(void*) * 4))
+    if (!CoopRuntimeGuards::IsReadableRuntimePointer(manager, sizeof(*manager)))
         return false;
 
     ArkNpc* npc = nullptr;
