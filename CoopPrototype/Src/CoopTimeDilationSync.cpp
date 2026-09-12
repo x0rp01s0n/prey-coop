@@ -44,13 +44,16 @@ bool ModMain::BuildTimeDilationPacket(
 {
     if (m_localWorldEpoch == 0 || !std::isfinite(scale) || scale <= 0.0f || scale > 4.0f)
         return false;
+    const unsigned remoteTimers = timers & kRemoteDilationTimers;
+    if (remoteTimers == 0)
+        return false;
     packet = {};
     packet.sequence = m_timeDilationSequence;
     packet.worldEpoch = m_localWorldEpoch;
     packet.hostSaveKeyHash = CurrentHostSaveKeyHash();
     packet.sourcePeerHash = GetLocalAccountToken();
     packet.revision = m_timeDilationRevision;
-    packet.timers = timers;
+    packet.timers = remoteTimers;
     packet.command = static_cast<uint16_t>(command);
     packet.scale = scale;
     packet.eventId = BuildTimeEventId(packet.sourcePeerHash, packet.sequence, packet.revision, packet.command);
@@ -77,13 +80,14 @@ bool ModMain::SendTimeDilationTo(
 void ModMain::OnNativeTimeScaleOverride(
     ArkTimeScaleManager*, unsigned timers, float scale, int handle)
 {
-    if (m_timeDilationApplyDepth != 0 || m_networkMode == CoopNetworkMode::Off ||
+    if ((timers & kRemoteDilationTimers) == 0 ||
+        m_timeDilationApplyDepth != 0 || m_networkMode == CoopNetworkMode::Off ||
         !m_hasRemoteEndpoint || !IsSessionGameplayReady() || !std::isfinite(scale))
     {
         return;
     }
     m_timeDilationLocalHandle = handle;
-    m_timeDilationTimers = timers;
+    m_timeDilationTimers = kRemoteDilationTimers;
     m_timeDilationScale = scale;
     m_timeDilationOwnerHash = GetLocalAccountToken();
     CoopSerialSequence::Advance(m_timeDilationSequence);
@@ -144,6 +148,13 @@ void ModMain::HandleTimeDilation(const CoopProtocol::TimeDilationPacket& packet)
         return;
     }
 
+    if ((packet.timers & kRemoteDilationTimers) == 0)
+    {
+        ++m_timeDilationDropped;
+        m_lastTimeDilationEvent = "no_game_timer_drop";
+        return;
+    }
+
     ArkTimeScaleManager* manager = GetTimeScaleManager();
     if (!manager)
     {
@@ -169,7 +180,7 @@ void ModMain::HandleTimeDilation(const CoopProtocol::TimeDilationPacket& packet)
             remoteTimers != 0 ? manager->OverrideTimeScale(remoteTimers, packet.scale) : -1;
         --m_timeDilationApplyDepth;
         m_timeDilationOwnerHash = packet.sourcePeerHash;
-        m_timeDilationTimers = packet.timers;
+        m_timeDilationTimers = remoteTimers;
         m_timeDilationScale = packet.scale;
         ++m_timeDilationApplied;
         CoopSerialSequence::Advance(m_timeDilationSequence);
@@ -192,7 +203,7 @@ void ModMain::HandleTimeDilation(const CoopProtocol::TimeDilationPacket& packet)
             return;
         m_timeDilationRevision = packet.revision;
         m_timeDilationOwnerHash = packet.sourcePeerHash;
-        m_timeDilationTimers = packet.timers;
+        m_timeDilationTimers = packet.timers & kRemoteDilationTimers;
         m_timeDilationScale = packet.scale;
         if (packet.sourcePeerHash != localPeer)
         {
