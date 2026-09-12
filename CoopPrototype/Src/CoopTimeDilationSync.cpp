@@ -28,10 +28,8 @@ ArkTimeScaleManager* GetTimeScaleManager()
     return g_pGame ? g_pGame->m_pArkTimeScaleManager.get() : nullptr;
 }
 
-// A remote peer's slow-motion (e.g. their weapon wheel) must only dilate the
-// shared WORLD (Game) timer: enemies, props and music slow for everyone, while
-// the receiver's local Player and UI time bases stay normal so they can move
-// and operate normally as if nothing happened.
+// Shared time-scale events may only affect the Game timer on a receiver.
+// Focus-mode handles stay local and are scoped by enemy authority below.
 constexpr unsigned kRemoteDilationTimers =
     static_cast<unsigned>(ArkTimeScaleManager::EArkTimerFlag::Game);
 }
@@ -80,6 +78,15 @@ bool ModMain::SendTimeDilationTo(
 void ModMain::OnNativeTimeScaleOverride(
     ArkTimeScaleManager*, unsigned timers, float scale, int handle)
 {
+    if ((timers & kRemoteDilationTimers) != 0 &&
+        m_localFocusTimeDilationActive)
+    {
+        m_localFocusTimeDilationHandles.insert(handle);
+        m_lastTimeDilationEvent =
+            "native_focus_local_scale_" + std::to_string(scale);
+        return;
+    }
+
     if ((timers & kRemoteDilationTimers) == 0 ||
         m_timeDilationApplyDepth != 0 || m_networkMode == CoopNetworkMode::Off ||
         !m_hasRemoteEndpoint || !IsSessionGameplayReady() || !std::isfinite(scale))
@@ -104,6 +111,22 @@ void ModMain::OnNativeTimeScaleOverride(
 
 void ModMain::OnNativeTimeScaleUpdate(ArkTimeScaleManager* manager, int handle, float scale)
 {
+    if (m_localFocusTimeDilationActive)
+    {
+        m_localFocusTimeDilationHandles.insert(handle);
+        m_lastTimeDilationEvent =
+            "native_focus_local_update_" + std::to_string(scale);
+        return;
+    }
+
+    if (m_localFocusTimeDilationHandles.find(handle) !=
+        m_localFocusTimeDilationHandles.end())
+    {
+        m_lastTimeDilationEvent =
+            "native_focus_local_update_" + std::to_string(scale);
+        return;
+    }
+
     if (handle != m_timeDilationLocalHandle || !std::isfinite(scale) ||
         std::fabs(scale - m_timeDilationScale) < 0.001f)
         return;
@@ -112,6 +135,14 @@ void ModMain::OnNativeTimeScaleUpdate(ArkTimeScaleManager* manager, int handle, 
 
 void ModMain::OnNativeTimeScaleClear(ArkTimeScaleManager*, int handle)
 {
+    const auto localFocusHandle = m_localFocusTimeDilationHandles.find(handle);
+    if (localFocusHandle != m_localFocusTimeDilationHandles.end())
+    {
+        m_localFocusTimeDilationHandles.erase(localFocusHandle);
+        m_lastTimeDilationEvent = "native_focus_local_end";
+        return;
+    }
+
     if (m_timeDilationApplyDepth != 0 || handle != m_timeDilationLocalHandle ||
         m_networkMode == CoopNetworkMode::Off || !m_hasRemoteEndpoint || !IsSessionGameplayReady())
     {
@@ -131,6 +162,16 @@ void ModMain::OnNativeTimeScaleClear(ArkTimeScaleManager*, int handle)
     m_timeDilationTimers = 0;
     m_timeDilationScale = 1.0f;
     m_lastTimeDilationEvent = "native_end";
+}
+
+void ModMain::BeginLocalFocusTimeDilationCapture()
+{
+    m_localFocusTimeDilationActive = true;
+}
+
+void ModMain::EndLocalFocusTimeDilationCapture()
+{
+    m_localFocusTimeDilationActive = false;
 }
 
 void ModMain::HandleTimeDilation(const CoopProtocol::TimeDilationPacket& packet)
@@ -278,5 +319,7 @@ void ModMain::ResetTimeDilationState(const char* reason)
     m_timeDilationScale = 1.0f;
     m_timeDilationLocalHandle = -1;
     m_timeDilationRemoteHandle = -1;
+    m_localFocusTimeDilationActive = false;
+    m_localFocusTimeDilationHandles.clear();
     m_lastTimeDilationEvent = reason && reason[0] ? reason : "reset";
 }
