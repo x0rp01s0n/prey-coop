@@ -68539,6 +68539,16 @@ void ModMain::RelayReliablePayloadToPeers(
     const auto type = static_cast<CoopProtocol::PacketType>(packet.payloadType);
     const bool areaScoped = IsAreaScopedReliablePayload(packet.payloadType);
     const bool sourceInHostArea = IsKnownSameLevel(sourcePeer->levelName, m_localLevelName);
+    bool relaySharedDrop = false;
+    if (!sourceInHostArea &&
+        type == CoopProtocol::PacketType::SharedDrop &&
+        packet.payloadSize == sizeof(CoopProtocol::SharedDropPacket))
+    {
+        CoopProtocol::SharedDropPacket sharedDrop = {};
+        std::memcpy(&sharedDrop, packet.payload, sizeof(sharedDrop));
+        relaySharedDrop =
+            sharedDrop.command == static_cast<uint16_t>(CoopProtocol::SharedDropCommand::Spawn);
+    }
     const bool remoteAreaAuthorityRequest =
         !sourceInHostArea &&
         (type == CoopProtocol::PacketType::EnemyDamageRequest ||
@@ -68564,6 +68574,7 @@ void ModMain::RelayReliablePayloadToPeers(
         type == CoopProtocol::PacketType::StoryEvent ||
         type == CoopProtocol::PacketType::AreaObjectEvent ||
         type == CoopProtocol::PacketType::EnemyRoster ||
+        relaySharedDrop ||
         type == CoopProtocol::PacketType::HazardEvent ||
         remoteAreaAuthorityRequest ||
         remoteEnemyAuthorityCandidate;
