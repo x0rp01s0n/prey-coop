@@ -4151,6 +4151,28 @@ bool ModMain::TryBuildReadOnlyLocalFacingMixTarget(
     if (((state.remoteLocomotionFlags | state.remoteMannequinFlags) & hardAuthorityFlags) != 0)
         return false;
 
+    // A disguised Mimic is presenting the mimicked prop. Rotating its NPC
+    // body toward observer-local attention rotates the prop and exposes it.
+    // Mimicry presentation stays entirely with the current authority until
+    // Vanilla ends the disguise and the ordinary local-facing mix can resume.
+    if (state.localMimicryStateKnown && state.localMimicryActive)
+        return false;
+    if (state.archetypeId == kMimicArchetype)
+    {
+        ArkNpc* npc = EntityUtils::GetArkNpc(const_cast<IEntity*>(&entity));
+        bool isMimicking = false;
+        if (!npc ||
+            !TryGuardedCall(
+                "read-only local facing mimicry state",
+                [npc]() { return npc->IsMimicking(); },
+                isMimicking,
+                nullptr) ||
+            isMimicking)
+        {
+            return false;
+        }
+    }
+
     // The attention edge records identity, while the ordinary awareness path
     // keeps localRotationOverrideSeconds alive for suspicion and combat. Aim
     // at the real player's current position throughout that native window;
@@ -5311,6 +5333,17 @@ IEntity* ModMain::TryBindClientLocalEnemyForLocomotion(
         }
 
         EnemyAuthorityState& state = m_enemyAuthorities[enemyNetId];
+        if (state.mimicReplacementOrphanUntilSeconds > -999.0f &&
+            state.mimicReplacementOrphanUntilSeconds < EnemyAnimationNowSeconds())
+        {
+            state.mimicReplacementOrphanUntilSeconds = -1000.0f;
+            state.localMimicryStateKnown = false;
+            state.localMimicryActive = false;
+            state.localMimicryIgnorePsi = false;
+            state.localMimicryTargetGuid = 0;
+            state.localMimicryTargetArchetypeId = 0;
+            state.localMimicryReason = EArkNpcMimicryReason::none;
+        }
         const bool resetRemoteBindingState =
             !state.remoteLocomotionAuthority ||
             state.entityId != entityId ||
