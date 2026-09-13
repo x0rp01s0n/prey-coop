@@ -63,6 +63,11 @@ constexpr float kPostReviveDownedGraceSeconds = 1.5f;
 constexpr float kLocalDownedAttentionClearSeconds = 0.25f;
 constexpr float kLocalDownedFocusCleanupSeconds = 0.25f;
 constexpr float kLocalPlayerHealthWriteEpsilon = 0.01f;
+// Vanilla opens the death menu after 5 seconds. The normal death movement
+// clears its slow-motion handle first (1.3s full slow + 2.5s ramp), which is
+// the exact hand-off point we prefer. This real-time fallback remains before
+// the fade/menu boundary if that handle is unavailable for an unusual death.
+constexpr float kNativeDeathFeedbackFailsafeSeconds = 4.0f;
 constexpr float kUnstuckTeleportOffsetMeters = 2.0f;
 constexpr float kDownedHealth = 1.0f;
 constexpr int kLocalAttentionObserveOnly = 0;
@@ -1202,10 +1207,26 @@ bool ModMain::ShouldRunArkPlayerNativeDeathFeedback(const ArkPlayerHealthCompone
 void ModMain::OnArkPlayerNativeDeathFeedbackStarting(const ArkPlayerHealthComponent* healthComponent, bool byRecyclerGrenade)
 {
     (void)healthComponent;
-    (void)byRecyclerGrenade;
 
     m_nativeDeathFeedbackActive = true;
+    m_nativeDeathFeedbackByRecycler = byRecyclerGrenade;
+    m_nativeDeathFeedbackPresentationComplete = false;
+    m_nativeDeathFeedbackTimeScaleHandle = -1;
+    m_nativeDeathFeedbackRemainingSeconds = 0.0f;
     ++m_nativeDeathFeedbackRuns;
+
+    if (m_networkMode == CoopNetworkMode::Host && AreAllConnectedRemotePlayersDowned())
+    {
+        m_teamWipe = true;
+        m_hostTeamWipeDeathTriggered = true;
+        SendLocalPlayerStatus(
+            CoopProtocol::kPlayerStatusFlagDowned |
+                CoopProtocol::kPlayerStatusFlagTeamWipe,
+            0);
+        m_networkStatus = "host team wipe continuing native death";
+        return;
+    }
+
     m_networkStatus = "native death feedback starting";
 }
 
@@ -1213,13 +1234,21 @@ void ModMain::OnArkPlayerNativeDeathFeedbackFinished(const ArkPlayerHealthCompon
 {
     (void)healthComponent;
 
-    m_nativeDeathFeedbackActive = false;
-    RecoverLocalPlayerFromNativeDeathState(byRecyclerGrenade ? "native recycler death feedback" : "native death feedback");
-    SetLocalPlayerHealthSafe(m_downedEngineHealthFloor, byRecyclerGrenade ? "native recycler death downed clamp" : "native death downed clamp");
-    if (!m_localPlayerDowned)
-        EnterLocalDowned(byRecyclerGrenade ? CoopProtocol::kPlayerStatusFlagUnreachableRecovery : 0, true, false);
+    if (m_teamWipe && m_networkMode == CoopNetworkMode::Host)
+    {
+        m_nativeDeathFeedbackActive = false;
+        m_nativeDeathFeedbackPresentationComplete = false;
+        m_nativeDeathFeedbackTimeScaleHandle = -1;
+        m_nativeDeathFeedbackRemainingSeconds = 0.0f;
+        m_networkStatus = "host team wipe native death complete";
+        return;
+    }
 
-    m_networkStatus = byRecyclerGrenade ? "converted native recycler death to downed" : "converted native death to downed";
+    m_nativeDeathFeedbackByRecycler = byRecyclerGrenade;
+    m_nativeDeathFeedbackRemainingSeconds = kNativeDeathFeedbackFailsafeSeconds;
+    m_networkStatus = byRecyclerGrenade
+        ? "native recycler death feedback pending downed conversion"
+        : "native death feedback pending downed conversion";
 }
 
 bool ModMain::ShouldSuppressArkPlayerDeath(const ArkPlayerHealthComponent* healthComponent, bool byRecyclerGrenade)
@@ -1258,6 +1287,9 @@ bool ModMain::ShouldSuppressArkPlayerForceKill(const ArkPlayerHealthComponent* h
     if (m_networkMode == CoopNetworkMode::Off)
         return false;
 
+    if (m_allowNativeDeathFeedbackForDowned && !m_localPlayerDowned && !m_nativeDeathFeedbackActive)
+        return false;
+
     return !(m_teamWipe && m_networkMode == CoopNetworkMode::Host);
 }
 
@@ -1287,7 +1319,9 @@ bool ModMain::ShouldSuppressArkPlayerRagdollize(const ArkPlayer* player) const
     if (m_teamWipe && m_networkMode == CoopNetworkMode::Host)
         return false;
 
-    return m_localPlayerDowned || m_nativeDeathFeedbackActive;
+    // Vanilla owns the initial fatal impulse and ragdoll. The regular downed
+    // guards take over only after the delayed conversion has recovered it.
+    return m_localPlayerDowned && !m_nativeDeathFeedbackActive;
 }
 
 void ModMain::OnArkPlayerRagdollizeSuppressed(float verticalSpeed)
@@ -1381,6 +1415,9 @@ bool ModMain::ShouldNeutralizeNativeTimeScale(float scale) const
         return false;
 
     if (m_networkMode == CoopNetworkMode::Off)
+        return false;
+
+    if (m_teamWipe && m_networkMode == CoopNetworkMode::Host)
         return false;
 
     if (m_peerConnectionLostFreezeActive)
@@ -1602,6 +1639,19 @@ void ModMain::ClearLocalPlayerModalStateAfterSidecarApply(const char* reason)
 void ModMain::OnArkPlayerDeathScreenOpenSuppressed()
 {
     ++m_suppressedDownedDeathScreens;
+
+    // The death UI can become eligible during the short ragdoll window. Keep
+    // it closed without ending the native presentation early.
+    if (m_nativeDeathFeedbackActive)
+    {
+        // The native timer reached the point where Prey would open its death
+        // menu. Convert on the next main tick rather than mutating health from
+        // inside the UI hook.
+        m_nativeDeathFeedbackPresentationComplete = true;
+        m_networkStatus = "native death presentation complete; downed conversion queued";
+        return;
+    }
+
     SetLocalPlayerHealthSafe(m_downedEngineHealthFloor, "suppressed death screen");
     if (!m_localPlayerDowned)
         EnterLocalDowned(0, true, false);
@@ -1995,8 +2045,7 @@ void ModMain::EnterLocalDowned(uint32_t reason, bool sendStatus, bool clampHealt
     ApplyLocalPlayerDownedAttentionState(ArkPlayer::GetInstance());
     ApplyLocalDownedControls(0.0f);
 
-    if (m_remotePlayerDowned)
-        m_teamWipe = true;
+    RefreshHostTeamWipeState("local player downed");
 
     if (sendStatus)
     {
@@ -2020,6 +2069,13 @@ void ModMain::ReviveLocalPlayer(float health, bool sendStatus)
     }
     m_localPlayerDowned = false;
     m_teamWipe = false;
+    m_nativeDeathFeedbackActive = false;
+    m_nativeDeathFeedbackByRecycler = false;
+    m_nativeDeathFeedbackPresentationComplete = false;
+    m_nativeDeathFeedbackTimeScaleHandle = -1;
+    m_nativeDeathFeedbackRemainingSeconds = 0.0f;
+    m_pendingHostTeamWipeDeath = false;
+    m_hostTeamWipeDeathTriggered = false;
     m_localReviveSuppressDownedStatusSeconds = kPostReviveDownedGraceSeconds;
     m_localDownedAttentionClearAccumulator = 0.0f;
     m_localDownedFocusCleanupAccumulator = 0.0f;
@@ -2043,10 +2099,15 @@ void ModMain::SetRemotePlayerDowned(bool downed)
         return;
 
     m_remotePlayerDowned = downed;
+    if (m_activeRemotePeerToken != 0)
+    {
+        const auto peerIt = m_remotePeers.find(m_activeRemotePeerToken);
+        if (peerIt != m_remotePeers.end())
+            peerIt->second.downed = downed;
+    }
     if (downed)
         m_proxyStandStanceApplied = false;
-    if (m_localPlayerDowned && downed)
-        m_teamWipe = true;
+    RefreshHostTeamWipeState(downed ? "remote player downed" : "remote player revived");
 
     if (IEntity* proxyEntity = GetProxyEntity())
     {
@@ -2066,7 +2127,8 @@ void ModMain::SetRemotePlayerDowned(bool downed)
         }
         else
         {
-            ClearRemoteProxyPoseHold("remote_player_revived");
+            // Keep the frozen downed frame until the next replicated pose replaces
+            // it. Resetting the layer here leaves an observable bind-pose frame.
             ApplySurvivorFactionToProxy(*proxyEntity);
             RestoreProxyRuntimeHealth();
             std::string detail;
@@ -2074,6 +2136,76 @@ void ModMain::SetRemotePlayerDowned(bool downed)
         }
         ApplyRemoteProxyDownedVisual(*proxyEntity, downed);
     }
+}
+
+bool ModMain::AreAllConnectedRemotePlayersDowned() const
+{
+    for (const auto& entry : m_remotePeers)
+    {
+        const RemotePeerSession& peer = entry.second;
+        if (!peer.sessionReady || peer.accountToken == 0)
+            continue;
+
+        const bool peerDowned = entry.first == m_activeRemotePeerToken
+            ? m_remotePlayerDowned
+            : peer.downed;
+        if (!peerDowned)
+            return false;
+    }
+
+    // With no connected survivor there is nobody who can revive the Host, so
+    // its next fatal hit follows the normal single-player death path as well.
+    return true;
+}
+
+void ModMain::RefreshHostTeamWipeState(const char* reason)
+{
+    if (m_networkMode != CoopNetworkMode::Host || !m_localPlayerDowned)
+        return;
+
+    if (!AreAllConnectedRemotePlayersDowned())
+    {
+        m_teamWipe = false;
+        m_pendingHostTeamWipeDeath = false;
+        return;
+    }
+
+    if (m_teamWipe)
+        return;
+
+    m_teamWipe = true;
+    SendLocalPlayerStatus(
+        CoopProtocol::kPlayerStatusFlagDowned |
+            CoopProtocol::kPlayerStatusFlagTeamWipe,
+        0);
+    m_pendingHostTeamWipeDeath = true;
+    m_networkStatus = std::string("host team wipe queued: ") + (reason ? reason : "unknown");
+}
+
+void ModMain::TriggerPendingHostTeamWipeDeath()
+{
+    if (!m_pendingHostTeamWipeDeath || m_hostTeamWipeDeathTriggered ||
+        m_networkMode != CoopNetworkMode::Host || !m_teamWipe || !ArkPlayer::GetInstancePtr())
+    {
+        return;
+    }
+
+    m_pendingHostTeamWipeDeath = false;
+    m_hostTeamWipeDeathTriggered = true;
+    m_nativeDeathFeedbackActive = false;
+    m_nativeDeathFeedbackPresentationComplete = false;
+    m_nativeDeathFeedbackTimeScaleHandle = -1;
+    m_nativeDeathFeedbackRemainingSeconds = 0.0f;
+    m_localPlayerDowned = false;
+    ReleaseLocalPlayerDownedAttentionState();
+    ReleaseLocalDownedControls();
+    ClearDownedHudOverlay();
+
+    ArkPlayerHealthComponent& health =
+        ArkPlayer::GetInstance().m_playerComponent.GetHealthComponent();
+    health.m_bDeathMenuOpened = false;
+    health.ForceKill();
+    m_networkStatus = "host team wipe opened native death flow";
 }
 
 void ModMain::TickRemoteReviveInteraction(float frameTime)
@@ -2516,6 +2648,41 @@ void ModMain::TickDownedState(float frameTime)
         ReleaseLocalDownedControls();
         return;
     }
+
+    if (m_nativeDeathFeedbackActive)
+    {
+        const float realFrameTime = gEnv && gEnv->pTimer
+            ? gEnv->pTimer->GetRealFrameTime()
+            : frameTime;
+        m_nativeDeathFeedbackRemainingSeconds = std::max(
+            0.0f,
+            m_nativeDeathFeedbackRemainingSeconds - std::clamp(realFrameTime, 0.0f, 0.1f));
+        if (m_nativeDeathFeedbackPresentationComplete || m_nativeDeathFeedbackRemainingSeconds <= 0.0f)
+        {
+            const bool byRecyclerGrenade = m_nativeDeathFeedbackByRecycler;
+            m_nativeDeathFeedbackActive = false;
+            m_nativeDeathFeedbackPresentationComplete = false;
+            m_nativeDeathFeedbackTimeScaleHandle = -1;
+            m_nativeDeathFeedbackRemainingSeconds = 0.0f;
+            RecoverLocalPlayerFromNativeDeathState(
+                byRecyclerGrenade ? "delayed native recycler death feedback" : "delayed native death feedback");
+            SetLocalPlayerHealthSafe(
+                m_downedEngineHealthFloor,
+                byRecyclerGrenade ? "delayed native recycler death downed clamp" : "delayed native death downed clamp");
+            if (!m_localPlayerDowned)
+            {
+                EnterLocalDowned(
+                    byRecyclerGrenade ? CoopProtocol::kPlayerStatusFlagUnreachableRecovery : 0,
+                    true,
+                    false);
+            }
+            m_networkStatus = byRecyclerGrenade
+                ? "converted native recycler death to downed after feedback"
+                : "converted native death to downed after feedback";
+        }
+    }
+
+    TriggerPendingHostTeamWipeDeath();
 
     if (m_localPlayerDowned && ArkPlayer::GetInstancePtr())
     {
