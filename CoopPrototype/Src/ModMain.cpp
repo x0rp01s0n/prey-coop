@@ -25965,6 +25965,12 @@ void ModMain::ResetRuntimeWorldRefsForLoad(const char* reason)
     m_remotePlayerDowned = false;
     m_teamWipe = false;
     m_nativeDeathFeedbackActive = false;
+    m_nativeDeathFeedbackByRecycler = false;
+    m_nativeDeathFeedbackPresentationComplete = false;
+    m_nativeDeathFeedbackTimeScaleHandle = -1;
+    m_nativeDeathFeedbackRemainingSeconds = 0.0f;
+    m_pendingHostTeamWipeDeath = false;
+    m_hostTeamWipeDeathTriggered = false;
     m_pendingForceLocalDown = false;
     m_pendingReviveLocal = false;
     m_pendingReviveLocalHealth = 0.0f;
@@ -38438,6 +38444,12 @@ std::string ModMain::BuildRuntimeControlStatus() const
         << " areaJournalLast=" << StatusToken(areaJournalLastEvent)
         << " downedLocal=" << (m_localPlayerDowned ? 1 : 0)
         << " downedRemote=" << (m_remotePlayerDowned ? 1 : 0)
+        << " deathFeedback=" << (m_nativeDeathFeedbackActive ? 1 : 0)
+            << "/" << m_nativeDeathFeedbackRemainingSeconds
+            << "/" << (m_teamWipe ? 1 : 0)
+            << "/" << (m_nativeDeathFeedbackPresentationComplete ? 1 : 0)
+            << "/" << m_nativeDeathFeedbackRuns
+            << "/" << m_suppressedDownedDeathScreens
         << " lastArea=" << StatusToken(m_lastAreaAuthorityEvent);
     return out.str();
 }
@@ -38675,6 +38687,7 @@ bool ModMain::DebugExportLocalPlayerJsonl(std::string& detail)
     EStance stance = EStance::STANCE_NULL;
     bool zeroG = false;
     bool dead = false;
+    bool deathMenuOpened = false;
     int godMode = -1;
     bool showArmor = false;
     float oxygen = -1.0f;
@@ -38691,6 +38704,11 @@ bool ModMain::DebugExportLocalPlayerJsonl(std::string& detail)
     TryGuardedCall("dump player GetStance", [player]() -> EStance { return player->GetStance(); }, stance, &reason);
     TryGuardedCall("dump player IsZeroG", [player]() -> bool { return player->IsZeroG(); }, zeroG, &reason);
     TryGuardedCall("dump player IsDead", [player]() -> bool { return player->IsDead(); }, dead, &reason);
+    TryGuardedCall(
+        "dump player death menu opened",
+        [player]() -> bool { return player->m_playerComponent.GetHealthComponent().m_bDeathMenuOpened; },
+        deathMenuOpened,
+        &reason);
     TryGuardedCall("dump player GetGodMode", [player]() -> int { return player->GetGodMode(); }, godMode, &reason);
     TryGuardedCall("dump player m_bShowArmor", [player]() -> bool { return player->m_bShowArmor; }, showArmor, &reason);
     if (player->m_helmet.m_pOxygenComponent)
@@ -38720,6 +38738,7 @@ bool ModMain::DebugExportLocalPlayerJsonl(std::string& detail)
         << ",\"stance\":" << static_cast<int>(stance)
         << ",\"zeroG\":" << (zeroG ? "true" : "false")
         << ",\"dead\":" << (dead ? "true" : "false")
+        << ",\"deathMenuOpened\":" << (deathMenuOpened ? "true" : "false")
         << ",\"godMode\":" << godMode
         << ",\"downedLocal\":" << (m_localPlayerDowned ? "true" : "false")
         << ",\"downedRemote\":" << (m_remotePlayerDowned ? "true" : "false")
@@ -51781,6 +51800,22 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
         m_networkStatus = "queued runtime local down";
         action = "force_down_local";
     }
+    else if (command == "coop_force_native_death_local")
+    {
+        ArkPlayer* player = ArkPlayer::GetInstancePtr();
+        if (!IsGameReady() || !player)
+        {
+            ok = false;
+            action = "force_native_death_local_unavailable";
+            m_networkStatus = "runtime native local death failed: player unavailable";
+        }
+        else
+        {
+            LogCoop("processing debug native local death");
+            player->m_playerComponent.GetHealthComponent().ForceKill();
+            action = "force_native_death_local";
+        }
+    }
     else if (command == "coop_revive_local")
     {
         float health = m_reviveHealth;
@@ -52661,6 +52696,13 @@ void ModMain::StartHost()
     m_localPlayerDowned = false;
     m_remotePlayerDowned = false;
     m_teamWipe = false;
+    m_nativeDeathFeedbackActive = false;
+    m_nativeDeathFeedbackByRecycler = false;
+    m_nativeDeathFeedbackPresentationComplete = false;
+    m_nativeDeathFeedbackTimeScaleHandle = -1;
+    m_nativeDeathFeedbackRemainingSeconds = 0.0f;
+    m_pendingHostTeamWipeDeath = false;
+    m_hostTeamWipeDeathTriggered = false;
     m_pendingForceLocalDown = false;
     m_pendingReviveLocal = false;
     m_pendingReviveLocalHealth = 0.0f;
@@ -53087,6 +53129,13 @@ void ModMain::StartClient()
     m_localPlayerDowned = false;
     m_remotePlayerDowned = false;
     m_teamWipe = false;
+    m_nativeDeathFeedbackActive = false;
+    m_nativeDeathFeedbackByRecycler = false;
+    m_nativeDeathFeedbackPresentationComplete = false;
+    m_nativeDeathFeedbackTimeScaleHandle = -1;
+    m_nativeDeathFeedbackRemainingSeconds = 0.0f;
+    m_pendingHostTeamWipeDeath = false;
+    m_hostTeamWipeDeathTriggered = false;
     m_pendingForceLocalDown = false;
     m_pendingReviveLocal = false;
     m_pendingReviveLocalHealth = 0.0f;
@@ -53441,6 +53490,12 @@ void ModMain::StopNetwork()
     m_remotePlayerDowned = false;
     m_teamWipe = false;
     m_nativeDeathFeedbackActive = false;
+    m_nativeDeathFeedbackByRecycler = false;
+    m_nativeDeathFeedbackPresentationComplete = false;
+    m_nativeDeathFeedbackTimeScaleHandle = -1;
+    m_nativeDeathFeedbackRemainingSeconds = 0.0f;
+    m_pendingHostTeamWipeDeath = false;
+    m_hostTeamWipeDeathTriggered = false;
     m_lastProxyTargetBindings = 0;
     m_lastProxyCombatStimulusCount = 0;
     m_lastProxyAbilityAttempts = 0;
@@ -53576,6 +53631,13 @@ void ModMain::StopNetwork()
     m_localPlayerDowned = false;
     m_remotePlayerDowned = false;
     m_teamWipe = false;
+    m_nativeDeathFeedbackActive = false;
+    m_nativeDeathFeedbackByRecycler = false;
+    m_nativeDeathFeedbackPresentationComplete = false;
+    m_nativeDeathFeedbackTimeScaleHandle = -1;
+    m_nativeDeathFeedbackRemainingSeconds = 0.0f;
+    m_pendingHostTeamWipeDeath = false;
+    m_hostTeamWipeDeathTriggered = false;
     m_pendingForceLocalDown = false;
     m_pendingReviveLocal = false;
     m_pendingReviveLocalHealth = 0.0f;
@@ -70656,7 +70718,7 @@ void ModMain::HandleRemotePlayerDamage(const CoopProtocol::RemotePlayerDamagePac
 
     const float damage = std::min(packet.damage, 10000.0f);
     ArkPlayer& player = ArkPlayer::GetInstance();
-    if (m_downedModeEnabled && (m_localPlayerDowned || player.GetHealth() - damage <= kDownedHealth))
+    if (m_downedModeEnabled && m_localPlayerDowned)
     {
         EnterLocalDowned(packet.flags, true);
     }
@@ -70707,7 +70769,11 @@ void ModMain::HandlePlayerStatus(const CoopProtocol::PlayerStatusPacket& packet)
 
     CoopSerialSequence::Observe(packet.sequence, m_lastPlayerStatusSequence);
     ++m_receivedPlayerStatusPackets;
-    if (teamWipe)
+    const bool authoritativeTeamWipe =
+        teamWipe &&
+        m_networkMode == CoopNetworkMode::Client &&
+        m_activePacketSourceAccountToken == GetSessionHostAccountToken();
+    if (authoritativeTeamWipe)
         m_teamWipe = true;
 
     if (targetLocalPlayer)

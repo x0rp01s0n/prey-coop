@@ -4948,6 +4948,25 @@ bool ModMain::ApplyAdditionalRemoteProxyAnimation(
 
     blend = std::max(0.0f, blend);
     std::string guardReason;
+    if (!restart && animationName == "combat_forceresist_front_out_empty")
+    {
+        float currentTime = -1.0f;
+        std::string currentTimeType;
+        bool readOk = false;
+        const bool readGuarded = TryGuardedCall(
+            "additional downed pose GetAnimationTime",
+            [table, &currentTime, &currentTimeType]()
+            {
+                return ReadAnimProxyAnimationTime(table, 0, 0, currentTime, currentTimeType);
+            },
+            readOk,
+            &guardReason);
+        // ArkHuman's native controller can replace our raw frozen clip while
+        // the network state remains downed. Rebuild only when the observed
+        // layer has actually left the hand-tuned downed frame.
+        restart = readGuarded && readOk && std::fabs(currentTime - normalizedTime) > 0.02f;
+    }
+
     bool playOk = true;
     if (restart)
     {
@@ -5232,7 +5251,34 @@ bool ModMain::StartRemoteProxyPoseHold(
     blend = std::max(0.0f, blend);
 
     const std::string effectivePose = poseName.empty() ? std::string("custom") : poseName;
-    if (m_remoteProxyPoseHoldActive &&
+    bool heldFrameStillActive = true;
+    if (effectivePose == "downed_pose" &&
+        m_remoteProxyPoseHoldActive &&
+        m_remoteProxyPoseHoldEntityId == entity->GetId())
+    {
+        float currentTime = -1.0f;
+        std::string currentTimeType;
+        bool readOk = false;
+        std::string guardReason;
+        const bool readGuarded = TryGuardedCall(
+            "remote downed pose GetAnimationTime",
+            [table, slot, layer, &currentTime, &currentTimeType]()
+            {
+                return ReadAnimProxyAnimationTime(
+                    table,
+                    slot,
+                    layer,
+                    currentTime,
+                    currentTimeType);
+            },
+            readOk,
+            &guardReason);
+        heldFrameStillActive =
+            !readGuarded || !readOk || std::fabs(currentTime - normalizedTime) <= 0.02f;
+    }
+
+    if (heldFrameStillActive &&
+        m_remoteProxyPoseHoldActive &&
         m_remoteProxyPoseHoldEntityId == entity->GetId() &&
         m_remoteProxyPoseHoldClip == animationName &&
         m_remoteProxyPoseHoldSlot == slot &&
@@ -5672,6 +5718,52 @@ void ModMain::TickRemoteProxyPoseHold(float frameTime)
 
     const float stepSeconds = m_remoteProxyPoseHoldAccumulator;
     m_remoteProxyPoseHoldAccumulator = 0.0f;
+
+    if (!m_remoteProxyPoseHoldLoop && m_remoteProxyPoseHoldName == "downed_pose")
+    {
+        float currentTime = -1.0f;
+        std::string currentTimeType;
+        bool readOk = false;
+        std::string readReason;
+        const bool readGuarded = TryGuardedCall(
+            "remote downed pose tick GetAnimationTime",
+            [table, this, &currentTime, &currentTimeType]()
+            {
+                return ReadAnimProxyAnimationTime(
+                    table,
+                    m_remoteProxyPoseHoldSlot,
+                    m_remoteProxyPoseHoldLayer,
+                    currentTime,
+                    currentTimeType);
+            },
+            readOk,
+            &readReason);
+        if (readGuarded && readOk &&
+            std::fabs(currentTime - m_remoteProxyPoseHoldTime) > 0.02f)
+        {
+            const std::string poseName = m_remoteProxyPoseHoldName;
+            const std::string clipName = m_remoteProxyPoseHoldClip;
+            const float normalizedTime = m_remoteProxyPoseHoldTime;
+            const int slot = m_remoteProxyPoseHoldSlot;
+            const int layer = m_remoteProxyPoseHoldLayer;
+            const float blend = m_remoteProxyPoseHoldBlend;
+            std::string detail;
+            StartRemoteProxyPoseHold(
+                poseName,
+                clipName,
+                normalizedTime,
+                slot,
+                layer,
+                blend,
+                detail);
+            m_remoteProxyPoseHoldLast =
+                "remote_proxy_downed_pose_reassert current=" + std::to_string(currentTime) +
+                " target=" + std::to_string(normalizedTime) +
+                " result=" + detail;
+            return;
+        }
+    }
+
     if (m_remoteProxyPoseHoldLoop)
     {
         constexpr float kLoopEndpointInset = 0.01f;

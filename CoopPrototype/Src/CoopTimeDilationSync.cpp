@@ -78,6 +78,16 @@ bool ModMain::SendTimeDilationTo(
 void ModMain::OnNativeTimeScaleOverride(
     ArkTimeScaleManager*, unsigned timers, float scale, int handle)
 {
+    // DoDeath enters the native death movement while this flag is active. Its
+    // slow-motion handle is cleared after the ragdoll presentation and before
+    // the 5-second death-menu fade. Track that native boundary independently
+    // from the multiplayer time-dilation owner, which may change meanwhile.
+    if (m_nativeDeathFeedbackActive && m_timeDilationApplyDepth == 0 &&
+        handle >= 0 && std::isfinite(scale) && scale < 0.999f)
+    {
+        m_nativeDeathFeedbackTimeScaleHandle = handle;
+    }
+
     if ((timers & kRemoteDilationTimers) != 0 &&
         m_localFocusTimeDilationActive)
     {
@@ -135,6 +145,14 @@ void ModMain::OnNativeTimeScaleUpdate(ArkTimeScaleManager* manager, int handle, 
 
 void ModMain::OnNativeTimeScaleClear(ArkTimeScaleManager*, int handle)
 {
+    if (m_nativeDeathFeedbackActive && m_timeDilationApplyDepth == 0 &&
+        handle >= 0 && handle == m_nativeDeathFeedbackTimeScaleHandle)
+    {
+        m_nativeDeathFeedbackPresentationComplete = true;
+        m_nativeDeathFeedbackTimeScaleHandle = -1;
+        m_networkStatus = "native death slow motion complete; downed conversion queued";
+    }
+
     const auto localFocusHandle = m_localFocusTimeDilationHandles.find(handle);
     if (localFocusHandle != m_localFocusTimeDilationHandles.end())
     {

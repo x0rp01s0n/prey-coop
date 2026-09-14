@@ -2451,6 +2451,9 @@ private:
     void EnterLocalDowned(uint32_t reason, bool sendStatus, bool clampHealth = true);
     void ReviveLocalPlayer(float health, bool sendStatus);
     void SetRemotePlayerDowned(bool downed);
+    bool AreAllConnectedRemotePlayersDowned() const;
+    void RefreshHostTeamWipeState(const char* reason);
+    void TriggerPendingHostTeamWipeDeath();
     void TickRemoteReviveInteraction(float frameTime);
     void ClearLocalPlayerAsEnemyTarget();
     void ApplyLocalPlayerDownedAttentionState(ArkPlayer& player);
@@ -4613,6 +4616,12 @@ private:
     bool m_localDownedWeaponDisabled = false;
     bool m_localDownedAttentionObjectDisabled = false;
     bool m_nativeDeathFeedbackActive = false;
+    bool m_nativeDeathFeedbackByRecycler = false;
+    bool m_nativeDeathFeedbackPresentationComplete = false;
+    int m_nativeDeathFeedbackTimeScaleHandle = -1;
+    bool m_pendingHostTeamWipeDeath = false;
+    bool m_hostTeamWipeDeathTriggered = false;
+    float m_nativeDeathFeedbackRemainingSeconds = 0.0f;
     bool m_saveLoadGuardActive = false;
     bool m_waitingForPostLoadContinue = false;
     bool m_pendingPostLoadResync = false;
