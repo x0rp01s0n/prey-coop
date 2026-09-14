@@ -62635,9 +62635,13 @@ bool ModMain::QueueLocalAreaObjectEventForHook(
         return false;
     }
 
+    const bool awaitingAuthorityCommit =
+        packet.eventKind == CoopProtocol::kAreaObjectEventWorkstationUtilityPressed &&
+        ShouldRouteLocalWorkstationUtilityToAreaAuthorityForHook();
     m_areaObjectJournal.Record(m_localLevelName, packet);
     m_areaObjectRevision = std::max(m_areaObjectRevision, packet.postVersion);
-    m_appliedAreaObjectEventIds.insert(packet.eventId);
+    if (!awaitingAuthorityCommit)
+        m_appliedAreaObjectEventIds.insert(packet.eventId);
     m_lastAreaObjectEventId = packet.eventId;
 
     if (m_socket == kInvalidNetworkSocket ||
@@ -67000,6 +67004,48 @@ void ModMain::HandleAreaObjectEvent(const CoopProtocol::AreaObjectEventPacket& p
     }
 
     FinalizeAppliedAreaObjectEvent(packet, detail);
+
+    const bool sourceMatches = m_activePacketSourceAccountToken != 0 &&
+        packet.sourcePeerHash == m_activePacketSourceAccountToken;
+    if (packet.eventKind == CoopProtocol::kAreaObjectEventWorkstationUtilityPressed &&
+        authorityInteractionInput && applied && sourceMatches)
+    {
+        bool echoed = false;
+        if (m_networkMode == CoopNetworkMode::Host)
+        {
+            const auto sourcePeer = m_remotePeers.find(packet.sourcePeerHash);
+            if (sourcePeer != m_remotePeers.end() && sourcePeer->second.address != 0 &&
+                sourcePeer->second.port != 0 && sourcePeer->second.sessionReady &&
+                IsKnownSameLevel(sourcePeer->second.levelName, m_localLevelName))
+            {
+                echoed = QueueReliablePayloadToEndpoint(
+                    static_cast<uint16_t>(CoopProtocol::PacketType::AreaObjectEvent),
+                    &packet,
+                    sizeof(packet),
+                    sourcePeer->second.address,
+                    sourcePeer->second.port,
+                    GetLocalAccountToken(),
+                    "workstation utility authority echo failed");
+            }
+        }
+        else if (m_networkMode == CoopNetworkMode::Client && IsClientAreaAuthorityActive())
+        {
+            // Remote-area authority sends the accepted input back through the
+            // session Host, which routes it to the source while excluding this
+            // authority peer. Other observers discard the already-applied id.
+            uint32_t hostAddress = 0;
+            uint16_t hostPort = 0;
+            echoed = ResolveSessionHostEndpoint(hostAddress, hostPort) &&
+                SendAreaObjectEventTo(
+                    packet, hostAddress, hostPort,
+                    "workstation utility authority echo failed");
+        }
+
+        LogCoop(
+            std::string(echoed ? "echoed" : "failed_to_echo") +
+            " accepted workstation utility event=" + std::to_string(packet.eventId) +
+            " source=" + std::to_string(packet.sourcePeerHash));
+    }
 
 }
 
