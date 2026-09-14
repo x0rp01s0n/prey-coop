@@ -103,6 +103,7 @@ set(SOURCE_FILES
 	CoopEventRouter.h
 	CoopProtocol.h
 	CoopReliableReorderBuffer.h
+	CoopSessionHelloPolicy.h
 	CoopVTableHook.h
 	ModMain.cpp
 	ModMainChat.cpp

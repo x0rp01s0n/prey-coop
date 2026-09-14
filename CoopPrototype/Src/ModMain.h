@@ -14,6 +14,7 @@
 
 #include "CoopProtocol.h"
 #include "CoopReliableReorderBuffer.h"
+#include "CoopSessionHelloPolicy.h"
 #include "CoopDamagePolicy.h"
 #include "CoopEnemyAuthorityPolicy.h"
 #include "CoopEnemyControlPolicy.h"
@@ -1372,6 +1373,8 @@ private:
         uint32_t sessionFlags = 0;
         uint32_t worldEpoch = 0;
         uint32_t levelEpoch = 0;
+        uint32_t lastSessionHelloSequence = 0;
+        float lastAcceptedSessionHelloTime = -1.0f;
         std::string username;
         std::string levelName;
         std::string poseAnimationClip;
@@ -1902,7 +1905,7 @@ private:
     void HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket& packet, uint32_t fromAddress, uint16_t fromPort);
     void DrainReliableReorderBuffer(uint64_t endpointKey, uint32_t fromAddress, uint16_t fromPort);
     void HandleReliablePayload(uint16_t payloadType, const uint8_t* payload, uint16_t payloadSize);
-    void HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet, uint32_t fromAddress, uint16_t fromPort);
+    bool HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet, uint32_t fromAddress, uint16_t fromPort);
     void HandlePeerPresence(const CoopProtocol::PeerPresencePacket& packet);
     bool SendPeerPresenceTo(const RemotePeerSession& peer, CoopProtocol::PeerPresenceCommand command, uint32_t address, uint16_t port, const char* failurePrefix);
     void BroadcastPeerPresence(const RemotePeerSession& peer, CoopProtocol::PeerPresenceCommand command, uint64_t excludedAccountToken = 0);
@@ -4341,6 +4344,8 @@ private:
         uint32_t count = 0;
     };
     std::unordered_map<uint64_t, RemotePeerSession> m_remotePeers;
+    std::unordered_map<uint64_t, std::unordered_set<uint64_t>> m_retiredRuntimeSessionNonces;
+    std::unordered_map<uint64_t, CoopSessionHelloPolicy::Freshness> m_removedPeerSessionHellos;
     std::unordered_map<uint64_t, ChatTextRateState> m_chatTextRates;
     std::unordered_map<uint64_t, HostPlayerStateUploadReceive> m_hostPlayerStateUploadReceives;
     std::unordered_set<uint64_t> m_pendingHostPlayerStateUploadRequests;

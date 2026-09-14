@@ -4,6 +4,7 @@
 #include "CoopHookStats.h"
 #include "CoopWorkstationSync.h"
 #include "CoopSerialSequence.h"
+#include "CoopSessionHelloPolicy.h"
 #include "CoopRuntimeLog.h"
 #include "CoopRuntimeConfig.h"
 #include "CoopFilesystem.h"
@@ -53441,6 +53442,8 @@ void ModMain::StopNetwork()
     m_reliableSendQueue.clear();
     m_reliableEndpointStates.clear();
     m_remotePeers.clear();
+    m_retiredRuntimeSessionNonces.clear();
+    m_removedPeerSessionHellos.clear();
     m_activeRemotePeerToken = 0;
     m_primaryRemotePeerToken = 0;
     m_activePacketSourceAccountToken = 0;
@@ -69645,6 +69648,18 @@ void ModMain::RemoveRemotePeer(uint64_t accountToken, const char* reason, bool a
     m_deferredHostPlayerStateUploadRequestSaveKeys.erase(accountToken);
     RemoveChatSender(accountToken);
     m_chatTextRates.erase(accountToken);
+    if (peer.runtimeSessionNonce != 0 || peer.lastSessionHelloSequence != 0)
+    {
+        // Keep the accepted Hello frontier after removal so delayed retries do not look like first admission.
+        CoopSessionHelloPolicy::Freshness& tombstone = m_removedPeerSessionHellos[accountToken];
+        tombstone.runtimeNonce = peer.runtimeSessionNonce;
+        tombstone.sequence = peer.lastSessionHelloSequence;
+        tombstone.acceptedAt = peer.lastAcceptedSessionHelloTime;
+        tombstone.address = peer.address;
+        tombstone.port = peer.port;
+    }
+    if (peer.runtimeSessionNonce != 0)
+        m_retiredRuntimeSessionNonces[accountToken].insert(peer.runtimeSessionNonce);
     m_remotePeers.erase(it);
     for (const EntityId entityId : reclaimedTurretEntities)
     {
@@ -69800,8 +69815,11 @@ void ModMain::TickReceivePackets(const char* failurePrefix)
 
         m_networkTelemetry.RecordWireReceive(header.type, static_cast<uint32_t>(receivedBytes));
 
-        m_lastPacketTime = GetNowSeconds();
-        ClearPeerTimeoutWarning("packet received");
+        if (!isSessionHello)
+        {
+            m_lastPacketTime = GetNowSeconds();
+            ClearPeerTimeoutWarning("packet received");
+        }
 
         if (header.type == static_cast<uint16_t>(CoopProtocol::PacketType::SessionHello))
         {
@@ -69810,7 +69828,11 @@ void ModMain::TickReceivePackets(const char* failurePrefix)
 
             CoopProtocol::SessionHelloPacket packet = {};
             std::memcpy(&packet, packetBuffer, sizeof(packet));
-            HandleSessionHello(packet, fromAddress.sin_addr.s_addr, fromAddress.sin_port);
+            if (HandleSessionHello(packet, fromAddress.sin_addr.s_addr, fromAddress.sin_port))
+            {
+                m_lastPacketTime = GetNowSeconds();
+                ClearPeerTimeoutWarning("session hello received");
+            }
             continue;
         }
 
@@ -70277,7 +70299,7 @@ void ModMain::TickReceivePackets(const char* failurePrefix)
     }
 }
 
-void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet, uint32_t fromAddress, uint16_t fromPort)
+bool ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet, uint32_t fromAddress, uint16_t fromPort)
 {
     if (m_networkMode == CoopNetworkMode::Client)
     {
@@ -70287,7 +70309,7 @@ void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
             expectedAddress != fromAddress || expectedPort != fromPort)
         {
             m_networkStatus = "ignored session hello from non-host endpoint";
-            return;
+            return false;
         }
     }
 
@@ -70298,7 +70320,7 @@ void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
             SendSessionReject(CoopProtocol::SessionRejectReason::InvalidIdentity, "missing player identity", fromAddress, fromPort);
         m_sessionStatus = "rejected peer: missing account identity";
         m_networkStatus = m_sessionStatus;
-        return;
+        return false;
     }
     if (packet.accountToken == localAccountToken)
     {
@@ -70307,8 +70329,10 @@ void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
         m_duplicateAccountRejected = true;
         m_sessionStatus = "duplicate PlayerAccountId: use a separate coop profile";
         m_networkStatus = m_sessionStatus;
-        return;
+        return false;
     }
+    if (packet.sequence == 0)
+        return false;
     /*
     if (m_networkMode == CoopNetworkMode::Host &&
         m_kickedAccountTokens.find(packet.accountToken) != m_kickedAccountTokens.end())
@@ -70324,71 +70348,150 @@ void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
 
     auto existingIt = m_remotePeers.find(packet.accountToken);
     bool newPeer = existingIt == m_remotePeers.end();
-    if (!newPeer &&
-        existingIt->second.address == fromAddress &&
-        existingIt->second.port == fromPort &&
-        packet.runtimeSessionNonce != 0 &&
-        existingIt->second.runtimeSessionNonce != 0 &&
-        packet.runtimeSessionNonce != existingIt->second.runtimeSessionNonce)
+    const auto tombstoneIt = m_removedPeerSessionHellos.find(packet.accountToken);
+    const bool hasTombstone = tombstoneIt != m_removedPeerSessionHellos.end();
+
+    const float helloNow = GetNowSeconds();
+    if (!std::isfinite(helloNow))
+        return false;
+    CoopSessionHelloPolicy::Freshness previousFreshness;
+    if (!newPeer)
     {
-        // Account and UDP endpoint survive a process restart. The reliable
-        // sequence space does not, so retire the old incarnation before
-        // accepting packets from the new one.
+        previousFreshness.runtimeNonce = existingIt->second.runtimeSessionNonce;
+        previousFreshness.sequence = existingIt->second.lastSessionHelloSequence;
+        previousFreshness.acceptedAt = existingIt->second.lastAcceptedSessionHelloTime;
+        previousFreshness.address = existingIt->second.address;
+        previousFreshness.port = existingIt->second.port;
+    }
+    const bool useTombstone = CoopSessionHelloPolicy::ShouldUseTombstone(
+        !newPeer,
+        previousFreshness,
+        hasTombstone);
+    if (useTombstone)
+        previousFreshness = tombstoneIt->second;
+
+    const uint64_t currentRuntimeNonce = previousFreshness.runtimeNonce;
+    const auto retiredNoncesIt = m_retiredRuntimeSessionNonces.find(packet.accountToken);
+    const bool incomingRuntimeNonceRetired = packet.runtimeSessionNonce != 0 &&
+        retiredNoncesIt != m_retiredRuntimeSessionNonces.end() &&
+        retiredNoncesIt->second.find(packet.runtimeSessionNonce) != retiredNoncesIt->second.end();
+    const uint32_t lastHelloSequence = previousFreshness.sequence;
+    const float secondsSinceAcceptedHello = previousFreshness.acceptedAt < 0.0f
+        ? -1.0f
+        : helloNow - previousFreshness.acceptedAt;
+    const CoopSessionHelloPolicy::Decision preliminaryDecision = useTombstone
+        ? CoopSessionHelloPolicy::ClassifyTombstoneRecovery(
+            packet.runtimeSessionNonce,
+            currentRuntimeNonce,
+            incomingRuntimeNonceRetired,
+            secondsSinceAcceptedHello,
+            true)
+        : CoopSessionHelloPolicy::Classify(
+            packet.sequence,
+            lastHelloSequence,
+            packet.runtimeSessionNonce,
+            currentRuntimeNonce,
+            incomingRuntimeNonceRetired,
+            secondsSinceAcceptedHello,
+            false,
+            true);
+    if (preliminaryDecision == CoopSessionHelloPolicy::Decision::Reject)
+        return false;
+
+    const bool endpointMatches = CoopSessionHelloPolicy::MatchesEndpoint(
+        previousFreshness,
+        fromAddress,
+        fromPort);
+    if (!CoopSessionHelloPolicy::EndpointChangeAllowed(endpointMatches, preliminaryDecision))
+    {
+        m_networkStatus = "rejected identity already connected from another endpoint";
+        return false;
+    }
+
+    const bool runtimeSessionRestart = preliminaryDecision == CoopSessionHelloPolicy::Decision::Restart;
+    const bool admissionRequired = newPeer || useTombstone || runtimeSessionRestart;
+    bool admissionAuthorized = true;
+    if (m_networkMode == CoopNetworkMode::Host && admissionRequired)
+    {
+        const bool replacingExistingPeer = !newPeer && (useTombstone || runtimeSessionRestart);
+        const int existingRemoteCount = static_cast<int>(m_remotePeers.size()) -
+            (replacingExistingPeer ? 1 : 0);
+        if (existingRemoteCount + 1 >= std::max(2, m_maxSessionPlayers))
+        {
+            SendSessionReject(CoopProtocol::SessionRejectReason::ServerFull, "server is full", fromAddress, fromPort);
+            m_networkStatus = "server full (" + std::to_string(m_maxSessionPlayers) + " players)";
+            admissionAuthorized = false;
+        }
+        else if (m_serverAccessMode == 1 &&
+            ReadFixedString(packet.password, sizeof(packet.password)) != m_serverPassword)
+        {
+            SendSessionReject(CoopProtocol::SessionRejectReason::WrongPassword, "incorrect server password", fromAddress, fromPort);
+            m_networkStatus = "rejected player with incorrect password";
+            admissionAuthorized = false;
+        }
+        else if (m_serverAccessMode == 2)
+        {
+            bool allowlisted = false;
+            std::string token;
+            std::istringstream stream(m_serverAllowlist);
+            while (std::getline(stream, token, ','))
+            {
+                token.erase(std::remove_if(token.begin(), token.end(), [](unsigned char ch) { return std::isspace(ch) != 0; }), token.end());
+                if (token.empty())
+                    continue;
+                char* end = nullptr;
+                const uint64_t parsed = std::strtoull(token.c_str(), &end, 0);
+                if (end && *end == '\0' && parsed == packet.accountToken)
+                {
+                    allowlisted = true;
+                    break;
+                }
+            }
+            if (!allowlisted)
+            {
+                SendSessionReject(CoopProtocol::SessionRejectReason::WrongPassword, "player is not on the allowlist", fromAddress, fromPort);
+                m_networkStatus = "rejected player not on allowlist";
+                admissionAuthorized = false;
+            }
+        }
+    }
+    if (m_networkMode == CoopNetworkMode::Client && newPeer && !hasTombstone &&
+        !runtimeSessionRestart && !m_remotePeers.empty())
+    {
+        m_networkStatus = "ignored session hello from non-host endpoint";
+        admissionAuthorized = false;
+    }
+
+    const CoopSessionHelloPolicy::Decision acceptedDecision = useTombstone
+        ? CoopSessionHelloPolicy::ClassifyTombstoneRecovery(
+            packet.runtimeSessionNonce,
+            currentRuntimeNonce,
+            incomingRuntimeNonceRetired,
+            secondsSinceAcceptedHello,
+            admissionAuthorized)
+        : CoopSessionHelloPolicy::Classify(
+            packet.sequence,
+            lastHelloSequence,
+            packet.runtimeSessionNonce,
+            currentRuntimeNonce,
+            incomingRuntimeNonceRetired,
+            secondsSinceAcceptedHello,
+            admissionRequired,
+            admissionAuthorized);
+    if (acceptedDecision == CoopSessionHelloPolicy::Decision::Reject)
+        return false;
+    const bool acceptedRuntimeSessionRestart = acceptedDecision == CoopSessionHelloPolicy::Decision::Restart;
+
+    const uint64_t replacedRuntimeSessionNonce = acceptedRuntimeSessionRestart ? currentRuntimeNonce : 0;
+    if (acceptedRuntimeSessionRestart)
+    {
+        // Account and UDP endpoint survive a process restart. Retire the old
+        // incarnation only after admission checks have succeeded.
+        m_retiredRuntimeSessionNonces[packet.accountToken].insert(replacedRuntimeSessionNonce);
         LogCoop("peer runtime session restarted token=" + Hex64(packet.accountToken));
         RemoveRemotePeer(packet.accountToken, "peer runtime session restarted", false);
         existingIt = m_remotePeers.end();
         newPeer = true;
-    }
-    if (!newPeer &&
-        (existingIt->second.address != fromAddress || existingIt->second.port != fromPort))
-    {
-        m_networkStatus = "rejected identity already connected from another endpoint";
-        return;
-    }
-    if (m_networkMode == CoopNetworkMode::Host && newPeer &&
-        static_cast<int>(m_remotePeers.size()) + 1 >= std::max(2, m_maxSessionPlayers))
-    {
-        SendSessionReject(CoopProtocol::SessionRejectReason::ServerFull, "server is full", fromAddress, fromPort);
-        m_networkStatus = "server full (" + std::to_string(m_maxSessionPlayers) + " players)";
-        return;
-    }
-    if (m_networkMode == CoopNetworkMode::Host && newPeer &&
-        m_serverAccessMode == 1 &&
-        ReadFixedString(packet.password, sizeof(packet.password)) != m_serverPassword)
-    {
-        SendSessionReject(CoopProtocol::SessionRejectReason::WrongPassword, "incorrect server password", fromAddress, fromPort);
-        m_networkStatus = "rejected player with incorrect password";
-        return;
-    }
-    if (m_networkMode == CoopNetworkMode::Host && newPeer && m_serverAccessMode == 2)
-    {
-        bool allowlisted = false;
-        std::string token;
-        std::istringstream stream(m_serverAllowlist);
-        while (std::getline(stream, token, ','))
-        {
-            token.erase(std::remove_if(token.begin(), token.end(), [](unsigned char ch) { return std::isspace(ch) != 0; }), token.end());
-            if (token.empty())
-                continue;
-            char* end = nullptr;
-            const uint64_t parsed = std::strtoull(token.c_str(), &end, 0);
-            if (end && *end == '\0' && parsed == packet.accountToken)
-            {
-                allowlisted = true;
-                break;
-            }
-        }
-        if (!allowlisted)
-        {
-            SendSessionReject(CoopProtocol::SessionRejectReason::WrongPassword, "player is not on the allowlist", fromAddress, fromPort);
-            m_networkStatus = "rejected player not on allowlist";
-            return;
-        }
-    }
-    if (m_networkMode == CoopNetworkMode::Client && newPeer && !m_remotePeers.empty())
-    {
-        m_networkStatus = "ignored session hello from non-host endpoint";
-        return;
     }
 
     if (m_networkMode == CoopNetworkMode::Client)
@@ -70439,7 +70542,10 @@ void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
 
     RemotePeerSession& peer = m_remotePeers[packet.accountToken];
     peer.accountToken = packet.accountToken;
-    peer.runtimeSessionNonce = packet.runtimeSessionNonce;
+    peer.runtimeSessionNonce = CoopSessionHelloPolicy::RuntimeNonceAfterAcceptedHello(
+        packet.runtimeSessionNonce,
+        currentRuntimeNonce);
+    peer.lastAcceptedSessionHelloTime = helloNow;
     peer.address = fromAddress;
     peer.port = fromPort;
     peer.modBuild = packet.modBuild;
@@ -70447,13 +70553,15 @@ void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
     peer.levelId = packet.levelId;
     peer.worldEpoch = packetWorldEpoch;
     peer.levelEpoch = packet.levelEpoch;
+    peer.lastSessionHelloSequence = packet.sequence;
+    m_removedPeerSessionHellos.erase(packet.accountToken);
     peer.location = Vec3(packet.px, packet.py, packet.pz);
     peer.sessionFlags = packet.flags;
     peer.modelArchetypeId = packet.modelArchetypeId != 0 ? packet.modelArchetypeId : kProxyArchetype;
     const std::string username = ReadSessionUsername(packet);
     if (!username.empty())
         peer.username = username;
-    peer.lastPacketTime = GetNowSeconds();
+    peer.lastPacketTime = helloNow;
     m_reliableEndpointStates[MakeEndpointKey(fromAddress, fromPort)].lastPacketTime = peer.lastPacketTime;
     const bool hostResumeMatchesLocalWorld =
         packetWorldEpoch != 0 &&
@@ -70573,6 +70681,7 @@ void ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
             CoopProtocol::PeerPresenceCommand::AddOrUpdate,
             peer.accountToken);
     }
+    return true;
 }
 
 void ModMain::HandleAreaLease(const CoopProtocol::AreaLeasePacket& packet)
