@@ -38,6 +38,11 @@ constexpr bool IsAfter(uint32_t candidate, uint32_t reference)
     return distance != 0u && distance <= kHalfRange;
 }
 
+constexpr bool IsNewer(uint32_t candidate, uint32_t lastAccepted)
+{
+    return IsAfter(candidate, lastAccepted);
+}
+
 constexpr bool IsAtOrBefore(uint32_t value, uint32_t frontier)
 {
     if (value == 0u || frontier == 0u)
@@ -78,6 +83,11 @@ static_assert(CoopSerialSequence::Next(0xffffffffu) == 1u);
 static_assert(CoopSerialSequence::Previous(1u) == 0xffffffffu);
 static_assert(CoopSerialSequence::IsAfter(1u, 0xffffffffu));
 static_assert(!CoopSerialSequence::IsAfter(0xffffffffu, 1u));
+static_assert(CoopSerialSequence::IsNewer(1u, 0u));
+static_assert(!CoopSerialSequence::IsNewer(1u, 1u));
+static_assert(!CoopSerialSequence::IsNewer(1u, 2u));
+static_assert(CoopSerialSequence::IsNewer(1u, 0xffffffffu));
+static_assert(!CoopSerialSequence::IsNewer(0xffffffffu, 1u));
 static_assert(CoopSerialSequence::IsAtOrBefore(0xffffffffu, 1u));
 static_assert(CoopSerialSequence::IsAtOrBefore(1u, 1u));
 static_assert(!CoopSerialSequence::IsAtOrBefore(2u, 1u));
