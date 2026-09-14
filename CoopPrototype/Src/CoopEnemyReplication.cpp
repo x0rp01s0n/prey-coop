@@ -8894,7 +8894,7 @@ bool ModMain::ShouldBlockRemoteEnemyRagdoll(void* npcPtr, const char* stage)
     return true;
 }
 
-void ModMain::TickRemoteEnemySmoothing(float frameTime)
+void ModMain::TickRemoteEnemySmoothing(float frameTime, float realFrameTime)
 {
     if (EnvFlagEnabled("COOP_DISABLE_REMOTE_ENEMY_SMOOTH_TICK") ||
         m_networkMode == CoopNetworkMode::Off ||
@@ -8906,8 +8906,9 @@ void ModMain::TickRemoteEnemySmoothing(float frameTime)
         return;
     }
 
-    const float tickSeconds = std::clamp(std::max(frameTime, 0.0f), 0.0f, 0.05f);
-    if (tickSeconds <= 0.0f)
+    const float gameTickSeconds = std::clamp(std::max(frameTime, 0.0f), 0.0f, 0.05f);
+    const float realTickSeconds = std::clamp(std::max(realFrameTime, 0.0f), 0.0f, 0.05f);
+    if (gameTickSeconds <= 0.0f && realTickSeconds <= 0.0f)
         return;
     const float nowSeconds = gEnv && gEnv->pTimer ? gEnv->pTimer->GetAsyncCurTime() : -1.0f;
 
@@ -8960,6 +8961,14 @@ void ModMain::TickRemoteEnemySmoothing(float frameTime)
             state.remoteLegBlendOwned = false;
             continue;
         }
+
+        // A local focus menu may dilate unclaimed enemies, but a lease held
+        // by another player follows that owner's wall-clock network samples.
+        const float tickSeconds = state.remoteAuthorityHasAttention
+            ? realTickSeconds
+            : gameTickSeconds;
+        if (tickSeconds <= 0.0f)
+            continue;
 
         Quat localFacingMixTarget = Quat::CreateIdentity();
         // On a mixed observer, Vanilla owns the target and combat decision but
@@ -9244,6 +9253,9 @@ void ModMain::TickRemoteEnemySmoothing(float frameTime)
                 (smooth.burst ? " burst=1" : "") +
                 (smooth.hardPosition ? " hard=1" : "") +
                 (smooth.hardRotation ? " rotHard=1" : "") +
+                (state.remoteAuthorityHasAttention
+                    ? " clock=foreign_authority_real"
+                    : " clock=unclaimed_game") +
                 " count=" + std::to_string(m_enemyTransformSmoothTicks);
             AppendEnemySyncTrace("pose", m_lastEnemyLocomotionEvent);
         }

@@ -28,10 +28,8 @@ ArkTimeScaleManager* GetTimeScaleManager()
     return g_pGame ? g_pGame->m_pArkTimeScaleManager.get() : nullptr;
 }
 
-// A remote peer's slow-motion (e.g. their weapon wheel) must only dilate the
-// shared WORLD (Game) timer: enemies, props and music slow for everyone, while
-// the receiver's local Player and UI time bases stay normal so they can move
-// and operate normally as if nothing happened.
+// Shared time-scale events may only affect the Game timer on a receiver.
+// Focus-mode handles stay local and are scoped by enemy authority below.
 constexpr unsigned kRemoteDilationTimers =
     static_cast<unsigned>(ArkTimeScaleManager::EArkTimerFlag::Game);
 }
@@ -44,13 +42,16 @@ bool ModMain::BuildTimeDilationPacket(
 {
     if (m_localWorldEpoch == 0 || !std::isfinite(scale) || scale <= 0.0f || scale > 4.0f)
         return false;
+    const unsigned remoteTimers = timers & kRemoteDilationTimers;
+    if (remoteTimers == 0)
+        return false;
     packet = {};
     packet.sequence = m_timeDilationSequence;
     packet.worldEpoch = m_localWorldEpoch;
     packet.hostSaveKeyHash = CurrentHostSaveKeyHash();
     packet.sourcePeerHash = GetLocalAccountToken();
     packet.revision = m_timeDilationRevision;
-    packet.timers = timers;
+    packet.timers = remoteTimers;
     packet.command = static_cast<uint16_t>(command);
     packet.scale = scale;
     packet.eventId = BuildTimeEventId(packet.sourcePeerHash, packet.sequence, packet.revision, packet.command);
@@ -77,13 +78,23 @@ bool ModMain::SendTimeDilationTo(
 void ModMain::OnNativeTimeScaleOverride(
     ArkTimeScaleManager*, unsigned timers, float scale, int handle)
 {
-    if (m_timeDilationApplyDepth != 0 || m_networkMode == CoopNetworkMode::Off ||
+    if ((timers & kRemoteDilationTimers) != 0 &&
+        m_localFocusTimeDilationActive)
+    {
+        m_localFocusTimeDilationHandles.insert(handle);
+        m_lastTimeDilationEvent =
+            "native_focus_local_scale_" + std::to_string(scale);
+        return;
+    }
+
+    if ((timers & kRemoteDilationTimers) == 0 ||
+        m_timeDilationApplyDepth != 0 || m_networkMode == CoopNetworkMode::Off ||
         !m_hasRemoteEndpoint || !IsSessionGameplayReady() || !std::isfinite(scale))
     {
         return;
     }
     m_timeDilationLocalHandle = handle;
-    m_timeDilationTimers = timers;
+    m_timeDilationTimers = kRemoteDilationTimers;
     m_timeDilationScale = scale;
     m_timeDilationOwnerHash = GetLocalAccountToken();
     CoopSerialSequence::Advance(m_timeDilationSequence);
@@ -100,6 +111,22 @@ void ModMain::OnNativeTimeScaleOverride(
 
 void ModMain::OnNativeTimeScaleUpdate(ArkTimeScaleManager* manager, int handle, float scale)
 {
+    if (m_localFocusTimeDilationActive)
+    {
+        m_localFocusTimeDilationHandles.insert(handle);
+        m_lastTimeDilationEvent =
+            "native_focus_local_update_" + std::to_string(scale);
+        return;
+    }
+
+    if (m_localFocusTimeDilationHandles.find(handle) !=
+        m_localFocusTimeDilationHandles.end())
+    {
+        m_lastTimeDilationEvent =
+            "native_focus_local_update_" + std::to_string(scale);
+        return;
+    }
+
     if (handle != m_timeDilationLocalHandle || !std::isfinite(scale) ||
         std::fabs(scale - m_timeDilationScale) < 0.001f)
         return;
@@ -108,6 +135,14 @@ void ModMain::OnNativeTimeScaleUpdate(ArkTimeScaleManager* manager, int handle, 
 
 void ModMain::OnNativeTimeScaleClear(ArkTimeScaleManager*, int handle)
 {
+    const auto localFocusHandle = m_localFocusTimeDilationHandles.find(handle);
+    if (localFocusHandle != m_localFocusTimeDilationHandles.end())
+    {
+        m_localFocusTimeDilationHandles.erase(localFocusHandle);
+        m_lastTimeDilationEvent = "native_focus_local_end";
+        return;
+    }
+
     if (m_timeDilationApplyDepth != 0 || handle != m_timeDilationLocalHandle ||
         m_networkMode == CoopNetworkMode::Off || !m_hasRemoteEndpoint || !IsSessionGameplayReady())
     {
@@ -129,6 +164,16 @@ void ModMain::OnNativeTimeScaleClear(ArkTimeScaleManager*, int handle)
     m_lastTimeDilationEvent = "native_end";
 }
 
+void ModMain::BeginLocalFocusTimeDilationCapture()
+{
+    m_localFocusTimeDilationActive = true;
+}
+
+void ModMain::EndLocalFocusTimeDilationCapture()
+{
+    m_localFocusTimeDilationActive = false;
+}
+
 void ModMain::HandleTimeDilation(const CoopProtocol::TimeDilationPacket& packet)
 {
     ++m_timeDilationReceived;
@@ -141,6 +186,13 @@ void ModMain::HandleTimeDilation(const CoopProtocol::TimeDilationPacket& packet)
     {
         ++m_timeDilationDropped;
         m_lastTimeDilationEvent = "guard_drop";
+        return;
+    }
+
+    if ((packet.timers & kRemoteDilationTimers) == 0)
+    {
+        ++m_timeDilationDropped;
+        m_lastTimeDilationEvent = "no_game_timer_drop";
         return;
     }
 
@@ -169,7 +221,7 @@ void ModMain::HandleTimeDilation(const CoopProtocol::TimeDilationPacket& packet)
             remoteTimers != 0 ? manager->OverrideTimeScale(remoteTimers, packet.scale) : -1;
         --m_timeDilationApplyDepth;
         m_timeDilationOwnerHash = packet.sourcePeerHash;
-        m_timeDilationTimers = packet.timers;
+        m_timeDilationTimers = remoteTimers;
         m_timeDilationScale = packet.scale;
         ++m_timeDilationApplied;
         CoopSerialSequence::Advance(m_timeDilationSequence);
@@ -192,7 +244,7 @@ void ModMain::HandleTimeDilation(const CoopProtocol::TimeDilationPacket& packet)
             return;
         m_timeDilationRevision = packet.revision;
         m_timeDilationOwnerHash = packet.sourcePeerHash;
-        m_timeDilationTimers = packet.timers;
+        m_timeDilationTimers = packet.timers & kRemoteDilationTimers;
         m_timeDilationScale = packet.scale;
         if (packet.sourcePeerHash != localPeer)
         {
@@ -267,5 +319,7 @@ void ModMain::ResetTimeDilationState(const char* reason)
     m_timeDilationScale = 1.0f;
     m_timeDilationLocalHandle = -1;
     m_timeDilationRemoteHandle = -1;
+    m_localFocusTimeDilationActive = false;
+    m_localFocusTimeDilationHandles.clear();
     m_lastTimeDilationEvent = reason && reason[0] ? reason : "reset";
 }
