@@ -810,7 +810,7 @@ constexpr size_t kMaxProxyCombatStimulusPerTick = 8;
 constexpr size_t kMaxEnemyStatesPerTick = 32;
 constexpr int kMaxPacketsPerFrame = 128;
 constexpr size_t kReliableMaxQueuedPackets = 256;
-constexpr size_t kReliableSendWindow = 32;
+constexpr size_t kReliableSendWindow = CoopReliableReorder::kWindowCapacity;
 constexpr int kReliableMaxSendsPerFrame = 32;
 constexpr size_t kSaveTransferQueueLowWater = 96;
 constexpr size_t kPlayerStateTransferQueueLowWater = 24;
@@ -67649,8 +67649,8 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
         return;
     }
 
-    ReliableEndpointState& endpointState =
-        m_reliableEndpointStates[MakeEndpointKey(fromAddress, fromPort)];
+    const uint64_t endpointKey = MakeEndpointKey(fromAddress, fromPort);
+    ReliableEndpointState& endpointState = m_reliableEndpointStates[endpointKey];
     endpointState.lastPacketTime = GetNowSeconds();
     const bool isCrossWorldControlPayload = IsCrossWorldReliablePayload(packet.payloadType);
     const bool isAreaScopedPayload = IsAreaScopedReliablePayload(packet.payloadType);
@@ -67695,7 +67695,8 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
 
     if (isReliableTransferStart &&
         packet.reliableSequence != CoopSerialSequence::Next(endpointState.recvSequence) &&
-        CoopSerialSequence::IsAfter(packet.reliableSequence, endpointState.recvSequence))
+        CoopSerialSequence::IsAfter(packet.reliableSequence, endpointState.recvSequence) &&
+        !CoopReliableReorder::IsWithinForwardWindow(endpointState.recvSequence, packet.reliableSequence))
     {
         bool newTransfer = true;
         if (packet.payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::SaveTransfer))
@@ -67716,6 +67717,7 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
         if (newTransfer)
         {
             endpointState.recvSequence = CoopSerialSequence::Previous(packet.reliableSequence);
+            endpointState.reorderedPackets.DiscardAtOrBefore(endpointState.recvSequence);
             m_lastReliableEvent =
                 "resynced reliable for control seq " +
                 std::to_string(packet.reliableSequence) +
@@ -67734,9 +67736,15 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
 
     if (packet.reliableSequence != CoopSerialSequence::Next(endpointState.recvSequence))
     {
+        endpointState.reorderedPackets.Store(
+            endpointState.recvSequence,
+            packet.reliableSequence,
+            packet);
         SendReliableAckTo(endpointState.recvSequence, fromAddress, fromPort, "reliable gap ack failed");
         m_lastReliableEvent =
-            "waiting reliable seq " +
+            "buffered reliable seq " +
+            std::to_string(packet.reliableSequence) +
+            " waiting seq " +
             std::to_string(CoopSerialSequence::Next(endpointState.recvSequence));
         return;
     }
@@ -67776,6 +67784,7 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
             std::to_string(packet.reliableSequence) +
             " type " + std::to_string(packet.payloadType) +
             " old-world";
+        DrainReliableReorderBuffer(endpointKey, fromAddress, fromPort);
         return;
     }
 
@@ -67795,6 +67804,7 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
             std::to_string(packet.reliableSequence) +
             " type " + std::to_string(packet.payloadType) +
             " level " + payloadRemoteLevel;
+        DrainReliableReorderBuffer(endpointKey, fromAddress, fromPort);
         return;
     }
 
@@ -67811,6 +67821,7 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
             std::to_string(packet.reliableSequence) +
             " type " + std::to_string(packet.payloadType) +
             " level-mismatch";
+        DrainReliableReorderBuffer(endpointKey, fromAddress, fromPort);
         return;
     }
 
@@ -67819,10 +67830,8 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
             (!IsSessionGameplayReady() &&
                 !(isEnemyReplicationPayload && enemyReplicationReceiveReady))))
     {
-        // There is no receive-side reorder buffer. Holding the sequence here
-        // permanently blocks the cross-world save/player-state transfer that
-        // admits this peer. The authoritative snapshot supersedes gameplay
-        // packets emitted during the join window, so retire them in order.
+        // The authoritative snapshot supersedes gameplay packets emitted
+        // during the join window, so retire them in order.
         endpointState.recvSequence = packet.reliableSequence;
         m_reliableRecvSequence = endpointState.recvSequence;
         ++m_reliableRetiredAreaPackets;
@@ -67832,6 +67841,7 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
             "retired reliable pre-session payload seq " +
             std::to_string(packet.reliableSequence) +
             " type " + std::to_string(packet.payloadType);
+        DrainReliableReorderBuffer(endpointKey, fromAddress, fromPort);
         return;
     }
 
@@ -67944,6 +67954,23 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
     }
     StoreActiveRemotePeerContext();
     m_activePacketSourceAccountToken = 0;
+    DrainReliableReorderBuffer(endpointKey, fromAddress, fromPort);
+}
+
+void ModMain::DrainReliableReorderBuffer(uint64_t endpointKey, uint32_t fromAddress, uint16_t fromPort)
+{
+    auto endpointIt = m_reliableEndpointStates.find(endpointKey);
+    if (endpointIt == m_reliableEndpointStates.end())
+        return;
+
+    CoopProtocol::ReliableEnvelopePacket nextPacket = {};
+    while (endpointIt->second.reorderedPackets.TakeNext(endpointIt->second.recvSequence, nextPacket))
+    {
+        HandleReliableEnvelope(nextPacket, fromAddress, fromPort);
+        endpointIt = m_reliableEndpointStates.find(endpointKey);
+        if (endpointIt == m_reliableEndpointStates.end())
+            return;
+    }
 }
 
 void ModMain::HandleReliablePayload(uint16_t payloadType, const uint8_t* payload, uint16_t payloadSize)
