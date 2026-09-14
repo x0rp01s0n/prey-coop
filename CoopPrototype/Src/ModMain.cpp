@@ -24491,9 +24491,15 @@ static bool ArkFocusMode_Start_Hook(ArkFocusModeComponent* focusMode, const bool
         return false;
     }
 
+    if (gMod)
+        gMod->BeginLocalFocusTimeDilationCapture();
     const bool result = s_hookArkFocusModeStart.InvokeOrig(focusMode, openMenu);
     if (gMod)
+    {
+        if (!result)
+            gMod->EndLocalFocusTimeDilationCapture();
         gMod->RecordFocusModeStart(openMenu, false, result);
+    }
     return result;
 }
 
@@ -24502,7 +24508,10 @@ static void ArkFocusMode_Stop_Hook(ArkFocusModeComponent* focusMode, const bool 
     TracePostLoadNativeHook("ArkFocusMode::Stop");
     s_hookArkFocusModeStop.InvokeOrig(focusMode, fromTargeting);
     if (gMod)
+    {
+        gMod->EndLocalFocusTimeDilationCapture();
         gMod->RecordFocusModeStop(fromTargeting);
+    }
 }
 
 static bool ArkDialogPlayer_Play_Hook(ArkDialogPlayer* dialogPlayer, const SDialogParams& params)
@@ -35499,6 +35508,7 @@ void ModMain::OnArkSaveLoadSerializePersistentStateHook(
 void ModMain::MainUpdate(unsigned updateFlags)
 {
     const float frameTime = gEnv && gEnv->pTimer ? gEnv->pTimer->GetFrameTime() : 0.0f;
+    const float realFrameTime = gEnv && gEnv->pTimer ? gEnv->pTimer->GetRealFrameTime() : frameTime;
 
     // Refresh the bounded report outside the log hot path. This keeps the
     // release diagnostic available without turning every emitted event into a
@@ -35808,7 +35818,7 @@ void ModMain::MainUpdate(unsigned updateFlags)
     tracePostProxyStep("after TickEnemyMimicryStateHeartbeat");
     TickPendingEnemyDeathCommits(frameTime);
     tracePostProxyStep("after TickPendingEnemyDeathCommits");
-    TickRemoteEnemySmoothing(frameTime);
+    TickRemoteEnemySmoothing(frameTime, realFrameTime);
     tracePostProxyStep("after TickRemoteEnemySmoothing");
     TickAreaLease(frameTime);
     tracePostProxyStep("after TickAreaLease");

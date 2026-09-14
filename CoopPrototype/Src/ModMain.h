@@ -264,6 +264,8 @@ public:
     void OnNativeTimeScaleOverride(ArkTimeScaleManager* manager, unsigned timers, float scale, int handle);
     void OnNativeTimeScaleUpdate(ArkTimeScaleManager* manager, int handle, float scale);
     void OnNativeTimeScaleClear(ArkTimeScaleManager* manager, int handle);
+    void BeginLocalFocusTimeDilationCapture();
+    void EndLocalFocusTimeDilationCapture();
     bool ShouldSuppressFocusModeStart(bool openMenu) const;
     void RecordFocusModeStart(bool openMenu, bool suppressed, bool result);
     void RecordFocusModeStop(bool fromTargeting);
@@ -2731,7 +2733,7 @@ private:
     void TickClientEnemyAuthorityClaims(float frameTime);
     void TickLocalFocusedOperatorCombat(float frameTime);
     void ResetLocalFocusedOperatorCombat(const char* reason);
-    void TickRemoteEnemySmoothing(float frameTime);
+    void TickRemoteEnemySmoothing(float frameTime, float realFrameTime);
     bool IsLocalPlayerAuthorityBlockedByModalState() const;
     bool SendClientEnemyAuthorityStateNow(EnemyAuthorityState& state, uint32_t sourceFlags, const char* failurePrefix);
     void HandleRemoteEnemyAuthorityStateOnAreaAuthority(const CoopProtocol::TestMimicStatePacket& packet);
@@ -3360,6 +3362,8 @@ private:
     float m_timeDilationScale = 1.0f;
     int m_timeDilationLocalHandle = -1;
     int m_timeDilationRemoteHandle = -1;
+    bool m_localFocusTimeDilationActive = false;
+    std::unordered_set<int> m_localFocusTimeDilationHandles;
     std::string m_lastTimeDilationEvent = "-";
     std::string m_lastSharedDropEvent = "-";
     bool m_applyingRemoteGooResult = false;
