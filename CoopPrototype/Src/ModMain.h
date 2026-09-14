@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "CoopProtocol.h"
+#include "CoopReliableReorderBuffer.h"
 #include "CoopDamagePolicy.h"
 #include "CoopEnemyAuthorityPolicy.h"
 #include "CoopEnemyControlPolicy.h"
@@ -1331,6 +1332,7 @@ private:
         uint32_t recvSequence = 0;
         uint32_t ackedSequence = 0;
         float lastPacketTime = -1.0f;
+        CoopReliableReorder::Buffer<CoopProtocol::ReliableEnvelopePacket> reorderedPackets;
     };
 
     struct HostPlayerStateUploadReceive
@@ -1898,6 +1900,7 @@ private:
     void TickNetworkRuntimeCleanup(float frameTime);
     void HandleReliableAck(const CoopProtocol::ReliableAckPacket& packet, uint32_t fromAddress, uint16_t fromPort);
     void HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket& packet, uint32_t fromAddress, uint16_t fromPort);
+    void DrainReliableReorderBuffer(uint64_t endpointKey, uint32_t fromAddress, uint16_t fromPort);
     void HandleReliablePayload(uint16_t payloadType, const uint8_t* payload, uint16_t payloadSize);
     void HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet, uint32_t fromAddress, uint16_t fromPort);
     void HandlePeerPresence(const CoopProtocol::PeerPresencePacket& packet);

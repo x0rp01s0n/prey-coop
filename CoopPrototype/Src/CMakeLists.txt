@@ -102,6 +102,7 @@ set(SOURCE_FILES
 	CoopEventRouter.cpp
 	CoopEventRouter.h
 	CoopProtocol.h
+	CoopReliableReorderBuffer.h
 	CoopVTableHook.h
 	ModMain.cpp
 	ModMainChat.cpp
@@ -129,6 +130,9 @@ set_target_properties(CoopAbiSmokeTest PROPERTIES
 	RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/abi-smoke"
 )
 add_dependencies(${MOD_NAME} CoopAbiSmokeTest)
+
+add_executable(CoopReliableReorderBufferTest EXCLUDE_FROM_ALL CoopReliableReorderBufferTest.cpp)
+target_include_directories(CoopReliableReorderBufferTest PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 
 add_executable(CoopWineFocusCtl CoopWineFocusCtl.cpp)
 target_link_libraries(CoopWineFocusCtl user32 gdi32)
