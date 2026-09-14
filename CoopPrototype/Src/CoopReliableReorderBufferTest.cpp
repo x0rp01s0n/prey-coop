@@ -39,6 +39,18 @@ struct Receiver
         }
     }
 
+    void ReceiveTransferStart(const Envelope& envelope)
+    {
+        if (envelope.sequence != CoopSerialSequence::Next(ackFrontier) &&
+            CoopSerialSequence::IsAfter(envelope.sequence, ackFrontier) &&
+            !CoopReliableReorder::IsWithinForwardWindow(ackFrontier, envelope.sequence))
+        {
+            ackFrontier = CoopSerialSequence::Previous(envelope.sequence);
+            reordered.DiscardAtOrBefore(ackFrontier);
+        }
+        Receive(envelope);
+    }
+
     void Consume(const Envelope& envelope, bool loadControlPump)
     {
         ackFrontier = envelope.sequence;
@@ -94,6 +106,7 @@ int main()
     CHECK(bounded.ackFrontier == 0);
     CHECK(bounded.reordered.Size() == 0);
     CHECK(bounded.sentAckFrontiers.back() == 0);
+    CHECK(!CoopReliableReorder::IsWithinForwardWindow(0, CoopReliableReorder::kWindowCapacity + 1));
 
     Receiver loadControl;
     loadControl.Receive({2, true}, true);
@@ -121,5 +134,26 @@ int main()
     wrapFrontier = std::numeric_limits<uint32_t>::max();
     CHECK(wrapping.TakeNext(wrapFrontier, nextSequence));
     CHECK(nextSequence == 1);
+
+    Receiver transferStartInWindow;
+    for (uint32_t sequence = 1; sequence <= 473; ++sequence)
+        transferStartInWindow.Receive({sequence, false});
+    CHECK(CoopReliableReorder::IsWithinForwardWindow(473, 488));
+    transferStartInWindow.ReceiveTransferStart({488, true});
+    CHECK(transferStartInWindow.ackFrontier == 473);
+    CHECK(transferStartInWindow.reordered.Size() == 1);
+    for (uint32_t sequence = 474; sequence < 488; ++sequence)
+        transferStartInWindow.Receive({sequence, false});
+    CHECK(transferStartInWindow.ackFrontier == 488);
+    CHECK(transferStartInWindow.applied.size() == 488);
+    CHECK(transferStartInWindow.applied[487] == 488);
+
+    Receiver transferStartOutsideWindow;
+    for (uint32_t sequence = 1; sequence <= 473; ++sequence)
+        transferStartOutsideWindow.Receive({sequence, false});
+    CHECK(!CoopReliableReorder::IsWithinForwardWindow(473, 506));
+    transferStartOutsideWindow.ReceiveTransferStart({506, true});
+    CHECK(transferStartOutsideWindow.ackFrontier == 506);
+    CHECK(transferStartOutsideWindow.applied.back() == 506);
     return 0;
 }

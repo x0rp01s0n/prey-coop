@@ -12,6 +12,17 @@ namespace CoopReliableReorder
 {
 constexpr std::size_t kWindowCapacity = 32;
 
+constexpr bool IsWithinForwardWindow(uint32_t frontier, uint32_t sequence)
+{
+    if (!CoopSerialSequence::IsAfter(sequence, frontier))
+        return false;
+
+    const uint32_t distance = frontier == 0
+        ? sequence
+        : CoopSerialSequence::ForwardDistance(frontier, sequence);
+    return distance <= kWindowCapacity;
+}
+
 template<typename T>
 class Buffer
 {

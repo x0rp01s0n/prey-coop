@@ -67695,7 +67695,8 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
 
     if (isReliableTransferStart &&
         packet.reliableSequence != CoopSerialSequence::Next(endpointState.recvSequence) &&
-        CoopSerialSequence::IsAfter(packet.reliableSequence, endpointState.recvSequence))
+        CoopSerialSequence::IsAfter(packet.reliableSequence, endpointState.recvSequence) &&
+        !CoopReliableReorder::IsWithinForwardWindow(endpointState.recvSequence, packet.reliableSequence))
     {
         bool newTransfer = true;
         if (packet.payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::SaveTransfer))
@@ -67829,10 +67830,8 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
             (!IsSessionGameplayReady() &&
                 !(isEnemyReplicationPayload && enemyReplicationReceiveReady))))
     {
-        // There is no receive-side reorder buffer. Holding the sequence here
-        // permanently blocks the cross-world save/player-state transfer that
-        // admits this peer. The authoritative snapshot supersedes gameplay
-        // packets emitted during the join window, so retire them in order.
+        // The authoritative snapshot supersedes gameplay packets emitted
+        // during the join window, so retire them in order.
         endpointState.recvSequence = packet.reliableSequence;
         m_reliableRecvSequence = endpointState.recvSequence;
         ++m_reliableRetiredAreaPackets;
