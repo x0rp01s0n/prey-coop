@@ -32147,6 +32147,23 @@ void ModMain::AddMultiplayerToNativePauseMenu(ArkPauseMenu* menu)
         : "native multiplayer pause-menu entry installed";
 }
 
+void ModMain::ArmMultiplayerUiInputGuard()
+{
+    m_multiplayerInputSuppressUntilMs = GetTickCount64() + 750;
+    m_multiplayerWaitForGamepadRelease = true;
+    ++m_multiplayerUiSessionGeneration;
+    m_multiplayerUiFocusedControl = "-";
+    m_multiplayerUiFocusedControlId = 0;
+    m_multiplayerUiActiveControl = "-";
+    m_multiplayerUiActiveControlId = 0;
+    m_multiplayerUiLastActivatedControl = "-";
+    m_multiplayerUiLastActivatedControlId = 0;
+    m_multiplayerUiLastActivationFrame = 0;
+    m_multiplayerUiLastGamepadConfirmFrame = 0;
+    m_multiplayerUiLastActivationSource = "-";
+    m_multiplayerUiActivationCount = 0;
+}
+
 void ModMain::OpenMultiplayerFromNativeMainMenu()
 {
     m_showMultiplayerUi = true;
@@ -32154,7 +32171,7 @@ void ModMain::OpenMultiplayerFromNativeMainMenu()
     m_multiplayerOpenedFromNativePauseMenu = false;
     m_multiplayerUiTab = 0;
     m_multiplayerUiFocusPrimaryOnOpen = true;
-    m_multiplayerInputSuppressUntilMs = GetTickCount64() + 750;
+    ArmMultiplayerUiInputGuard();
     m_multiplayerRestoreChairloaderGuiOnClose = false;
     if (gCL && gCL->gui && gCL->gui->IsEnabled())
     {
@@ -32174,7 +32191,7 @@ void ModMain::OpenMultiplayerFromNativePauseMenu()
     m_multiplayerOpenedFromNativePauseMenu = true;
     m_multiplayerUiTab = m_networkMode == CoopNetworkMode::Off ? 0 : 3;
     m_multiplayerUiFocusPrimaryOnOpen = true;
-    m_multiplayerInputSuppressUntilMs = GetTickCount64() + 750;
+    ArmMultiplayerUiInputGuard();
     m_multiplayerRestoreChairloaderGuiOnClose = false;
     if (gCL && gCL->gui && gCL->gui->IsEnabled())
     {
@@ -32229,6 +32246,13 @@ void ModMain::CloseMultiplayerUi(const char* reason)
     m_nativePauseMultiplayerFocused = false;
     m_multiplayerUiFocusPrimaryOnOpen = false;
     m_multiplayerInputSuppressUntilMs = 0;
+    m_multiplayerWaitForGamepadRelease = false;
+    m_multiplayerUiGamepadInputSuppressed = false;
+    m_multiplayerUiFocusedControl = "-";
+    m_multiplayerUiFocusedControlId = 0;
+    m_multiplayerUiActiveControl = "-";
+    m_multiplayerUiActiveControlId = 0;
+    m_multiplayerUiLastGamepadConfirmFrame = 0;
     if (!m_joinOverlayActive)
         ReleaseJoinInputBlock(reason && reason[0] ? reason : "multiplayer menu closed");
     if (m_multiplayerRestoreChairloaderGuiOnClose && gCL && gCL->gui)
@@ -32251,7 +32275,10 @@ void ModMain::Draw()
         ImGui::BeginMainMenuBar())
     {
         if (ImGui::MenuItem("Multiplayer"))
+        {
             m_showMultiplayerUi = true;
+            ArmMultiplayerUiInputGuard();
+        }
         if (ImGui::BeginMenu("Coop Prototype"))
         {
             ImGui::MenuItem("Developer tools", nullptr, &m_showDeveloperUi);
@@ -37739,6 +37766,25 @@ std::string ModMain::BuildRuntimeControlStatus() const
             << "/" << (m_joinInputBlocked ? 1 : 0)
         << " multiplayerUiTab=" << m_multiplayerUiTab
         << " multiplayerUiDebug=" << StatusToken(m_uiDebugStatus.empty() ? "-" : m_uiDebugStatus)
+        << " multiplayerUiControl=" << StatusToken(m_multiplayerUiFocusedControl)
+            << "/" << m_multiplayerUiFocusedControlId
+            << "/" << StatusToken(m_multiplayerUiActiveControl)
+            << "/" << m_multiplayerUiActiveControlId
+            << "/" << StatusToken(m_multiplayerUiLastActivatedControl)
+            << "/" << m_multiplayerUiLastActivatedControlId
+            << "/" << m_multiplayerUiActivationCount
+            << "/" << StatusToken(m_multiplayerUiLastActivationSource)
+            << "/" << m_multiplayerUiLastActivationFrame
+            << "/" << m_multiplayerUiSessionGeneration
+        << " multiplayerUiGamepad=" << (m_multiplayerUiGamepadConnected ? 1 : 0)
+            << "/" << m_multiplayerUiGamepadHeldButtons
+            << "/" << m_multiplayerUiGamepadPressedButtons
+            << "/" << (m_multiplayerUiGamepadInputSuppressed ? 1 : 0)
+        << " multiplayerUiSelection=" << m_serverBrowserFilter
+            << "/" << m_serverAccessMode
+            << "/" << StatusToken(m_identityConfig.Data().accountStrategy)
+            << "/" << m_identityConfig.Data().selectedModelArchetypeId
+            << "/" << m_selectedServerIndex
         << " multiplayerUiInput=" << static_cast<int>(m_multiplayerUiMouseX)
             << "," << static_cast<int>(m_multiplayerUiMouseY)
             << "/" << m_multiplayerUiMouseClicks
@@ -43791,10 +43837,15 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
     }
     else if (command == "coop_multiplayer_ui")
     {
+        const bool wasVisible = m_showMultiplayerUi;
         if (args.empty() || args.front() == "toggle")
             m_showMultiplayerUi = !m_showMultiplayerUi;
         else
             m_showMultiplayerUi = std::atoi(args.front().c_str()) != 0;
+        if (m_showMultiplayerUi && !wasVisible)
+            ArmMultiplayerUiInputGuard();
+        else if (!m_showMultiplayerUi && wasVisible)
+            CloseMultiplayerUi("runtime command");
         action = m_showMultiplayerUi ? "multiplayer_ui_open" : "multiplayer_ui_closed";
     }
     else if (command == "coop_start_host")

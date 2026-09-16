@@ -12,6 +12,7 @@
 #include <Xinput.h>
 
 #include <imgui.h>
+#include <imgui_internal.h>
 #include <imgui_stdlib.h>
 
 namespace
@@ -91,12 +92,15 @@ void DrawSectionLabel(const char* label)
 
 struct GamepadButtonEdges
 {
+    bool connected = false;
+    WORD heldButtons = 0;
+    WORD pressedButtons = 0;
     bool back = false;
     bool previousTab = false;
     bool nextTab = false;
 };
 
-GamepadButtonEdges PollXInputButtonEdges(ImGuiIO& io)
+GamepadButtonEdges PollXInputButtonEdges()
 {
     using GetStateFn = DWORD(WINAPI*)(DWORD, XINPUT_STATE*);
     static GetStateFn getState = []() -> GetStateFn
@@ -117,8 +121,6 @@ GamepadButtonEdges PollXInputButtonEdges(ImGuiIO& io)
     GamepadButtonEdges edges;
     if (!getState)
         return edges;
-    WORD heldButtons = 0;
-    bool hasGamepad = false;
     for (DWORD user = 0; user < XUSER_MAX_COUNT; ++user)
     {
         XINPUT_STATE state = {};
@@ -126,16 +128,23 @@ GamepadButtonEdges PollXInputButtonEdges(ImGuiIO& io)
         const WORD buttons = connected ? state.Gamepad.wButtons : 0;
         const WORD pressed = static_cast<WORD>(buttons & ~previousButtons[user]);
         previousButtons[user] = buttons;
-        hasGamepad = hasGamepad || connected;
-        heldButtons = static_cast<WORD>(heldButtons | buttons);
+        edges.connected = edges.connected || connected;
+        edges.heldButtons = static_cast<WORD>(edges.heldButtons | buttons);
+        edges.pressedButtons = static_cast<WORD>(edges.pressedButtons | pressed);
         edges.back = edges.back || (pressed & XINPUT_GAMEPAD_B) != 0;
         edges.previousTab = edges.previousTab || (pressed & XINPUT_GAMEPAD_LEFT_SHOULDER) != 0;
         edges.nextTab = edges.nextTab || (pressed & XINPUT_GAMEPAD_RIGHT_SHOULDER) != 0;
     }
-    if (hasGamepad)
+    return edges;
+}
+
+void PublishXInputState(ImGuiIO& io, const GamepadButtonEdges& state, bool suppressed)
+{
+    if (state.connected)
         io.BackendFlags |= ImGuiBackendFlags_HasGamepad;
     else
         io.BackendFlags &= ~ImGuiBackendFlags_HasGamepad;
+    const WORD heldButtons = suppressed ? 0 : state.heldButtons;
     io.AddKeyEvent(ImGuiKey_GamepadFaceDown, (heldButtons & XINPUT_GAMEPAD_A) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadFaceLeft, (heldButtons & XINPUT_GAMEPAD_X) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadFaceUp, (heldButtons & XINPUT_GAMEPAD_Y) != 0);
@@ -143,7 +152,6 @@ GamepadButtonEdges PollXInputButtonEdges(ImGuiIO& io)
     io.AddKeyEvent(ImGuiKey_GamepadDpadRight, (heldButtons & XINPUT_GAMEPAD_DPAD_RIGHT) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadDpadUp, (heldButtons & XINPUT_GAMEPAD_DPAD_UP) != 0);
     io.AddKeyEvent(ImGuiKey_GamepadDpadDown, (heldButtons & XINPUT_GAMEPAD_DPAD_DOWN) != 0);
-    return edges;
 }
 }
 
@@ -213,10 +221,68 @@ void ModMain::DrawMultiplayerUi()
     const bool offline = m_networkMode == CoopNetworkMode::Off;
     CoopIdentityConfigData& identity = m_identityConfig.MutableData();
     const bool openingInputSuppressed = GetTickCount64() < m_multiplayerInputSuppressUntilMs;
-    const GamepadButtonEdges gamepad = PollXInputButtonEdges(io);
+    const GamepadButtonEdges gamepad = PollXInputButtonEdges();
+    if (m_multiplayerWaitForGamepadRelease && !openingInputSuppressed && gamepad.heldButtons == 0)
+        m_multiplayerWaitForGamepadRelease = false;
+    const bool gamepadInputSuppressed = openingInputSuppressed || m_multiplayerWaitForGamepadRelease;
+    PublishXInputState(io, gamepad, gamepadInputSuppressed);
+    m_multiplayerUiGamepadConnected = gamepad.connected;
+    m_multiplayerUiGamepadInputSuppressed = gamepadInputSuppressed;
+    m_multiplayerUiGamepadHeldButtons = gamepad.heldButtons;
+    m_multiplayerUiGamepadPressedButtons = gamepad.pressedButtons;
+    const uint32_t uiFrame = static_cast<uint32_t>(ImGui::GetFrameCount());
+    if (!gamepadInputSuppressed && (gamepad.pressedButtons & XINPUT_GAMEPAD_A) != 0)
+        m_multiplayerUiLastGamepadConfirmFrame = uiFrame;
+    m_multiplayerUiFocusedControl = "-";
+    m_multiplayerUiFocusedControlId = 0;
+    m_multiplayerUiActiveControl = "-";
+    m_multiplayerUiActiveControlId = 0;
+    const auto trackUiItem = [&](const std::string& name)
+    {
+        const ImGuiID id = ImGui::GetItemID();
+        if (ImGui::IsItemFocused())
+        {
+            m_multiplayerUiFocusedControl = name;
+            m_multiplayerUiFocusedControlId = id;
+        }
+        if (ImGui::IsItemActive())
+        {
+            m_multiplayerUiActiveControl = name;
+            m_multiplayerUiActiveControlId = id;
+        }
+        if (ImGui::IsItemActivated())
+        {
+            const ImGuiContext* context = ImGui::GetCurrentContext();
+            ImGuiInputSource source = context ? context->ActiveIdSource : ImGuiInputSource_None;
+            if (source == ImGuiInputSource_Nav && context)
+                source = context->NavInputSource;
+            const bool deliberateActivation =
+                (source == ImGuiInputSource_Gamepad &&
+                    m_multiplayerUiLastGamepadConfirmFrame != 0 &&
+                    uiFrame - m_multiplayerUiLastGamepadConfirmFrame <= 2) ||
+                (source == ImGuiInputSource_Keyboard &&
+                    (ImGui::IsKeyPressed(ImGuiKey_Enter, false) ||
+                        ImGui::IsKeyPressed(ImGuiKey_Space, false))) ||
+                (source == ImGuiInputSource_Mouse &&
+                    ImGui::IsMouseClicked(ImGuiMouseButton_Left, false));
+            if (deliberateActivation)
+            {
+                m_multiplayerUiLastActivatedControl = name;
+                m_multiplayerUiLastActivatedControlId = id;
+                m_multiplayerUiLastActivationFrame = static_cast<uint32_t>(ImGui::GetFrameCount());
+                m_multiplayerUiLastActivationSource = source == ImGuiInputSource_Gamepad
+                    ? "gamepad"
+                    : (source == ImGuiInputSource_Keyboard
+                        ? "keyboard"
+                        : (source == ImGuiInputSource_Mouse ? "mouse" : "other"));
+                ++m_multiplayerUiActivationCount;
+            }
+        }
+    };
     if (!openingInputSuppressed &&
         (ImGui::IsKeyPressed(ImGuiKey_Escape, false) ||
-            ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || gamepad.back))
+            (!gamepadInputSuppressed &&
+                (ImGui::IsKeyPressed(ImGuiKey_GamepadFaceRight, false) || gamepad.back))))
     {
         CloseMultiplayerUi("multiplayer back action");
         ImGui::End();
@@ -228,18 +294,24 @@ void ModMain::DrawMultiplayerUi()
 
     bool focusTabPrimaryCommand = m_multiplayerUiFocusPrimaryOnOpen;
     m_multiplayerUiFocusPrimaryOnOpen = false;
-    if (!openingInputSuppressed && !ImGui::IsAnyItemActive())
+    if (!openingInputSuppressed)
     {
+        const bool itemActive = ImGui::IsAnyItemActive();
         const bool previousTab =
-            ImGui::IsKeyPressed(ImGuiKey_Q, false) ||
-            ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false) ||
-            ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || gamepad.previousTab;
+            (!itemActive &&
+                (ImGui::IsKeyPressed(ImGuiKey_Q, false) ||
+                    ImGui::IsKeyPressed(ImGuiKey_LeftArrow, false))) ||
+            (!gamepadInputSuppressed &&
+                (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false) || gamepad.previousTab));
         const bool nextTab =
-            ImGui::IsKeyPressed(ImGuiKey_E, false) ||
-            ImGui::IsKeyPressed(ImGuiKey_RightArrow, false) ||
-            ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || gamepad.nextTab;
+            (!itemActive &&
+                (ImGui::IsKeyPressed(ImGuiKey_E, false) ||
+                    ImGui::IsKeyPressed(ImGuiKey_RightArrow, false))) ||
+            (!gamepadInputSuppressed &&
+                (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false) || gamepad.nextTab));
         if (previousTab != nextTab)
         {
+            ImGui::ClearActiveID();
             m_multiplayerUiTab = (m_multiplayerUiTab + (nextTab ? 1 : 3)) % 4;
             focusTabPrimaryCommand = true;
         }
@@ -249,7 +321,9 @@ void ModMain::DrawMultiplayerUi()
     ImGui::TextUnformatted("MULTIPLAYER");
     ImGui::SetWindowFontScale(1.0f);
     ImGui::SameLine(ImGui::GetWindowWidth() - 86.0f);
-    if (ImGui::Button("X##close_multiplayer", ImVec2(42.0f, 34.0f)))
+    const bool closePressed = ImGui::Button("X##close_multiplayer", ImVec2(42.0f, 34.0f));
+    trackUiItem("close");
+    if (closePressed)
         CloseMultiplayerUi("multiplayer close button");
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("Back");
@@ -262,18 +336,32 @@ void ModMain::DrawMultiplayerUi()
         const bool selected = m_multiplayerUiTab == tab;
         if (selected)
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.63f, 0.39f, 0.10f, 1.0f));
-        if (ImGui::Button(tabs[tab], ImVec2(172.0f, 38.0f)))
+        const bool tabPressed = ImGui::Button(tabs[tab], ImVec2(172.0f, 38.0f));
+        trackUiItem("tab_" + std::to_string(tab));
+        if (tabPressed)
         {
             m_multiplayerUiTab = tab;
             focusTabPrimaryCommand = true;
         }
+        const bool tabHasEnabledPrimary =
+            (tab == 0 && offline) ||
+            (tab == 1 && (offline || m_networkMode == CoopNetworkMode::Host)) ||
+            (tab == 2 && offline) ||
+            (tab == 3 &&
+                (m_networkMode != CoopNetworkMode::Off || m_lastUiNetworkMode == CoopNetworkMode::Client));
+        if (selected && focusTabPrimaryCommand && !tabHasEnabledPrimary)
+            ImGui::SetKeyboardFocusHere(-1);
         if (selected)
             ImGui::PopStyleColor();
     }
     ImGui::Separator();
 
     const float footerHeight = 56.0f;
-    ImGui::BeginChild("multiplayer_content", ImVec2(0.0f, -footerHeight), false, ImGuiWindowFlags_NoScrollbar);
+    ImGui::BeginChild(
+        "multiplayer_content",
+        ImVec2(0.0f, -footerHeight),
+        false,
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NavFlattened);
 
     if (m_multiplayerUiTab == 0)
     {
@@ -314,8 +402,11 @@ void ModMain::DrawMultiplayerUi()
 
         ImGui::SetNextItemWidth(300.0f);
         ImGui::InputTextWithHint("##server_search", "Search servers", &m_serverSearch);
+        trackUiItem("server_search");
         ImGui::SameLine();
-        if (ImGui::Button("REFRESH", ImVec2(110.0f, 30.0f)))
+        const bool refreshPressed = ImGui::Button("REFRESH", ImVec2(110.0f, 30.0f));
+        trackUiItem("server_refresh");
+        if (refreshPressed)
             RefreshServerBrowser();
         ImGui::SameLine(0.0f, 26.0f);
         const char* filters[] = {"ALL", "LAN", "FAVORITES", "RECENT"};
@@ -326,14 +417,20 @@ void ModMain::DrawMultiplayerUi()
             const bool selected = m_serverBrowserFilter == filter;
             if (selected)
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.46f, 0.47f, 1.0f));
-            if (ImGui::SmallButton(filters[filter]))
+            const bool filterPressed = ImGui::SmallButton(filters[filter]);
+            trackUiItem("server_filter_" + std::to_string(filter));
+            if (filterPressed)
                 m_serverBrowserFilter = filter;
             if (selected)
                 ImGui::PopStyleColor();
         }
 
         const float detailsWidth = std::clamp(ImGui::GetContentRegionAvail().x * 0.31f, 300.0f, 420.0f);
-        ImGui::BeginChild("server_list", ImVec2(-detailsWidth - 18.0f, 0.0f), true);
+        ImGui::BeginChild(
+            "server_list",
+            ImVec2(-detailsWidth - 18.0f, 0.0f),
+            true,
+            ImGuiWindowFlags_NavFlattened);
         DrawSectionLabel("SERVERS");
         int visibleServers = 0;
         for (size_t index = 0; index < m_serverBrowserEntries.size(); ++index)
@@ -354,7 +451,9 @@ void ModMain::DrawMultiplayerUi()
             ++visibleServers;
             const bool selected = m_selectedServerIndex == static_cast<int>(index);
             ImGui::PushID(static_cast<int>(index));
-            if (ImGui::Selectable("##server_row", selected, 0, ImVec2(0.0f, 66.0f)))
+            const bool serverPressed = ImGui::Selectable("##server_row", selected, 0, ImVec2(0.0f, 66.0f));
+            trackUiItem("server_row_" + std::to_string(index));
+            if (serverPressed)
                 m_selectedServerIndex = static_cast<int>(index);
             const ImVec2 rowMin = ImGui::GetItemRectMin();
             ImDrawList* draw = ImGui::GetWindowDrawList();
@@ -374,7 +473,11 @@ void ModMain::DrawMultiplayerUi()
         ImGui::EndChild();
 
         ImGui::SameLine();
-        ImGui::BeginChild("server_details", ImVec2(0.0f, 0.0f), true);
+        ImGui::BeginChild(
+            "server_details",
+            ImVec2(0.0f, 0.0f),
+            true,
+            ImGuiWindowFlags_NavFlattened);
         DrawSectionLabel("SERVER DETAILS");
         ServerBrowserEntry* selected = m_selectedServerIndex >= 0 && m_selectedServerIndex < static_cast<int>(m_serverBrowserEntries.size())
             ? &m_serverBrowserEntries[static_cast<size_t>(m_selectedServerIndex)]
@@ -395,12 +498,15 @@ void ModMain::DrawMultiplayerUi()
             {
                 ImGui::SetNextItemWidth(-1.0f);
                 ImGui::InputText("##join_password", &m_joinPassword, ImGuiInputTextFlags_Password);
+                trackUiItem("join_password");
             }
             const bool serverOnline = selected->lastSeenTime >= 0.0f && selected->modBuild == CoopProtocol::kModBuild;
             ImGui::BeginDisabled(!offline || !serverOnline || (selected->maxPlayers > 0 && selected->playerCount >= selected->maxPlayers));
-            if (focusTabPrimaryCommand)
+            if (focusTabPrimaryCommand && offline)
                 ImGui::SetKeyboardFocusHere();
-            if (ImGui::Button("JOIN SERVER", ImVec2(-1.0f, 38.0f)))
+            const bool joinPressed = ImGui::Button("JOIN SERVER", ImVec2(-1.0f, 38.0f));
+            trackUiItem("join_server");
+            if (joinPressed)
             {
                 m_hostAddress = address;
                 m_networkPort = selected->port;
@@ -423,7 +529,9 @@ void ModMain::DrawMultiplayerUi()
             {
                 return BookmarkMatches(bookmark, address, selected->port);
             });
-            if (ImGui::Button(favorite ? "REMOVE FAVORITE" : "ADD FAVORITE", ImVec2(-1.0f, 32.0f)))
+            const bool favoritePressed = ImGui::Button(favorite ? "REMOVE FAVORITE" : "ADD FAVORITE", ImVec2(-1.0f, 32.0f));
+            trackUiItem("server_favorite");
+            if (favoritePressed)
             {
                 identity.favoriteServers.erase(
                     std::remove_if(identity.favoriteServers.begin(), identity.favoriteServers.end(), [&](const CoopServerBookmark& bookmark)
@@ -446,9 +554,11 @@ void ModMain::DrawMultiplayerUi()
         DrawSectionLabel("DIRECT CONNECT");
         ImGui::SetNextItemWidth(-92.0f);
         ImGui::InputText("##direct_address", &m_hostAddress);
+        trackUiItem("direct_address");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(80.0f);
         ImGui::InputInt("##direct_port", &m_networkPort, 0, 0);
+        trackUiItem("direct_port");
         m_networkPort = std::clamp(m_networkPort, 1, 65535);
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::InputTextWithHint(
@@ -456,11 +566,14 @@ void ModMain::DrawMultiplayerUi()
             "Password (optional)",
             &m_joinPassword,
             ImGuiInputTextFlags_Password);
+        trackUiItem("direct_password");
         const bool validEndpoint = IsValidIpv4Address(m_hostAddress);
         ImGui::BeginDisabled(!offline || !validEndpoint);
         if (focusTabPrimaryCommand && !selected)
             ImGui::SetKeyboardFocusHere();
-        if (ImGui::Button("CONNECT", ImVec2(-1.0f, 34.0f)))
+        const bool connectPressed = ImGui::Button("CONNECT", ImVec2(-1.0f, 34.0f));
+        trackUiItem("connect");
+        if (connectPressed)
         {
             SavePersistentConfig("direct connect");
             m_lastUiNetworkMode = CoopNetworkMode::Client;
@@ -472,16 +585,22 @@ void ModMain::DrawMultiplayerUi()
     else if (m_multiplayerUiTab == 1)
     {
         const float settingsWidth = std::clamp(ImGui::GetContentRegionAvail().x * 0.55f, 480.0f, 720.0f);
-        ImGui::BeginChild("host_settings", ImVec2(settingsWidth, 0.0f), true);
+        ImGui::BeginChild(
+            "host_settings",
+            ImVec2(settingsWidth, 0.0f),
+            true,
+            ImGuiWindowFlags_NavFlattened);
         DrawSectionLabel("HOST SETTINGS");
         const bool canEditHostSettings = offline || m_networkMode == CoopNetworkMode::Host;
         bool hostSettingsChanged = false;
         ImGui::BeginDisabled(!canEditHostSettings);
         ImGui::SetNextItemWidth(-1.0f);
         hostSettingsChanged |= ImGui::InputText("Server name", &m_serverName);
+        trackUiItem("host_name");
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::BeginDisabled(!offline);
         hostSettingsChanged |= ImGui::InputInt("Port", &m_networkPort, 0, 0);
+        trackUiItem("host_port");
         ImGui::EndDisabled();
         m_networkPort = std::clamp(m_networkPort, 1, 65535);
         const int minimumPlayers = m_networkMode == CoopNetworkMode::Host
@@ -493,7 +612,9 @@ void ModMain::DrawMultiplayerUi()
             hostSettingsChanged = true;
         }
         hostSettingsChanged |= ImGui::SliderInt("Max players", &m_maxSessionPlayers, minimumPlayers, 16);
+        trackUiItem("host_max_players");
         hostSettingsChanged |= ImGui::Checkbox("Visible on LAN", &m_serverLanVisible);
+        trackUiItem("host_lan_visible");
         const char* accessModes[] = {"OPEN", "PASSWORD", "ALLOWLIST", "FRIENDS"};
         ImGui::TextUnformatted("Access");
         for (int mode = 0; mode < 4; ++mode)
@@ -504,7 +625,9 @@ void ModMain::DrawMultiplayerUi()
             if (selected)
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.46f, 0.47f, 1.0f));
             ImGui::BeginDisabled(mode == 3);
-            if (ImGui::SmallButton(accessModes[mode]))
+            const bool accessPressed = ImGui::SmallButton(accessModes[mode]);
+            trackUiItem("host_access_" + std::to_string(mode));
+            if (accessPressed)
             {
                 m_serverAccessMode = mode;
                 hostSettingsChanged = true;
@@ -517,18 +640,22 @@ void ModMain::DrawMultiplayerUi()
         {
             ImGui::SetNextItemWidth(-1.0f);
             hostSettingsChanged |= ImGui::InputText("Password", &m_serverPassword, ImGuiInputTextFlags_Password);
+            trackUiItem("host_password");
         }
         else if (m_serverAccessMode == 2)
         {
             ImGui::SetNextItemWidth(-1.0f);
             hostSettingsChanged |= ImGui::InputText("Player account tokens", &m_serverAllowlist);
+            trackUiItem("host_allowlist");
         }
         else if (m_serverAccessMode == 3)
         {
             ImGui::TextColored(ImVec4(0.92f, 0.62f, 0.24f, 1.0f), "Platform friends provider unavailable");
         }
         bool friendlyFire = identity.friendlyFire;
-        if (ImGui::Checkbox("Friendly fire", &friendlyFire))
+        const bool friendlyFirePressed = ImGui::Checkbox("Friendly fire", &friendlyFire);
+        trackUiItem("host_friendly_fire");
+        if (friendlyFirePressed)
         {
             identity.friendlyFire = friendlyFire;
             hostSettingsChanged = true;
@@ -538,13 +665,15 @@ void ModMain::DrawMultiplayerUi()
             SavePersistentConfig(m_networkMode == CoopNetworkMode::Host ? "live host settings" : "host settings");
 
         ImGui::Spacing();
-        if (focusTabPrimaryCommand)
+        if (focusTabPrimaryCommand && (offline || m_networkMode == CoopNetworkMode::Host))
             ImGui::SetKeyboardFocusHere();
         if (offline)
         {
             ImGui::BeginDisabled(m_serverAccessMode == 3 || (m_serverAccessMode == 1 && m_serverPassword.empty()) ||
                 (m_serverAccessMode == 2 && m_serverAllowlist.empty()));
-            if (ImGui::Button("START HOSTING##host_primary", ImVec2(220.0f, 42.0f)))
+            const bool startHostingPressed = ImGui::Button("START HOSTING###host_primary", ImVec2(220.0f, 42.0f));
+            trackUiItem("host_primary");
+            if (startHostingPressed)
             {
                 SavePersistentConfig("host game");
                 m_lastUiNetworkMode = CoopNetworkMode::Host;
@@ -552,14 +681,21 @@ void ModMain::DrawMultiplayerUi()
             }
             ImGui::EndDisabled();
         }
-        else if (m_networkMode == CoopNetworkMode::Host && ImGui::Button("STOP HOSTING##host_primary", ImVec2(220.0f, 42.0f)))
+        else if (m_networkMode == CoopNetworkMode::Host)
         {
-            StopNetwork();
+            const bool stopHostingPressed = ImGui::Button("STOP HOSTING###host_primary", ImVec2(220.0f, 42.0f));
+            trackUiItem("host_primary");
+            if (stopHostingPressed)
+                StopNetwork();
         }
         ImGui::EndChild();
 
         ImGui::SameLine();
-        ImGui::BeginChild("host_roster", ImVec2(0.0f, 0.0f), true);
+        ImGui::BeginChild(
+            "host_roster",
+            ImVec2(0.0f, 0.0f),
+            true,
+            ImGuiWindowFlags_NavFlattened);
         DrawSectionLabel("SESSION ROSTER");
         ImGui::TextColored(ImVec4(0.44f, 0.86f, 0.58f, 1.0f), "%s", GetLocalUsername().c_str());
         ImGui::SameLine();
@@ -574,7 +710,9 @@ void ModMain::DrawMultiplayerUi()
             {
                 ImGui::SameLine(ImGui::GetWindowWidth() - 82.0f);
                 ImGui::BeginDisabled(m_multiplayerKickRequestedToken != 0);
-                if (ImGui::SmallButton("KICK"))
+                const bool kickPressed = ImGui::SmallButton("KICK");
+                trackUiItem("host_kick_" + FormatAccountToken(peer.accountToken));
+                if (kickPressed)
                     m_multiplayerKickRequestedToken = peer.accountToken;
                 ImGui::EndDisabled();
             }
@@ -587,7 +725,11 @@ void ModMain::DrawMultiplayerUi()
     else if (m_multiplayerUiTab == 2)
     {
         EnsurePlayerPortraitTextures();
-        ImGui::BeginChild("profile_identity", ImVec2(410.0f, 0.0f), true);
+        ImGui::BeginChild(
+            "profile_identity",
+            ImVec2(410.0f, 0.0f),
+            true,
+            ImGuiWindowFlags_NavFlattened);
         DrawSectionLabel("PLAYER PROFILE");
         const ImVec2 portraitMin = ImGui::GetCursorScreenPos();
         const ImVec2 portraitMax(portraitMin.x + 128.0f, portraitMin.y + 128.0f);
@@ -607,13 +749,19 @@ void ModMain::DrawMultiplayerUi()
         ImGui::BeginDisabled(!offline);
         ImGui::TextDisabled("USERNAME");
         ImGui::SetNextItemWidth(-1.0f);
-        if (ImGui::InputText("##profile_username", &m_localUsername))
+        if (focusTabPrimaryCommand && offline)
+            ImGui::SetKeyboardFocusHere();
+        const bool usernameChanged = ImGui::InputText("##profile_username", &m_localUsername);
+        trackUiItem("profile_username");
+        if (usernameChanged)
             m_localUsername = SanitizeUsername(m_localUsername);
         const char* strategies[] = {"Generated UUID", "Platform account", "Custom profile"};
         int strategy = identity.accountStrategy == "steam" ? 1 : (identity.accountStrategy == "custom" ? 2 : 0);
         ImGui::TextDisabled("ACCOUNT MODE");
         ImGui::SetNextItemWidth(-1.0f);
-        if (ImGui::Combo("##profile_account_mode", &strategy, strategies, 3))
+        const bool strategyChanged = ImGui::Combo("##profile_account_mode", &strategy, strategies, 3);
+        trackUiItem("profile_account_mode");
+        if (strategyChanged)
         {
             if (strategy == 1 && !m_detectedPlatformAccountId.empty())
             {
@@ -635,19 +783,26 @@ void ModMain::DrawMultiplayerUi()
         ImGui::SetNextItemWidth(-1.0f);
         ImGui::BeginDisabled(strategy != 2);
         ImGui::InputText("##profile_id", &identity.accountId);
+        trackUiItem("profile_id");
         ImGui::EndDisabled();
         ImGui::EndDisabled();
         ImGui::TextDisabled("%s", FormatAccountToken(GetLocalAccountToken()).c_str());
         if (!m_detectedPlatformAccountId.empty())
             ImGui::TextDisabled("Platform detected");
         ImGui::BeginDisabled(!offline);
-        if (ImGui::Button("SAVE PROFILE", ImVec2(-1.0f, 36.0f)))
+        const bool saveProfilePressed = ImGui::Button("SAVE PROFILE", ImVec2(-1.0f, 36.0f));
+        trackUiItem("profile_save");
+        if (saveProfilePressed)
             SavePersistentConfig("profile save");
         ImGui::EndDisabled();
         ImGui::EndChild();
 
         ImGui::SameLine();
-        ImGui::BeginChild("profile_models", ImVec2(0.0f, 0.0f), true);
+        ImGui::BeginChild(
+            "profile_models",
+            ImVec2(0.0f, 0.0f),
+            true,
+            ImGuiWindowFlags_NavFlattened);
         DrawSectionLabel("PLAYER MODEL");
         int selectedModel = 0;
         for (size_t index = 0; index < kPlayerModels.size(); ++index)
@@ -665,7 +820,9 @@ void ModMain::DrawMultiplayerUi()
             if (selected)
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.63f, 0.39f, 0.10f, 1.0f));
             ImGui::BeginDisabled(!offline);
-            if (ImGui::Button(kPlayerModels[static_cast<size_t>(index)].label, ImVec2(modelWidth, 118.0f)))
+            const bool modelPressed = ImGui::Button(kPlayerModels[static_cast<size_t>(index)].label, ImVec2(modelWidth, 118.0f));
+            trackUiItem("profile_model_" + std::to_string(index));
+            if (modelPressed)
             {
                 identity.selectedModelArchetypeId = kPlayerModels[static_cast<size_t>(index)].archetypeId;
                 SavePersistentConfig("player model selection");
@@ -687,7 +844,11 @@ void ModMain::DrawMultiplayerUi()
     }
     else
     {
-        ImGui::BeginChild("session_summary", ImVec2(430.0f, 0.0f), true);
+        ImGui::BeginChild(
+            "session_summary",
+            ImVec2(430.0f, 0.0f),
+            true,
+            ImGuiWindowFlags_NavFlattened);
         DrawSectionLabel("CURRENT SESSION");
         ImGui::SetWindowFontScale(1.25f);
         ImGui::TextUnformatted(m_networkMode == CoopNetworkMode::Host
@@ -705,7 +866,9 @@ void ModMain::DrawMultiplayerUi()
         {
             if (focusTabPrimaryCommand)
                 ImGui::SetKeyboardFocusHere();
-            if (ImGui::Button("LEAVE SESSION", ImVec2(-1.0f, 42.0f)))
+            const bool leavePressed = ImGui::Button("LEAVE SESSION", ImVec2(-1.0f, 42.0f));
+            trackUiItem("session_leave");
+            if (leavePressed)
                 m_multiplayerLeaveRequested = true;
         }
         else
@@ -713,16 +876,22 @@ void ModMain::DrawMultiplayerUi()
             ImGui::TextDisabled("No active multiplayer session");
             if (focusTabPrimaryCommand && m_lastUiNetworkMode == CoopNetworkMode::Client)
                 ImGui::SetKeyboardFocusHere();
-            if (m_lastUiNetworkMode == CoopNetworkMode::Client &&
-                ImGui::Button("RECONNECT", ImVec2(-1.0f, 38.0f)))
+            if (m_lastUiNetworkMode == CoopNetworkMode::Client)
             {
-                StartClient();
+                const bool reconnectPressed = ImGui::Button("RECONNECT", ImVec2(-1.0f, 38.0f));
+                trackUiItem("session_reconnect");
+                if (reconnectPressed)
+                    StartClient();
             }
         }
         ImGui::EndChild();
 
         ImGui::SameLine();
-        ImGui::BeginChild("session_roster", ImVec2(0.0f, 0.0f), true);
+        ImGui::BeginChild(
+            "session_roster",
+            ImVec2(0.0f, 0.0f),
+            true,
+            ImGuiWindowFlags_NavFlattened);
         DrawSectionLabel("PLAYERS");
         ImGui::TextColored(ImVec4(0.44f, 0.86f, 0.58f, 1.0f), "%s", GetLocalUsername().c_str());
         ImGui::SameLine();
@@ -743,7 +912,9 @@ void ModMain::DrawMultiplayerUi()
             {
                 ImGui::SameLine(ImGui::GetWindowWidth() - 82.0f);
                 ImGui::BeginDisabled(m_multiplayerKickRequestedToken != 0);
-                if (ImGui::SmallButton("KICK"))
+                const bool kickPressed = ImGui::SmallButton("KICK");
+                trackUiItem("session_kick_" + FormatAccountToken(peer.accountToken));
+                if (kickPressed)
                     m_multiplayerKickRequestedToken = peer.accountToken;
                 ImGui::EndDisabled();
             }
@@ -783,7 +954,9 @@ void ModMain::DrawMultiplayerUi()
             ImGui::ProgressBar(-0.25f * static_cast<float>(ImGui::GetFrameCount() % 8), ImVec2(-1.0f, 8.0f), "");
             ImGui::TextWrapped("%s", m_sessionStatus.c_str());
             ImGui::TextDisabled("%s:%d", m_hostAddress.c_str(), m_networkPort);
-            if (ImGui::Button("CANCEL", ImVec2(-1.0f, 34.0f)))
+            const bool cancelPressed = ImGui::Button("CANCEL", ImVec2(-1.0f, 34.0f));
+            trackUiItem("join_cancel");
+            if (cancelPressed)
             {
                 StopNetwork();
                 ImGui::CloseCurrentPopup();
