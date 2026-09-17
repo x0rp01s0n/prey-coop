@@ -2,7 +2,7 @@
 <Mod
     modName="CoopPrototype"
     displayName="Coop Prototype"
-    version="0.1.0"
+    version="0.2.3"
     author="null234"
     dllName="CoopPrototype.dll"
     hasXML="false"
