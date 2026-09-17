@@ -35,6 +35,10 @@ auto s_hookCArkBreakableSetHealth = CArkBreakable::FSetHealth.MakeHook();
 auto s_hookCEntitySetBreakableGlass = CEntity::FSetBreakableGlass.MakeHook();
 auto s_hookCActionGameOnCollisionLoggedBreakable =
     CActionGame::FOnCollisionLogged_Breakable.MakeHook();
+auto s_hookCActionGameImpactBreaksGlass =
+    CActionGame::FImpactBreaksGlass.MakeHook();
+
+thread_local int s_lastImpactBreaksGlassDecision = -1;
 
 struct RegisteredBreakableGlass
 {
@@ -633,10 +637,42 @@ void CActionGame_OnCollisionLogged_Breakable_Hook(const EventPhys* event)
         s_breakableGlassCollisionCapture;
     s_breakableGlassCollisionCapture = {};
     s_breakableGlassCollisionCapture.active = collisionOk;
+    s_lastImpactBreaksGlassDecision = -1;
     s_hookCActionGameOnCollisionLoggedBreakable.InvokeOrig(event);
-    const BreakableGlassCollisionCapture captured =
+    BreakableGlassCollisionCapture captured =
         s_breakableGlassCollisionCapture;
     s_breakableGlassCollisionCapture = previousCapture;
+
+    // SetBreakableGlass identifies the pane on its first fracture. Later
+    // impacts on the already-created shards reuse that registered glass node
+    // without calling SetBreakableGlass again, so recover it from the target
+    // physics entity after Vanilla accepts the impact.
+    if (collisionOk && s_lastImpactBreaksGlassDecision == 1 &&
+        captured.entityId == INVALID_ENTITYID)
+    {
+        for (int side = 0; side < 2; ++side)
+        {
+            IEntity* candidate = ResolveGlassPhysicsEntity(collision.pEntity[side]);
+            if (!candidate)
+                continue;
+            const auto registered = s_registeredBreakableGlass.find(candidate->GetId());
+            if (registered == s_registeredBreakableGlass.end() ||
+                registered->second.stableId == 0 ||
+                registered->second.slots.empty())
+            {
+                continue;
+            }
+
+            captured.entityId = candidate->GetId();
+            captured.stableId = registered->second.stableId;
+            const int partId = collision.partid[side];
+            captured.slot = registered->second.slots.find(partId) !=
+                    registered->second.slots.end()
+                ? partId
+                : *registered->second.slots.begin();
+            break;
+        }
+    }
 
     if (gMod && collisionOk && captured.entityId != INVALID_ENTITYID &&
         captured.stableId != 0 && captured.slot >= 0)
@@ -658,6 +694,16 @@ void CActionGame_OnCollisionLogged_Breakable_Hook(const EventPhys* event)
         }
     }
 }
+
+bool CActionGame_ImpactBreaksGlass_Hook(
+    const EventPhysCollision& collision,
+    const ISurfaceType* surfaceType)
+{
+    const bool result = s_hookCActionGameImpactBreaksGlass.InvokeOrig(
+        collision, surfaceType);
+    s_lastImpactBreaksGlassDecision = result ? 1 : 0;
+    return result;
+}
 }
 
 void ModMain::InitBreakableSyncHooks()
@@ -666,6 +712,8 @@ void ModMain::InitBreakableSyncHooks()
     s_hookCEntitySetBreakableGlass.SetHookFunc(&CEntity_SetBreakableGlass_Hook);
     s_hookCActionGameOnCollisionLoggedBreakable.SetHookFunc(
         &CActionGame_OnCollisionLogged_Breakable_Hook);
+    s_hookCActionGameImpactBreaksGlass.SetHookFunc(
+        &CActionGame_ImpactBreaksGlass_Hook);
 }
 
 void ModMain::OnNativeBreakableHealthChanged(
@@ -738,8 +786,11 @@ void ModMain::OnNativeBreakableGlassImpact(
     int glassSlot)
 {
     ++m_breakableGlassHookCalls;
-    if (m_applyingRemoteAreaObjectEvent ||
-        m_saveLoadGuardActive || m_arkLevelTransitionLoadActive ||
+    // A replay intentionally re-enters Vanilla's glass hook. It is an echo
+    // suppression path, not a dropped local impact.
+    if (m_applyingRemoteAreaObjectEvent)
+        return;
+    if (m_saveLoadGuardActive || m_arkLevelTransitionLoadActive ||
         IsPostLoadNativeQuarantineActive() ||
         m_networkMode == CoopNetworkMode::Off || !IsSessionGameplayReady() ||
         targetGuid == 0 || glassSide < 0 || glassSide > 1 ||
@@ -809,6 +860,13 @@ void ModMain::OnNativeBreakableGlassImpact(
         "queued_guid_" + std::to_string(targetGuid) +
         "_side_" + std::to_string(glassSide) +
         "_slot_" + std::to_string(glassSlot) +
+        "_accepted_" + std::to_string(s_lastImpactBreaksGlassDecision) +
+        "_foreign_" + std::to_string(collision.iForeignData[0]) + "," +
+            std::to_string(collision.iForeignData[1]) +
+        "_part_" + std::to_string(collision.partid[0]) + "," +
+            std::to_string(collision.partid[1]) +
+        "_material_" + std::to_string(collision.idmat[0]) + "," +
+            std::to_string(collision.idmat[1]) +
         "_point_" + std::to_string(collision.pt.x) + "," +
             std::to_string(collision.pt.y) + "," +
             std::to_string(collision.pt.z);
@@ -905,41 +963,20 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
         return false;
     }
 
-    IEntity* sourceEntity = nullptr;
-    if (packet.sourcePeerHash == GetLocalAccountToken())
-    {
-        sourceEntity = ArkPlayer::GetInstancePtr()
-            ? ArkPlayer::GetInstance().GetEntity()
-            : nullptr;
-    }
-    else
-    {
-        const auto sourcePeerIt = m_remotePeers.find(packet.sourcePeerHash);
-        if (sourcePeerIt != m_remotePeers.end() &&
-            sourcePeerIt->second.proxyEntityId != INVALID_ENTITYID)
-        {
-            sourceEntity = gEnv->pEntitySystem->GetEntity(sourcePeerIt->second.proxyEntityId);
-        }
-        if (!sourceEntity)
-            sourceEntity = GetProxyEntity();
-    }
-
     EventPhysCollision collision;
+    collision.deferredResult = 0;
     collision.pEntity[glassSide] = targetPhysics;
     collision.pForeignData[glassSide] = targetEntity;
     collision.iForeignData[glassSide] = PHYS_FOREIGN_ID_ENTITY;
-    if (sourceEntity && sourceEntity->GetPhysics())
-    {
-        collision.pEntity[sourceSide] = sourceEntity->GetPhysics();
-        collision.pForeignData[sourceSide] = sourceEntity;
-        collision.iForeignData[sourceSide] = PHYS_FOREIGN_ID_ENTITY;
-    }
-    else
-    {
-        collision.pEntity[sourceSide] = WORLD_ENTITY;
-        collision.pForeignData[sourceSide] = nullptr;
-        collision.iForeignData[sourceSide] = -1;
-    }
+    // The remote player's proxy is not the weapon body that made the native
+    // impact. CryEngine reserves this foreign id for reconstructed events and
+    // accepts it without dereferencing or class-checking a synthetic collider.
+    collision.pEntity[sourceSide] = nullptr;
+    collision.pForeignData[sourceSide] = nullptr;
+    collision.iForeignData[sourceSide] = PHYS_FOREIGN_ID_ARK_SERIALIZED_EVENT;
+    collision.idCollider = collision.pEntity[1] == WORLD_ENTITY
+        ? 0
+        : static_cast<int>(targetEntity->GetId());
     collision.pt = Vec3(wire.point[0], wire.point[1], wire.point[2]);
     collision.n = Vec3(wire.normal[0], wire.normal[1], wire.normal[2]);
     for (int side = 0; side < 2; ++side)
@@ -957,13 +994,15 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
     collision.normImpulse = DecodeGlassHalf(wire.normalImpulse);
     collision.radius = DecodeGlassHalf(wire.radius);
 
-    if (!CoopRuntimeGuards::TryGuardedVoidCall(
-            "breakable glass apply native collision",
+    s_lastImpactBreaksGlassDecision = -1;
+    const bool applied = CoopRuntimeGuards::TryGuardedVoidCall(
+            "breakable glass apply native serialized collision",
             [&collision]()
             {
                 CActionGame::OnCollisionLogged_Breakable(&collision);
             },
-            &reason))
+            &reason);
+    if (!applied)
     {
         ++m_breakableGlassEventSkips;
         detail = "breakable_glass_native_apply_failed_guid_" +
@@ -976,7 +1015,17 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
     m_lastBreakableGlassEvent =
         "applied_guid_" + std::to_string(packet.targetGuid) +
         "_side_" + std::to_string(glassSide) +
-        "_slot_" + std::to_string(packet.value);
+        "_slot_" + std::to_string(packet.value) +
+        "_accepted_" + std::to_string(s_lastImpactBreaksGlassDecision) +
+        "_foreign_" + std::to_string(collision.iForeignData[0]) + "," +
+            std::to_string(collision.iForeignData[1]) +
+        "_part_" + std::to_string(collision.partid[0]) + "," +
+            std::to_string(collision.partid[1]) +
+        "_material_" + std::to_string(collision.idmat[0]) + "," +
+            std::to_string(collision.idmat[1]) +
+        "_point_" + std::to_string(collision.pt.x) + "," +
+            std::to_string(collision.pt.y) + "," +
+            std::to_string(collision.pt.z);
     detail = m_lastBreakableGlassEvent;
     return true;
 }
