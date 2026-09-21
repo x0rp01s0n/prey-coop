@@ -4357,6 +4357,7 @@ void ModMain::QueuePlayerSidecarInventoryRestore(
             m_pendingPlayerSidecarInventorySaveKey == "unknown_save"))
     {
         m_pendingPlayerSidecarInventoryItems.clear();
+        m_pendingPlayerSidecarDetachedItemIds.clear();
         m_pendingPlayerSidecarInventoryRestore = false;
         m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
         m_pendingPlayerSidecarEquippedWeaponArchetypeId = 0;
@@ -4388,6 +4389,29 @@ bool ModMain::TryRestorePendingPlayerSidecarInventory(const char* reason, bool n
 {
     if (!m_pendingPlayerSidecarInventoryRestore)
         return true;
+
+    const auto removeDetachedItems = [this]() -> bool
+    {
+        std::vector<EntityId> remainingDetachedItems;
+        remainingDetachedItems.reserve(m_pendingPlayerSidecarDetachedItemIds.size());
+        for (EntityId itemId : m_pendingPlayerSidecarDetachedItemIds)
+        {
+            if (!RemoveCoopEntityGuarded(itemId, true, "sidecar inventory replace detached item"))
+                remainingDetachedItems.push_back(itemId);
+        }
+        m_pendingPlayerSidecarDetachedItemIds.swap(remainingDetachedItems);
+        if (!m_pendingPlayerSidecarDetachedItemIds.empty())
+        {
+            m_lastPlayerSidecarEvent = "inventory restore waiting: detached item removal pending=" +
+                std::to_string(m_pendingPlayerSidecarDetachedItemIds.size());
+            LogCoop(m_lastPlayerSidecarEvent);
+            return false;
+        }
+        return true;
+    };
+
+    if (!removeDetachedItems())
+        return false;
 
     if (m_pendingPlayerSidecarInventoryHostAccountToken != 0 &&
         (m_networkMode != CoopNetworkMode::Client ||
@@ -4450,6 +4474,33 @@ bool ModMain::TryRestorePendingPlayerSidecarInventory(const char* reason, bool n
             return false;
         }
 
+        std::vector<EntityId> storedItemIds;
+        bool capturedStoredItems = false;
+        if (!TryGuardedCall(
+                "coop inventory restore stored item ids",
+                [&]() -> bool
+                {
+                    storedItemIds.reserve(inventory->m_storedItems.size());
+                    for (const ArkInventory::StorageCell& cell : inventory->m_storedItems)
+                    {
+                        const EntityId itemId = static_cast<EntityId>(cell.m_entityId);
+                        if (itemId != INVALID_ENTITYID &&
+                            std::find(storedItemIds.begin(), storedItemIds.end(), itemId) == storedItemIds.end())
+                        {
+                            storedItemIds.push_back(itemId);
+                        }
+                    }
+                    return true;
+                },
+                capturedStoredItems,
+                &guardReason) ||
+            !capturedStoredItems)
+        {
+            m_lastPlayerSidecarEvent = "inventory restore waiting: stored item capture failed: " + guardReason;
+            LogCoop(m_lastPlayerSidecarEvent);
+            return false;
+        }
+
         // Tear down equipped weapons before deleting their inventory owners.
         // Reversing this order leaves the Host-save reticle/attachment alive
         // while the Client inventory is already empty, and later pickups can
@@ -4475,6 +4526,13 @@ bool ModMain::TryRestorePendingPlayerSidecarInventory(const char* reason, bool n
 
         if (!nativeRestoreWindow)
             LogCoop("inventory restore used guarded runtime clear");
+
+        // RemoveAllItems only releases the inventory cells. The old item
+        // entities otherwise survive as ownerless world pickups while the
+        // authoritative copies are created below.
+        m_pendingPlayerSidecarDetachedItemIds = std::move(storedItemIds);
+        if (!removeDetachedItems())
+            return false;
 
         m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
         m_playerSidecarInventoryApplied = 0;

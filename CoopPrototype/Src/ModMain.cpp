@@ -26645,6 +26645,7 @@ void ModMain::EndCoopLoadGuard(const char* reason)
         m_pendingPlayerSidecarInventoryRestore = false;
         m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
         m_pendingPlayerSidecarInventoryItems.clear();
+        m_pendingPlayerSidecarDetachedItemIds.clear();
         m_pendingPlayerSidecarEquippedWeaponArchetypeId = 0;
         m_pendingPlayerSidecarQuickSelect.clear();
         m_pendingPlayerSidecarHasQuickSelect = false;
@@ -49713,6 +49714,7 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
         m_pendingPlayerSidecarInventoryRestore = false;
         m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
         m_pendingPlayerSidecarInventoryItems.clear();
+        m_pendingPlayerSidecarDetachedItemIds.clear();
         m_pendingPlayerSidecarEquippedWeaponArchetypeId = 0;
         m_pendingPlayerSidecarQuickSelect.clear();
         m_pendingPlayerSidecarHasQuickSelect = false;
@@ -53521,6 +53523,7 @@ void ModMain::StopNetwork()
     m_pendingPlayerSidecarInventoryRestore = false;
     m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
     m_pendingPlayerSidecarInventoryItems.clear();
+    m_pendingPlayerSidecarDetachedItemIds.clear();
     m_pendingPlayerSidecarEquippedWeaponArchetypeId = 0;
     m_pendingPlayerSidecarQuickSelect.clear();
     m_pendingPlayerSidecarHasQuickSelect = false;
@@ -73697,6 +73700,7 @@ bool ModMain::TryLoadHostWorldSave(const CoopProtocol::WorldSyncPacket& packet)
     m_pendingPlayerSidecarInventoryRestore = false;
     m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
     m_pendingPlayerSidecarInventoryItems.clear();
+    m_pendingPlayerSidecarDetachedItemIds.clear();
     m_pendingPlayerSidecarEquippedWeaponArchetypeId = 0;
     m_pendingPlayerSidecarQuickSelect.clear();
     m_pendingPlayerSidecarHasQuickSelect = false;
@@ -74158,6 +74162,7 @@ bool ModMain::TryLoadReceivedHostSave()
     m_pendingPlayerSidecarInventoryRestore = false;
     m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
     m_pendingPlayerSidecarInventoryItems.clear();
+    m_pendingPlayerSidecarDetachedItemIds.clear();
     m_pendingPlayerSidecarEquippedWeaponArchetypeId = 0;
     m_pendingPlayerSidecarQuickSelect.clear();
     m_pendingPlayerSidecarHasQuickSelect = false;
@@ -75888,6 +75893,7 @@ bool ModMain::QueueAuthoritativePlayerInventoryRestore(const PlayerSidecarState&
     m_pendingPlayerSidecarInventoryRestore = false;
     m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
     m_pendingPlayerSidecarInventoryItems.clear();
+    m_pendingPlayerSidecarDetachedItemIds.clear();
     m_pendingPlayerSidecarEquippedWeaponArchetypeId = 0;
     m_pendingPlayerSidecarQuickSelect.clear();
     m_pendingPlayerSidecarHasQuickSelect = false;
@@ -75957,6 +75963,7 @@ bool ModMain::EnforceClientPlayerStateApplyInvariant(const char* reason)
     m_pendingPlayerSidecarInventoryRestore = false;
     m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
     m_pendingPlayerSidecarInventoryItems.clear();
+    m_pendingPlayerSidecarDetachedItemIds.clear();
     m_pendingPlayerSidecarEquippedWeaponArchetypeId = 0;
     m_pendingPlayerSidecarQuickSelect.clear();
     m_pendingPlayerSidecarHasQuickSelect = false;
@@ -76478,6 +76485,7 @@ bool ModMain::TryApplyReceivedPlayerStateTransfer(const char* reason)
             m_pendingPlayerSidecarInventoryRestore = false;
             m_pendingPlayerSidecarInventoryRestoreNeedsClear = false;
             m_pendingPlayerSidecarInventoryItems.clear();
+            m_pendingPlayerSidecarDetachedItemIds.clear();
             m_pendingPlayerSidecarEquippedWeaponArchetypeId = 0;
             m_pendingPlayerSidecarQuickSelect.clear();
             m_pendingPlayerSidecarHasQuickSelect = false;
