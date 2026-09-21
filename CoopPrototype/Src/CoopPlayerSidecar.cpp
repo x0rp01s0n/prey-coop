@@ -4031,8 +4031,13 @@ bool ModMain::ApplyLocalPlayerSidecar(const PlayerSidecarState& state, const cha
         }
     }
 
-    if (applyPosition && hasPlayerViewRotation && ShouldApplyPlayerSidecarViewRotation(player, playerViewRotation))
-        SetLocalPlayerViewRotationAfterTeleport(playerViewRotation);
+    if (applyPosition && hasPlayerViewRotation)
+    {
+        bool zeroG = false;
+        TryGuardedCall("sidecar view IsZeroG", [&player]() { return player.IsZeroG(); }, zeroG, nullptr);
+        if (!zeroG || ShouldApplyPlayerSidecarViewRotation(player, playerViewRotation))
+            SetLocalPlayerViewRotationAfterTeleport(playerViewRotation);
+    }
 
     if (applyPosition && useNativePlayerCapture && state.nativeCapture.stance > static_cast<int>(EStance::STANCE_NULL))
         SetLocalPlayerStanceSafe(state.nativeCapture.stance, "apply native player sidecar stance");
