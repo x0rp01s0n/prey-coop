@@ -30,6 +30,7 @@ constexpr uint64_t kDebugBreakableArchetype = 221ull;
 constexpr EntityGUID kDebugBreakableGuid = 0x434f4f5042524b31ull; // "COOPBRK1"
 constexpr uint64_t kDebugScalableBreakableArchetype = 10739735956144680886ull;
 constexpr EntityGUID kDebugScalableBreakableGuid = 0x434f4f5053424b31ull; // "COOPSBK1"
+constexpr uint32_t kBreakableGlassStaticTargetFlag = 1u << 1;
 
 auto s_hookCArkBreakableSetHealth = CArkBreakable::FSetHealth.MakeHook();
 auto s_hookCEntitySetBreakableGlass = CEntity::FSetBreakableGlass.MakeHook();
@@ -304,6 +305,91 @@ bool DecodeGlassPayload(std::string_view encoded, BreakableGlassImpactWire& payl
         return false;
     std::memcpy(&payload, bytes.data(), sizeof(payload));
     return true;
+}
+
+uint64_t BuildStaticBreakableGlassStableId(
+    const EventPhysCollision& collision,
+    int staticSide)
+{
+    uint64_t hash = 14695981039346656037ull;
+    auto mix64 = [&hash](uint64_t value)
+    {
+        for (int index = 0; index < 8; ++index)
+        {
+            hash ^= (value >> (index * 8)) & 0xffu;
+            hash *= 1099511628211ull;
+        }
+    };
+
+    mix64(0x53544154474c4153ull); // "STATGLAS"
+    for (int axis = 0; axis < 3; ++axis)
+    {
+        mix64(static_cast<uint64_t>(static_cast<int64_t>(
+            std::llround(collision.pt[axis] * 10.0f))));
+        mix64(static_cast<uint64_t>(static_cast<int64_t>(
+            std::llround(std::fabs(collision.n[axis]) * 100.0f))));
+    }
+    mix64(static_cast<uint16_t>(collision.idmat[staticSide]));
+    return hash == 0 ? 1 : hash;
+}
+
+bool ResolveStaticBreakableGlassTarget(
+    const Vec3& point,
+    const Vec3& normal,
+    ray_hit& hit,
+    std::string& reason)
+{
+    if (!gEnv || !gEnv->pPhysicalWorld)
+    {
+        reason = "missing_physical_world";
+        return false;
+    }
+
+    const Vec3 rayNormal = normal.GetNormalizedSafe(Vec3(0.0f, 1.0f, 0.0f));
+    for (float direction : {1.0f, -1.0f})
+    {
+        std::memset(&hit, 0, sizeof(hit));
+        const Vec3 origin = point + rayNormal * (0.35f * direction);
+        const Vec3 ray = rayNormal * (-0.7f * direction);
+        int hitCount = 0;
+        if (!CoopRuntimeGuards::TryGuardedCall(
+                "breakable glass static raycast",
+                [&]()
+                {
+                    return gEnv->pPhysicalWorld->RayWorldIntersection(
+                        origin,
+                        ray,
+                        ent_static,
+                        rwi_stop_at_pierceable | rwi_ignore_noncolliding,
+                        &hit,
+                        1,
+                        nullptr,
+                        0,
+                        nullptr,
+                        0,
+                        "CoopBreakableGlassReplay");
+                },
+                hitCount,
+                &reason) ||
+            hitCount <= 0 || !hit.pCollider)
+        {
+            continue;
+        }
+
+        int foreignType = -1;
+        if (CoopRuntimeGuards::TryGuardedCall(
+                "breakable glass static foreign type",
+                [&hit]() { return hit.pCollider->GetiForeignData(); },
+                foreignType,
+                &reason) &&
+            foreignType == PHYS_FOREIGN_ID_STATIC)
+        {
+            return true;
+        }
+    }
+
+    reason = "missing_static_glass_raycast_target";
+    return false;
 }
 
 IEntity* ResolveGlassPhysicsEntity(IPhysicalEntity* physics)
@@ -715,6 +801,21 @@ void CActionGame_OnCollisionLogged_Breakable_Hook(const EventPhys* event)
                 collision, captured.stableId, glassSide, captured.slot);
         }
     }
+    else if (gMod && collisionOk && s_lastImpactBreaksGlassDecision == 1)
+    {
+        for (int side = 0; side < 2; ++side)
+        {
+            if (collision.iForeignData[side] != PHYS_FOREIGN_ID_STATIC)
+                continue;
+            gMod->OnNativeBreakableGlassImpact(
+                collision,
+                BuildStaticBreakableGlassStableId(collision, side),
+                side,
+                0,
+                true);
+            break;
+        }
+    }
 }
 
 bool CActionGame_ImpactBreaksGlass_Hook(
@@ -805,7 +906,8 @@ void ModMain::OnNativeBreakableGlassImpact(
     const EventPhysCollision& collision,
     uint64_t targetGuid,
     int glassSide,
-    int glassSlot)
+    int glassSlot,
+    bool staticTarget)
 {
     ++m_breakableGlassHookCalls;
     // A replay intentionally re-enters Vanilla's glass hook. It is an echo
@@ -864,7 +966,8 @@ void ModMain::OnNativeBreakableGlassImpact(
             CoopProtocol::kAreaObjectEventBreakableGlassImpact,
             targetGuid,
             static_cast<uint16_t>(glassSlot),
-            static_cast<uint32_t>(glassSide),
+            static_cast<uint32_t>(glassSide) |
+                (staticTarget ? kBreakableGlassStaticTargetFlag : 0u),
             "CActionGame::OnCollisionLogged_Breakable",
             0,
             encoded.c_str()))
@@ -882,6 +985,7 @@ void ModMain::OnNativeBreakableGlassImpact(
         "queued_guid_" + std::to_string(targetGuid) +
         "_side_" + std::to_string(glassSide) +
         "_slot_" + std::to_string(glassSlot) +
+        "_static_" + std::to_string(staticTarget ? 1 : 0) +
         "_accepted_" + std::to_string(s_lastImpactBreaksGlassDecision) +
         "_foreign_" + std::to_string(collision.iForeignData[0]) + "," +
             std::to_string(collision.iForeignData[1]) +
@@ -898,7 +1002,8 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
     const CoopProtocol::AreaObjectEventPacket& packet,
     std::string& detail)
 {
-    if (packet.targetGuid == 0 || packet.flags > 1 ||
+    if (packet.targetGuid == 0 ||
+        (packet.flags & ~(kBreakableGlassStaticTargetFlag | 1u)) != 0 ||
         packet.targetClassHash != HashStoryString("BreakableGlass") ||
         std::memchr(packet.textValue, '\0', sizeof(packet.textValue)) == nullptr ||
         !gEnv || !gEnv->pEntitySystem)
@@ -922,10 +1027,13 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
         return false;
     }
 
+    const bool staticTarget =
+        (packet.flags & kBreakableGlassStaticTargetFlag) != 0;
     EntityId targetEntityId = INVALID_ENTITYID;
     IEntity* targetEntity = nullptr;
     std::string reason;
-    CoopRuntimeGuards::TryGuardedCall(
+    if (!staticTarget)
+        CoopRuntimeGuards::TryGuardedCall(
             "breakable glass apply FindEntityByGuid",
             [&packet]()
             {
@@ -934,7 +1042,7 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
             },
             targetEntityId,
             &reason);
-    if (targetEntityId != INVALID_ENTITYID)
+    if (!staticTarget && targetEntityId != INVALID_ENTITYID)
     {
         CoopRuntimeGuards::TryGuardedCall(
             "breakable glass apply GetEntity",
@@ -943,7 +1051,7 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
             &reason);
     }
 
-    if (!targetEntity)
+    if (!staticTarget && !targetEntity)
     {
         RefreshAllBreakableGlassRegistrations();
         for (auto it = s_registeredBreakableGlass.begin();
@@ -970,14 +1078,14 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
     // Dynamically spawned scene windows have no authored GUID and do not enter
     // CEntity's glass registry until their first native impact. Resolve their
     // deterministic name/class/position identity before replaying that impact.
-    if (!targetEntity)
+    if (!staticTarget && !targetEntity)
     {
         targetEntity = FindEntityByBreakableGlassStableId(packet.targetGuid);
         if (targetEntity)
             targetEntityId = targetEntity->GetId();
     }
 
-    if (!targetEntity)
+    if (!staticTarget && !targetEntity)
     {
         ++m_breakableGlassEventSkips;
         detail = "missing_breakable_glass_stable_id_" +
@@ -985,9 +1093,51 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
         return false;
     }
 
-    const int glassSide = static_cast<int>(packet.flags);
+    const int glassSide = static_cast<int>(packet.flags & 1u);
     const int sourceSide = 1 - glassSide;
-    IPhysicalEntity* targetPhysics = targetEntity->GetPhysics();
+    ray_hit staticHit;
+    std::memset(&staticHit, 0, sizeof(staticHit));
+    IPhysicalEntity* targetPhysics = nullptr;
+    void* targetForeignData = nullptr;
+    int targetForeignType = PHYS_FOREIGN_ID_ENTITY;
+    if (staticTarget)
+    {
+        if (!ResolveStaticBreakableGlassTarget(
+                Vec3(wire.point[0], wire.point[1], wire.point[2]),
+                Vec3(wire.normal[0], wire.normal[1], wire.normal[2]),
+                staticHit,
+                reason))
+        {
+            ++m_breakableGlassEventSkips;
+            detail = "missing_static_breakable_glass_guid_" +
+                std::to_string(packet.targetGuid) + "_reason_" +
+                BreakableStatusToken(reason);
+            return false;
+        }
+        targetPhysics = staticHit.pCollider;
+        targetForeignType = PHYS_FOREIGN_ID_STATIC;
+        if (!CoopRuntimeGuards::TryGuardedCall(
+                "breakable glass static foreign data",
+                [targetPhysics]()
+                {
+                    return targetPhysics->GetForeignData(PHYS_FOREIGN_ID_STATIC);
+                },
+                targetForeignData,
+                &reason) ||
+            !targetForeignData)
+        {
+            ++m_breakableGlassEventSkips;
+            detail = "missing_static_breakable_glass_foreign_data_guid_" +
+                std::to_string(packet.targetGuid) + "_reason_" +
+                BreakableStatusToken(reason);
+            return false;
+        }
+    }
+    else
+    {
+        targetPhysics = targetEntity->GetPhysics();
+        targetForeignData = targetEntity;
+    }
     if (!targetPhysics || targetPhysics == WORLD_ENTITY)
     {
         ++m_breakableGlassEventSkips;
@@ -998,17 +1148,15 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
     EventPhysCollision collision;
     collision.deferredResult = 0;
     collision.pEntity[glassSide] = targetPhysics;
-    collision.pForeignData[glassSide] = targetEntity;
-    collision.iForeignData[glassSide] = PHYS_FOREIGN_ID_ENTITY;
+    collision.pForeignData[glassSide] = targetForeignData;
+    collision.iForeignData[glassSide] = targetForeignType;
     // The remote player's proxy is not the weapon body that made the native
     // impact. CryEngine reserves this foreign id for reconstructed events and
     // accepts it without dereferencing or class-checking a synthetic collider.
     collision.pEntity[sourceSide] = nullptr;
     collision.pForeignData[sourceSide] = nullptr;
     collision.iForeignData[sourceSide] = PHYS_FOREIGN_ID_ARK_SERIALIZED_EVENT;
-    collision.idCollider = collision.pEntity[1] == WORLD_ENTITY
-        ? 0
-        : static_cast<int>(targetEntity->GetId());
+    collision.idCollider = staticTarget ? 0 : static_cast<int>(targetEntity->GetId());
     collision.pt = Vec3(wire.point[0], wire.point[1], wire.point[2]);
     collision.n = Vec3(wire.normal[0], wire.normal[1], wire.normal[2]);
     for (int side = 0; side < 2; ++side)
@@ -1021,6 +1169,17 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
         collision.partid[side] = wire.partId[side];
         collision.idmat[side] = wire.materialId[side];
         collision.iPrim[side] = wire.primitiveId[side];
+    }
+    if (staticTarget)
+    {
+        collision.pt = staticHit.pt;
+        collision.n = staticHit.n;
+        collision.partid[glassSide] = staticHit.partid;
+        collision.idmat[glassSide] = staticHit.surface_idx;
+        collision.iPrim[glassSide] = static_cast<short>(std::clamp(
+            staticHit.iPrim,
+            static_cast<int>(std::numeric_limits<short>::min()),
+            static_cast<int>(std::numeric_limits<short>::max())));
     }
     collision.penetration = DecodeGlassHalf(wire.penetration);
     collision.normImpulse = DecodeGlassHalf(wire.normalImpulse);
@@ -1048,6 +1207,7 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
         "applied_guid_" + std::to_string(packet.targetGuid) +
         "_side_" + std::to_string(glassSide) +
         "_slot_" + std::to_string(packet.value) +
+        "_static_" + std::to_string(staticTarget ? 1 : 0) +
         "_accepted_" + std::to_string(s_lastImpactBreaksGlassDecision) +
         "_foreign_" + std::to_string(collision.iForeignData[0]) + "," +
             std::to_string(collision.iForeignData[1]) +
