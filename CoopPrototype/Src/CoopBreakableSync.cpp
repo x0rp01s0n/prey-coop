@@ -183,6 +183,28 @@ void RefreshAllBreakableGlassRegistrations()
     }
 }
 
+IEntity* FindEntityByBreakableGlassStableId(uint64_t stableId)
+{
+    if (stableId == 0 || !gEnv || !gEnv->pEntitySystem)
+        return nullptr;
+
+    IEntityIt* rawIterator = gEnv->pEntitySystem->GetEntityIterator();
+    if (!rawIterator)
+        return nullptr;
+
+    IEntityItPtr iterator = rawIterator;
+    iterator->MoveFirst();
+    while (!iterator->IsEnd())
+    {
+        IEntity* candidate = iterator->Next();
+        if (!candidate)
+            break;
+        if (BuildBreakableGlassStableId(*candidate) == stableId)
+            return candidate;
+    }
+    return nullptr;
+}
+
 #pragma pack(push, 1)
 struct BreakableGlassImpactWire
 {
@@ -943,6 +965,16 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
             }
             ++it;
         }
+    }
+
+    // Dynamically spawned scene windows have no authored GUID and do not enter
+    // CEntity's glass registry until their first native impact. Resolve their
+    // deterministic name/class/position identity before replaying that impact.
+    if (!targetEntity)
+    {
+        targetEntity = FindEntityByBreakableGlassStableId(packet.targetGuid);
+        if (targetEntity)
+            targetEntityId = targetEntity->GetId();
     }
 
     if (!targetEntity)
