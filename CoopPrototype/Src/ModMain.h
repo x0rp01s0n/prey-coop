@@ -1743,7 +1743,8 @@ public:
         const EventPhysCollision& collision,
         uint64_t targetGuid,
         int glassSide,
-        int glassSlot);
+        int glassSlot,
+        bool staticTarget = false);
     bool IsApplyingRemoteHazardEvent() const { return m_hazardEventApplyDepth != 0; }
     bool RepairFirstNativeLeak(ArkLeakable* leakable, const char* context, std::string* detail = nullptr);
     bool DebugSpawnPersistentAreaHazard(std::string& detail);
