@@ -4207,6 +4207,7 @@ private:
     std::string m_lastPlayerSidecarPath = "-";
     std::string m_pendingPlayerSidecarSaveReason;
     std::vector<PlayerInventoryItemState> m_pendingPlayerSidecarInventoryItems;
+    std::vector<EntityId> m_pendingPlayerSidecarDetachedItemIds;
     std::vector<PlayerChipsetState> m_pendingPlayerSidecarChipsets;
     uint64_t m_pendingPlayerSidecarEquippedWeaponArchetypeId = 0;
     std::vector<PlayerQuickSelectState> m_pendingPlayerSidecarQuickSelect;
