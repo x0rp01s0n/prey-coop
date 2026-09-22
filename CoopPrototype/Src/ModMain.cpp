@@ -19037,6 +19037,9 @@ static void ArkPlayer_FullSerialize_Hook(ArkPlayer* player, TSerialize serialize
 
 static void ArkPlayer_PostSerialize_Hook(ArkPlayer* player)
 {
+    // Native PostSerialize assumes every inventory grid entry resolves to a live ArkItem.
+    if (gMod)
+        gMod->SanitizeLocalPlayerInventoryReferences(player, "ArkPlayer::PostSerialize pre native");
     s_hookArkPlayerPostSerialize.InvokeOrig(player);
     if (gMod)
         gMod->OnArkPlayerPostSerializeHook(player, "ArkPlayer::PostSerialize");
@@ -26755,6 +26758,9 @@ void ModMain::OnCryActionSaveGameRequested(
     (void)ignoreDelay;
 
     ++m_saveGameHookCalls;
+    SanitizeLocalPlayerInventoryReferences(
+        ArkPlayer::GetInstancePtr(),
+        "CCryAction::SaveGame pre native");
     const bool internalHostSnapshot =
         m_networkMode == CoopNetworkMode::Host &&
         m_hostInternalSnapshotSaveActive;
@@ -30127,6 +30133,74 @@ void ModMain::OnCryActionLoadGameFinished(const char* path, int result)
         }
         EndCoopLoadGuard("LoadGame failed");
     }
+}
+
+uint32_t ModMain::SanitizeLocalPlayerInventoryReferences(ArkPlayer* player, const char* reason)
+{
+    if (!player || player != ArkPlayer::GetInstancePtr() ||
+        !IsLikelyRuntimeCppObject(player, sizeof(ArkPlayer)))
+    {
+        return 0;
+    }
+
+    ArkInventory* inventory = player->m_pInventory;
+    ArkGame* arkGame = ArkGame::GetArkGame();
+    ArkItemSystem* itemSystem = arkGame ? &arkGame->GetArkItemSystem() : nullptr;
+    if (!inventory || !itemSystem ||
+        !IsLikelyRuntimeCppObject(inventory, sizeof(ArkInventory)) ||
+        !IsLikelyRuntimeCppObject(itemSystem, sizeof(ArkItemSystem)))
+    {
+        return 0;
+    }
+
+    std::vector<unsigned> removedIds;
+    std::string guardReason;
+    const bool sanitized = TryGuardedVoidCall(
+        "sanitize local inventory missing entity references",
+        [&]()
+        {
+            auto& cells = inventory->m_storedItems;
+            cells.erase(
+                std::remove_if(
+                    cells.begin(),
+                    cells.end(),
+                    [&](const ArkInventory::StorageCell& cell)
+                    {
+                        if (cell.m_entityId != 0 && FindArkItemDirect(itemSystem, cell.m_entityId))
+                            return false;
+                        removedIds.push_back(cell.m_entityId);
+                        return true;
+                    }),
+                cells.end());
+            if (!removedIds.empty())
+                inventory->m_bSortDirty = true;
+        },
+        &guardReason);
+
+    if (!sanitized)
+    {
+        LogCoop(
+            "inventory reference sanitation failed reason=" +
+            StatusToken(reason && reason[0] ? std::string(reason) : std::string("unknown")) +
+            (guardReason.empty() ? std::string() : " guard=" + StatusToken(guardReason)));
+        return 0;
+    }
+
+    if (removedIds.empty())
+        return 0;
+
+    std::ostringstream detail;
+    for (size_t index = 0; index < removedIds.size(); ++index)
+    {
+        if (index != 0)
+            detail << ',';
+        detail << removedIds[index];
+    }
+    LogCoop(
+        "removed missing inventory entity references count=" + std::to_string(removedIds.size()) +
+        " ids=" + StatusToken(detail.str()) +
+        " reason=" + StatusToken(reason && reason[0] ? std::string(reason) : std::string("unknown")));
+    return static_cast<uint32_t>(removedIds.size());
 }
 
 void ModMain::ActivateClientCoopSaveSlot(const std::string& savePath, uint32_t transferId, const char* reason)

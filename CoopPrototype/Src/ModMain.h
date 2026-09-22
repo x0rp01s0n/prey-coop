@@ -754,6 +754,7 @@ public:
     void OnCryActionNotifyLoadGame(ILoadGame* loadGame);
     void OnCryActionLoadGameRequested(const char* path, bool quick, bool ignoreDelay);
     void OnCryActionLoadGameFinished(const char* path, int result);
+    uint32_t SanitizeLocalPlayerInventoryReferences(ArkPlayer* player, const char* reason);
     void OnFlashUILoadingProgress(int progressAmount);
     void OnFlashUILoadingComplete();
     void OnFlashUILoadingError(const char* error);
