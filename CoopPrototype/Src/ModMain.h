@@ -1339,6 +1339,7 @@ private:
     struct HostPlayerStateUploadReceive
     {
         uint32_t transferId = 0;
+        uint32_t worldEpoch = 0;
         uint32_t totalBytes = 0;
         uint32_t chunkCount = 0;
         uint32_t receivedChunks = 0;
@@ -2167,6 +2168,7 @@ private:
     bool StartHostSaveTransferFromFile(const std::string& sourcePath, uint32_t transferId);
     bool QueueNextHostSaveTransferPacket();
     bool TryLoadReceivedHostSave();
+    bool TryStartReceivedHostSaveAfterTransfers(const char* reason);
     void ResetSaveTransferState(const char* lastEvent);
     bool BeginHostPlayerStateTransfer(const char* reason, const std::string& requestedSaveKey = {});
     bool BeginClientPlayerStateUpload(const char* reason, const std::string& saveKey = {});
@@ -2179,6 +2181,8 @@ private:
         const RemotePeerSession& peer,
         const std::string& saveKey);
     bool RequestRemotePlayerStateUpload(const char* reason);
+    void CancelHostPlayerStateUploadsForTimelineChange(const char* reason);
+    void CancelClientPlayerStateForTimelineChange(const char* reason);
     void TickDeferredRemotePlayerStateUploadRequests();
     bool BroadcastHostSaveIdentity(const char* reason, bool replaceTimeline = false);
     bool StartClientNativePlayerSnapshotForUpload(const char* reason, const std::string& saveKey);
