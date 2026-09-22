@@ -336,6 +336,7 @@ uint64_t BuildStaticBreakableGlassStableId(
 bool ResolveStaticBreakableGlassTarget(
     const Vec3& point,
     const Vec3& normal,
+    short expectedMaterial,
     ray_hit& hit,
     std::string& reason)
 {
@@ -348,7 +349,7 @@ bool ResolveStaticBreakableGlassTarget(
     const Vec3 rayNormal = normal.GetNormalizedSafe(Vec3(0.0f, 1.0f, 0.0f));
     for (float direction : {1.0f, -1.0f})
     {
-        std::memset(&hit, 0, sizeof(hit));
+        std::array<ray_hit, 16> hits{};
         const Vec3 origin = point + rayNormal * (0.35f * direction);
         const Vec3 ray = rayNormal * (-0.7f * direction);
         int hitCount = 0;
@@ -360,9 +361,9 @@ bool ResolveStaticBreakableGlassTarget(
                         origin,
                         ray,
                         ent_static,
-                        rwi_stop_at_pierceable | rwi_ignore_noncolliding,
-                        &hit,
-                        1,
+                        rwi_pierceability0 | rwi_ignore_noncolliding,
+                        hits.data(),
+                        static_cast<int>(hits.size()),
                         nullptr,
                         0,
                         nullptr,
@@ -371,24 +372,33 @@ bool ResolveStaticBreakableGlassTarget(
                 },
                 hitCount,
                 &reason) ||
-            hitCount <= 0 || !hit.pCollider)
+            hitCount <= 0)
         {
             continue;
         }
 
-        int foreignType = -1;
-        if (CoopRuntimeGuards::TryGuardedCall(
-                "breakable glass static foreign type",
-                [&hit]() { return hit.pCollider->GetiForeignData(); },
-                foreignType,
-                &reason) &&
-            foreignType == PHYS_FOREIGN_ID_STATIC)
+        const int candidateCount = std::min(hitCount, static_cast<int>(hits.size()));
+        for (int index = 0; index < candidateCount; ++index)
         {
-            return true;
+            ray_hit& candidate = hits[index];
+            if (!candidate.pCollider || candidate.surface_idx != expectedMaterial)
+                continue;
+
+            int foreignType = -1;
+            if (CoopRuntimeGuards::TryGuardedCall(
+                    "breakable glass static foreign type",
+                    [&candidate]() { return candidate.pCollider->GetiForeignData(); },
+                    foreignType,
+                    &reason) &&
+                foreignType == PHYS_FOREIGN_ID_STATIC)
+            {
+                hit = candidate;
+                return true;
+            }
         }
     }
 
-    reason = "missing_static_glass_raycast_target";
+    reason = "missing_static_glass_material_" + std::to_string(expectedMaterial);
     return false;
 }
 
@@ -1105,6 +1115,7 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
         if (!ResolveStaticBreakableGlassTarget(
                 Vec3(wire.point[0], wire.point[1], wire.point[2]),
                 Vec3(wire.normal[0], wire.normal[1], wire.normal[2]),
+                wire.materialId[glassSide],
                 staticHit,
                 reason))
         {
