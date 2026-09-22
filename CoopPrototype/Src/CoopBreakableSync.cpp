@@ -361,7 +361,10 @@ bool ResolveStaticBreakableGlassTarget(
                         origin,
                         ray,
                         ent_static,
-                        rwi_pierceability0 | rwi_ignore_noncolliding,
+                        // Authored glass is pierceable. Stop at its first
+                        // physical surface so the observer can resolve the
+                        // same pane accepted by the sender's native impact.
+                        rwi_stop_at_pierceable | rwi_ignore_noncolliding,
                         hits.data(),
                         static_cast<int>(hits.size()),
                         nullptr,
