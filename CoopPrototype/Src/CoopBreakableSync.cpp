@@ -1213,6 +1213,42 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
         return false;
     }
 
+    int deformResult = -1;
+    if (staticTarget && collision.iPrim[glassSide] < 0)
+    {
+        // Save-game break replay uses this exact path for authored glass whose
+        // break event has no source primitive. Replaying only the collision
+        // logger records the break but leaves the static render mesh intact.
+        if (!CoopRuntimeGuards::TryGuardedCall(
+                "breakable glass deform static mesh",
+                [&collision, targetPhysics]()
+                {
+                    return gEnv->pPhysicalWorld->DeformPhysicalEntity(
+                        targetPhysics,
+                        collision.pt,
+                        collision.n,
+                        collision.penetration,
+                        1);
+                },
+                deformResult,
+                &reason) ||
+            !CoopRuntimeGuards::TryGuardedVoidCall(
+                "breakable glass update deforming meshes first pass",
+                []() { gEnv->pPhysicalWorld->UpdateDeformingEntities(0.0f); },
+                &reason) ||
+            !CoopRuntimeGuards::TryGuardedVoidCall(
+                "breakable glass update deforming meshes second pass",
+                []() { gEnv->pPhysicalWorld->UpdateDeformingEntities(0.0f); },
+                &reason))
+        {
+            ++m_breakableGlassEventSkips;
+            detail = "breakable_glass_native_deform_failed_guid_" +
+                std::to_string(packet.targetGuid) + "_reason_" +
+                BreakableStatusToken(reason);
+            return false;
+        }
+    }
+
     ++m_breakableGlassEventsApplied;
     m_lastBreakableGlassEvent =
         "applied_guid_" + std::to_string(packet.targetGuid) +
@@ -1220,6 +1256,7 @@ bool ModMain::ApplyAreaObjectBreakableGlassImpact(
         "_slot_" + std::to_string(packet.value) +
         "_static_" + std::to_string(staticTarget ? 1 : 0) +
         "_accepted_" + std::to_string(s_lastImpactBreaksGlassDecision) +
+        "_deform_" + std::to_string(deformResult) +
         "_foreign_" + std::to_string(collision.iForeignData[0]) + "," +
             std::to_string(collision.iForeignData[1]) +
         "_part_" + std::to_string(collision.partid[0]) + "," +
