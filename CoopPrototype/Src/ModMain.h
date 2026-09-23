@@ -44,6 +44,7 @@
 #include <Prey/GameDll/EntityUtility/EntityEffects.h>
 
 class ArkNpc;
+class ArkWrenchComponent;
 class CoopChat;
 class ArkLevelTransitionDoor;
 class ArkWorldUIOwner;
@@ -214,6 +215,10 @@ public:
     bool ShouldSuppressArkNpcHit(EntityId entityId, const HitInfo& hitInfo) const;
     void SanitizeArkNpcHitForOriginal(EntityId entityId, HitInfo& hitInfo) const;
     void OnArkNpcHitPost(EntityId entityId, const HitInfo& hitInfo, uint64_t damagePackageId = 0);
+    void OnNativeWrenchFinisherPost(
+        const ArkWrenchComponent& wrench,
+        ArkNpc& npc,
+        unsigned weaponId);
     void OnArkEnemySignalPackageObserved(
         EntityId targetEntityId,
         EntityId senderEntityId,
@@ -2786,6 +2791,12 @@ private:
         uint64_t damageSourceAccountToken = 0,
         uint64_t sourceTurretStableKey = 0,
         uint32_t sourceTurretAuthorityEpoch = 0);
+    bool QueueLocalEnemyWrenchFinisherPresentation(
+        EnemyAuthorityState& state,
+        IEntity& entity,
+        const ArkWrenchComponent& wrench,
+        unsigned weaponId,
+        const char* reason);
     bool TryApplyVanillaEnemyDeathHit(
         ArkNpc& npc,
         IEntity& entity,

@@ -8167,6 +8167,7 @@ static auto s_hookFlashUILoadtimeUpdate = CFlashUI::FLoadtimeUpdate.MakeHook();
 static auto s_hookFlashUILoadtimeRender = CFlashUI::FLoadtimeRender.MakeHook();
 static auto s_hookFlashUIShowLoadingScreen = CFlashUI::FShowLoadingScreen.MakeHook();
 static auto s_hookFlashUIHideLoadingScreen = CFlashUI::FHideLoadingScreen.MakeHook();
+static auto s_hookArkWrenchComponentKillNpc = ArkWrenchComponent::FKillNpc.MakeHook();
 static auto s_hookArkNpcOnKill = ArkNpc::FOnKill.MakeHook();
 static auto s_hookArkNpcMakeUnconscious = ArkNpc::FMakeUnconscious.MakeHook();
 static auto s_hookArkNpcMakeConscious = ArkNpc::FMakeConscious.MakeHook();
@@ -14829,6 +14830,16 @@ static void ArkNpc_OnKill_LifecycleTrace_Hook(ArkNpc* npc, bool postSerializeKil
             entityId,
             nullptr,
             postSerializeKill ? "postSerialize=1" : "postSerialize=0");
+}
+
+static void ArkWrenchComponent_KillNpc_CoopDeath_Hook(
+    const ArkWrenchComponent* wrench,
+    ArkNpc& npc,
+    unsigned weaponId)
+{
+    s_hookArkWrenchComponentKillNpc.InvokeOrig(wrench, npc, weaponId);
+    if (gMod && wrench)
+        gMod->OnNativeWrenchFinisherPost(*wrench, npc, weaponId);
 }
 
 static void ArkNpc_MakeUnconscious_LifecycleTrace_Hook(ArkNpc* npc)
@@ -32047,6 +32058,9 @@ void ModMain::InitHooks()
         s_hookArkOperatorLaserDamage.SetHookFunc(&ArkOperatorLaserHelper_DoDamage_Hook);
     }
 
+    if (!EnvFlagEnabled("COOP_DISABLE_WRENCH_FINISHER_SYNC"))
+        s_hookArkWrenchComponentKillNpc.SetHookFunc(&ArkWrenchComponent_KillNpc_CoopDeath_Hook);
+
     if (!EnvFlagEnabled("COOP_DISABLE_PROXY_NPC_STATE_GUARD"))
     {
         s_hookArkNpcOnKill.SetHookFunc(&ArkNpc_OnKill_LifecycleTrace_Hook);
@@ -36623,6 +36637,83 @@ void ModMain::OnArkNpcHitPost(EntityId entityId, const HitInfo& hitInfo, uint64_
         const CoopEvents::Route route = RouteCoopEvent(routeContext);
         if (route.shouldEmitNetwork)
             SendEnemyStateNow(state, "hooked enemy state send failed");
+    }
+}
+
+void ModMain::OnNativeWrenchFinisherPost(
+    const ArkWrenchComponent& wrench,
+    ArkNpc& npc,
+    unsigned weaponId)
+{
+    if (m_applyingRemoteEnemyDeathCommit ||
+        m_networkMode == CoopNetworkMode::Off ||
+        !m_damageSyncEnabled ||
+        !IsSessionGameplayReady() ||
+        !gEnv ||
+        !gEnv->pEntitySystem)
+    {
+        return;
+    }
+
+    const EntityId entityId = ResolveNpcEntityIdForLifecycleTrace(&npc);
+    IEntity* entity = entityId != INVALID_ENTITYID
+        ? gEnv->pEntitySystem->GetEntity(entityId)
+        : nullptr;
+    if (!entity || !npc.IsDead())
+        return;
+
+    EnemyAuthorityState* state = nullptr;
+    if (const auto netIt = m_enemyNetIdsByEntity.find(entityId);
+        netIt != m_enemyNetIdsByEntity.end())
+    {
+        state = FindEnemyAuthorityByNetId(netIt->second);
+    }
+    if (!state && IsEnemyRuntimeControlCandidate(*entity))
+        state = &EnsureEnemyAuthorityState(*entity);
+    if (!state)
+        return;
+
+    if (state->authorityOwnerAccountToken != GetLocalAccountToken() ||
+        state->remoteLocomotionAuthority ||
+        state->localDeathPresentationEpochSent == state->authorityEpoch)
+    {
+        m_lastEnemyDeathPresentationEvent =
+            "ignored local wrench finisher net=" + std::to_string(state->netId) +
+            " owner=" + std::to_string(state->authorityOwnerAccountToken) +
+            " local=" + std::to_string(GetLocalAccountToken()) +
+            " remote=" + std::to_string(state->remoteLocomotionAuthority ? 1 : 0);
+        AppendEnemySyncTrace("death_presentation", m_lastEnemyDeathPresentationEvent);
+        return;
+    }
+
+    if (!QueueLocalEnemyWrenchFinisherPresentation(
+            *state,
+            *entity,
+            wrench,
+            weaponId,
+            "native wrench finisher"))
+    {
+        return;
+    }
+
+    state->lastPosition = entity->GetWorldPos();
+    state->lastRotation = entity->GetWorldRotation();
+    state->hasLastPosition = true;
+    state->sentDeadState = false;
+    state->deathCommitRepeatsRemaining =
+        std::max(state->deathCommitRepeatsRemaining, kMimicDeathCommitRepeatCount);
+
+    if (m_networkMode == CoopNetworkMode::Host)
+    {
+        SendEnemyStateNow(*state, "wrench finisher enemy state send failed");
+    }
+    else
+    {
+        SendClientEnemyAuthorityStateNow(
+            *state,
+            CoopProtocol::kEnemyStateSourceFlagAuthorityClaim |
+                CoopProtocol::kEnemyStateSourceFlagAuthoritySnapshot,
+            "client wrench finisher enemy state send failed");
     }
 }
 
@@ -50649,6 +50740,89 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
                 "_max_" + (healthAfterKnown ? std::to_string(maxHealthAfter) : std::to_string(maxHealth)) +
                 "_native_" + StatusToken(nativeHitDetail);
         }
+    }
+    else if (command == "coop_enemy_finisher")
+    {
+        IEntity* entity = nullptr;
+        std::string targetDetail;
+        const std::string target = args.empty() ? std::string("last") : ToLowerAscii(args[0]);
+        if (target == "last")
+        {
+            for (auto it = m_debugSpawnedEnemyEntityIds.rbegin(); it != m_debugSpawnedEnemyEntityIds.rend(); ++it)
+            {
+                IEntity* candidate = gEnv && gEnv->pEntitySystem ? gEnv->pEntitySystem->GetEntity(*it) : nullptr;
+                if (candidate && IsEnemyReplicationCandidate(*candidate))
+                {
+                    entity = candidate;
+                    break;
+                }
+            }
+            targetDetail = entity ? "last" : "last_missing";
+        }
+        else if (target.rfind("net:", 0) == 0)
+        {
+            uint64_t netId = 0;
+            if (TryParseUint64(std::string_view(target).substr(4), netId))
+            {
+                if (EnemyAuthorityState* state = FindEnemyAuthorityByNetId(netId))
+                    entity = gEnv && gEnv->pEntitySystem ? gEnv->pEntitySystem->GetEntity(state->entityId) : nullptr;
+            }
+            targetDetail = entity ? "net_" + std::to_string(netId) : "net_missing";
+        }
+        else
+        {
+            entity = ResolveRuntimeEntityTarget(args[0], targetDetail);
+        }
+
+        ArkNpc* npc = entity ? EntityUtils::GetArkNpc(entity) : nullptr;
+        unsigned wrenchId = INVALID_ENTITYID;
+        ArkGame* arkGame = nullptr;
+        IArkItem* rawWrench = nullptr;
+        std::string guardReason;
+        const bool resolved = npc &&
+            TryGuardedCall(
+                "enemy finisher find wrench",
+                []() -> unsigned
+                {
+                    return ArkPlayer::GetInstance().m_weaponComponent.FindWeapon(
+                        ArkWrenchComponent::GetWrenchArchetypeId());
+                },
+                wrenchId,
+                &guardReason) &&
+            wrenchId != INVALID_ENTITYID &&
+            TryGuardedCall("enemy finisher ArkGame", []() { return ArkGame::GetArkGame(); }, arkGame, &guardReason) &&
+            arkGame &&
+            TryGuardedCall(
+                "enemy finisher wrench item",
+                [arkGame, wrenchId]() -> IArkItem*
+                {
+                    return arkGame->GetArkItemSystem().GetItem(wrenchId);
+                },
+                rawWrench,
+                &guardReason) &&
+            rawWrench;
+        if (resolved)
+        {
+            auto* wrench = static_cast<ArkWeaponWrench*>(
+                static_cast<CArkItem*>(rawWrench));
+            ok = TryGuardedVoidCall(
+                "enemy native wrench finisher",
+                [wrench, npc, wrenchId]()
+                {
+                    wrench->m_wrenchComponent.KillNpc(*npc, wrenchId);
+                },
+                &guardReason);
+        }
+        else
+        {
+            ok = false;
+        }
+        action = ok ? "enemy_finisher" : "enemy_finisher_failed";
+        m_networkStatus =
+            "enemy_finisher_target_" + StatusToken(targetDetail) +
+            "_entity_" + std::to_string(entity ? entity->GetId() : INVALID_ENTITYID) +
+            "_wrench_" + std::to_string(wrenchId) +
+            "_guard_" + StatusToken(guardReason.empty() ? std::string("-") : guardReason);
     }
     else if (command == "coop_enemy_kill")
     {
@@ -71852,20 +72026,32 @@ void ModMain::HandleEnemyDeathPresentation(
     const CoopProtocol::EnemyDeathPresentationPacket& packet)
 {
     ++m_receivedEnemyDeathPresentationPackets;
+    const bool wrenchFinisher =
+        (packet.flags & CoopProtocol::kEnemyDeathPresentationFlagWrenchFinisher) != 0;
     bool materializedValuesFinite =
-        packet.signalValueCount > 0 &&
-        packet.signalValueCount <= CoopProtocol::kMaxEnemyDamageSignalValues;
+        wrenchFinisher ||
+        (packet.signalValueCount > 0 &&
+            packet.signalValueCount <= CoopProtocol::kMaxEnemyDamageSignalValues);
     for (size_t i = 0; materializedValuesFinite && i < packet.signalValueCount; ++i)
     {
         materializedValuesFinite =
             packet.signalIds[i] != 0 &&
             std::isfinite(packet.signalValues[i]);
     }
-    const bool finite =
+    const bool damagePayloadFinite =
         packet.damagePackageId != 0 &&
         std::isfinite(packet.damagePackageScale) && packet.damagePackageScale > 0.0f &&
         std::isfinite(packet.targetHealthBeforeHit) && packet.targetHealthBeforeHit > 0.0f &&
-        std::isfinite(packet.damage) && packet.damage >= 0.0f &&
+        std::isfinite(packet.damage) && packet.damage >= 0.0f;
+    const bool finisherPayloadFinite =
+        packet.finisherPackageId != 0 &&
+        std::isfinite(packet.finisherHitOffset) &&
+        std::isfinite(packet.finisherMaxForceMassScale) &&
+        std::isfinite(packet.finisherRayRange) &&
+        std::isfinite(packet.finisherSpeedRangeFactor) &&
+        std::isfinite(packet.finisherSpeedRangeMax);
+    const bool finite =
+        (wrenchFinisher ? finisherPayloadFinite : damagePayloadFinite) &&
         std::isfinite(packet.hitX) && std::isfinite(packet.hitY) && std::isfinite(packet.hitZ) &&
         std::isfinite(packet.dirX) && std::isfinite(packet.dirY) && std::isfinite(packet.dirZ) &&
         std::isfinite(packet.normalX) && std::isfinite(packet.normalY) && std::isfinite(packet.normalZ) &&
@@ -88438,6 +88624,90 @@ void ModMain::DrawNpcDebugLine(const char* label, EntityId entityId, uint64_t ne
         archetypeName);
 }
 
+bool ModMain::QueueLocalEnemyWrenchFinisherPresentation(
+    EnemyAuthorityState& state,
+    IEntity& entity,
+    const ArkWrenchComponent& wrench,
+    unsigned weaponId,
+    const char* reason)
+{
+    if (m_networkMode == CoopNetworkMode::Off ||
+        !IsSessionGameplayReady() ||
+        m_socket == kInvalidNetworkSocket ||
+        !m_hasRemoteEndpoint ||
+        m_applyingRemoteEnemyDeathCommit ||
+        state.netId == 0 ||
+        state.stableEnemyId == 0 ||
+        state.archetypeId == 0 ||
+        state.authorityOwnerAccountToken != GetLocalAccountToken() ||
+        state.remoteLocomotionAuthority ||
+        state.localDeathPresentationEpochSent == state.authorityEpoch)
+    {
+        return false;
+    }
+
+    CoopProtocol::EnemyDeathPresentationPacket packet = {};
+    packet.sequence = CoopSerialSequence::Advance(m_enemyDeathPresentationSequence);
+    packet.worldEpoch = m_localWorldEpoch;
+    packet.levelId = m_localLevelId;
+    packet.enemyNetId = state.netId;
+    packet.stableEnemyId = state.stableEnemyId;
+    packet.enemyArchetypeId = state.archetypeId;
+    packet.authorityOwnerAccountToken = GetLocalAccountToken();
+    packet.damageSourceAccountToken = GetLocalAccountToken();
+    packet.authorityEpoch = state.authorityEpoch;
+    packet.flags = CoopProtocol::kEnemyDeathPresentationFlagWrenchFinisher;
+    const Vec3 entityPosition = entity.GetWorldPos();
+    const Quat entityRotation = entity.GetWorldRotation();
+    packet.entityX = entityPosition.x;
+    packet.entityY = entityPosition.y;
+    packet.entityZ = entityPosition.z;
+    packet.entityQw = entityRotation.w;
+    packet.entityQx = entityRotation.v.x;
+    packet.entityQy = entityRotation.v.y;
+    packet.entityQz = entityRotation.v.z;
+    packet.finisherPackageId = wrench.m_packageId;
+    packet.finisherCriticalPackageId = wrench.m_criticalPackageId;
+    packet.finisherChargedPackageId = wrench.m_chargedPackageId;
+    packet.finisherChargedCriticalPackageId = wrench.m_chargedCriticalPackageId;
+    packet.finisherHitType = wrench.m_hitType;
+    packet.finisherHitOffset = wrench.m_hitOffset;
+    packet.finisherMaxForceMassScale = wrench.m_maxForceMassScale;
+    packet.finisherRayRange = wrench.m_rayRange;
+    packet.finisherSpeedRangeFactor = wrench.m_speedRangeFactor;
+    packet.finisherSpeedRangeMax = wrench.m_speedRangeMax;
+
+    bool hidden = false;
+    if (TryGuardedCall(
+            "wrench finisher death presentation IsHidden",
+            [&entity]() { return entity.IsHidden(); },
+            hidden,
+            nullptr) && hidden)
+    {
+        packet.flags |= CoopProtocol::kEnemyDeathPresentationFlagAuthorityHidden;
+    }
+
+    if (!SendEnemyDeathPresentationTo(
+            packet,
+            m_remoteAddress,
+            m_remotePort,
+            "wrench finisher death presentation send failed"))
+    {
+        return false;
+    }
+
+    state.localDeathPresentationEpochSent = state.authorityEpoch;
+    m_lastEnemyDeathPresentationEvent =
+        "sent wrench finisher seq=" + std::to_string(packet.sequence) +
+        " net=" + std::to_string(packet.enemyNetId) +
+        " epoch=" + std::to_string(packet.authorityEpoch) +
+        " weapon=" + std::to_string(weaponId) +
+        " package=" + std::to_string(packet.finisherPackageId) +
+        " reason=" + StatusToken(reason && reason[0] ? std::string(reason) : std::string("-"));
+    AppendEnemySyncTrace("death_presentation", m_lastEnemyDeathPresentationEvent);
+    return true;
+}
+
 bool ModMain::QueueLocalEnemyDeathPresentation(
     EnemyAuthorityState& state,
     IEntity& entity,
@@ -88860,11 +89130,14 @@ bool ModMain::TryApplyVanillaEnemyDeathHit(
     IEntity& entity,
     const CoopProtocol::EnemyDeathPresentationPacket& presentation)
 {
-    if (presentation.damagePackageId == 0 ||
+    const bool wrenchFinisher =
+        (presentation.flags & CoopProtocol::kEnemyDeathPresentationFlagWrenchFinisher) != 0;
+    if (!wrenchFinisher &&
+        (presentation.damagePackageId == 0 ||
         !std::isfinite(presentation.damagePackageScale) ||
         presentation.damagePackageScale <= 0.0f ||
         !std::isfinite(presentation.damage) ||
-        presentation.damage < 0.0f)
+        presentation.damage < 0.0f))
     {
         return false;
     }
@@ -88900,6 +89173,36 @@ bool ModMain::TryApplyVanillaEnemyDeathHit(
         return false;
 
     const EntityId mappedSourceEntityId = mappedSourceEntity->GetId();
+    if (wrenchFinisher)
+    {
+        ArkWrenchComponent wrench = {};
+        wrench.m_packageId = presentation.finisherPackageId;
+        wrench.m_criticalPackageId = presentation.finisherCriticalPackageId;
+        wrench.m_chargedPackageId = presentation.finisherChargedPackageId;
+        wrench.m_chargedCriticalPackageId = presentation.finisherChargedCriticalPackageId;
+        wrench.m_hitType = presentation.finisherHitType;
+        wrench.m_hitOffset = presentation.finisherHitOffset;
+        wrench.m_maxForceMassScale = presentation.finisherMaxForceMassScale;
+        wrench.m_rayRange = presentation.finisherRayRange;
+        wrench.m_speedRangeFactor = presentation.finisherSpeedRangeFactor;
+        wrench.m_speedRangeMax = presentation.finisherSpeedRangeMax;
+        wrench.m_fatigueThisHit = 0.0f;
+
+        std::string guardReason;
+        const bool applied = TryGuardedVoidCall(
+            "remote wrench finisher KillNpc",
+            [&]() { wrench.KillNpc(npc, mappedSourceEntityId); },
+            &guardReason);
+        if (!applied)
+        {
+            m_lastEnemyHealthEvent =
+                "native wrench finisher failed entity=" + std::to_string(entity.GetId()) +
+                " package=" + std::to_string(presentation.finisherPackageId) +
+                " reason=" + StatusToken(guardReason);
+        }
+        return applied;
+    }
+
     remoteHit.shooterId = mappedSourceEntityId;
     remoteHit.targetId = entity.GetId();
     remoteHit.weaponId = presentation.sourceTurretStableKey != 0

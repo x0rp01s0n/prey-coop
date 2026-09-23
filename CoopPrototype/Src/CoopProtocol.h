@@ -7,7 +7,7 @@
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 247;
+constexpr uint16_t kProtocolVersion = 248;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -165,6 +165,7 @@ constexpr uint32_t kRemoteDamageFlagSourceKey = 1u << 6;
 constexpr uint32_t kRemoteDamageFlagStableSource = 1u << 7;
 constexpr uint32_t kRemoteDamageFlagFriendlyFire = 1u << 8;
 constexpr uint32_t kEnemyDeathPresentationFlagRemote = 1u << 9;
+constexpr uint32_t kEnemyDeathPresentationFlagWrenchFinisher = 1u << 10;
 constexpr uint32_t kEnemyDeathPresentationFlagAuthorityHidden = 1u << 11;
 constexpr uint32_t kEnemyDamageRequestFlagLocalPlayerSource = 1u << 16;
 constexpr uint32_t kEnemyDamageRequestFlagLocalPlayerProjectile = 1u << 17;
@@ -1139,6 +1140,16 @@ struct EnemyDeathPresentationPacket
     int32_t penetrationCount = 0;
     uint16_t signalValueCount = 0;
     uint16_t reserved = 0;
+    uint64_t finisherPackageId = 0;
+    uint64_t finisherCriticalPackageId = 0;
+    uint64_t finisherChargedPackageId = 0;
+    uint64_t finisherChargedCriticalPackageId = 0;
+    int32_t finisherHitType = 0;
+    float finisherHitOffset = 0.0f;
+    float finisherMaxForceMassScale = 0.0f;
+    float finisherRayRange = 0.0f;
+    float finisherSpeedRangeFactor = 0.0f;
+    float finisherSpeedRangeMax = 0.0f;
     uint64_t signalIds[kMaxEnemyDamageSignalValues] = {};
     float signalValues[kMaxEnemyDamageSignalValues] = {};
 };
