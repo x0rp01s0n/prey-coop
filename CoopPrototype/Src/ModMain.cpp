@@ -105,6 +105,7 @@
 #include <Prey/CryRenderer/IRenderAuxGeom.h>
 #include <Prey/CryRenderer/IRenderer.h>
 #include <Prey/CrySystem/IConsole.h>
+#include <Prey/CrySystem/ICmdLine.h>
 #include <Prey/CrySystem/ILog.h>
 #include <Prey/CrySystem/ISystem.h>
 #include <Prey/CrySystem/ITimer.h>
@@ -1880,6 +1881,32 @@ std::string WideTraceString(const wchar_t* text)
     std::string result(static_cast<size_t>(needed - 1), '\0');
     WideCharToMultiByte(CP_UTF8, 0, text, -1, result.data(), needed, nullptr, nullptr);
     return result;
+}
+
+std::string ReadCommandLineOption(const char* optionName)
+{
+    if (!optionName || !optionName[0] || !gEnv || !gEnv->pSystem)
+        return {};
+
+    ICmdLine* commandLine = gEnv->pSystem->GetICmdLine();
+    if (!commandLine)
+        return {};
+
+    const ICmdLineArg* argument = commandLine->FindArg(eCLAT_Pre, optionName);
+    const char* value = argument ? argument->GetValue() : nullptr;
+    return value ? value : std::string();
+}
+
+std::string ResolveStartupSetting(const char* environmentName, const char* commandLineName)
+{
+    if (environmentName)
+    {
+        const char* environmentValue = std::getenv(environmentName);
+        if (environmentValue && environmentValue[0])
+            return environmentValue;
+    }
+
+    return ReadCommandLineOption(commandLineName);
 }
 
 void __cdecl CoopInvalidParameterTraceHandler(
@@ -3898,6 +3925,32 @@ std::filesystem::path BuildCoopClientSessionSavesRoot()
     return profileRoot / "CoopPrototype" / "ClientSessionSaves";
 }
 
+std::filesystem::path BuildCoopProcessTempRoot()
+{
+    std::filesystem::path root = GetPreyProfileRoot();
+    if (!root.empty())
+    {
+        root /= "CoopPrototype";
+        root /= "TransferTemp";
+    }
+    else
+    {
+        root = CoopFilesystem::EnvironmentPath("TEMP");
+        if (root.empty())
+            root = CoopFilesystem::EnvironmentPath("TMP");
+        if (!root.empty())
+            root /= "PreyCoop";
+    }
+
+    if (root.empty())
+        return {};
+
+    root /= std::to_wstring(GetCurrentProcessId());
+    std::error_code error;
+    std::filesystem::create_directories(root, error);
+    return error ? std::filesystem::path() : root;
+}
+
 std::filesystem::path BuildCoopClientSessionTempDirectory()
 {
     const std::filesystem::path root = BuildCoopClientSessionSavesRoot();
@@ -3941,9 +3994,7 @@ std::string BuildCoopReceivedSavePath(uint32_t transferId)
             return CoopFilesystem::ToUtf8(slotPath / "save.CSF");
     }
 
-    std::filesystem::path tempRoot = CoopFilesystem::EnvironmentPath("TEMP");
-    if (tempRoot.empty())
-        tempRoot = CoopFilesystem::EnvironmentPath("TMP");
+    const std::filesystem::path tempRoot = BuildCoopProcessTempRoot();
 
     char fileName[64] = {};
     std::snprintf(fileName, sizeof(fileName), "PreyCoopHostWorld_%08X.sav", transferId);
@@ -3956,9 +4007,7 @@ std::string BuildCoopReceivedSavePath(uint32_t transferId)
 
 std::string BuildCoopReceivedSavePackagePath(uint32_t transferId)
 {
-    std::filesystem::path tempRoot = CoopFilesystem::EnvironmentPath("TEMP");
-    if (tempRoot.empty())
-        tempRoot = CoopFilesystem::EnvironmentPath("TMP");
+    const std::filesystem::path tempRoot = BuildCoopProcessTempRoot();
 
     char fileName[64] = {};
     std::snprintf(fileName, sizeof(fileName), "PreyCoopHostWorld_%08X.cspkg", transferId);
@@ -6074,9 +6123,7 @@ bool ExtractCoopSavePackageToSlot(const std::string& packagePath, uint32_t trans
 
 std::string BuildCoopTempPlayerStatePath(uint32_t transferId, const std::string& username)
 {
-    std::filesystem::path tempRoot = CoopFilesystem::EnvironmentPath("TEMP");
-    if (tempRoot.empty())
-        tempRoot = CoopFilesystem::EnvironmentPath("TMP");
+    const std::filesystem::path tempRoot = BuildCoopProcessTempRoot();
 
     char fileName[128] = {};
     const std::string safeUsername = SanitizePathComponent(username.empty() ? std::string("Player") : username);
@@ -6090,9 +6137,7 @@ std::string BuildCoopTempPlayerStatePath(uint32_t transferId, const std::string&
 
 std::string BuildCoopTempAreaJournalPath(uint32_t transferId, const std::string& levelName)
 {
-    std::filesystem::path tempRoot = CoopFilesystem::EnvironmentPath("TEMP");
-    if (tempRoot.empty())
-        tempRoot = CoopFilesystem::EnvironmentPath("TMP");
+    const std::filesystem::path tempRoot = BuildCoopProcessTempRoot();
 
     char fileName[192] = {};
     const std::string safeLevel = SanitizePathComponent(levelName.empty() ? std::string("unknown") : levelName);
@@ -37288,8 +37333,8 @@ void ModMain::ApplyAutoStartFromEnvironment()
     if (m_autoStartApplied)
         return;
 
-    const char* autoStart = std::getenv("COOP_AUTOSTART");
-    if (!autoStart || !autoStart[0])
+    const std::string autoStart = ResolveStartupSetting("COOP_AUTOSTART", "coop-autostart");
+    if (autoStart.empty())
         return;
 
     m_autoStartApplied = true;
@@ -37338,13 +37383,19 @@ void ModMain::ApplyAutoStartFromEnvironment()
     if (livePropOpenEventFilter && livePropOpenEventFilter[0])
         m_livePropOpenEventFilter = std::atoi(livePropOpenEventFilter) != 0;
 
-    const char* envHost = std::getenv("COOP_HOST");
-    if (envHost && envHost[0])
+    const std::string envHost = ResolveStartupSetting("COOP_HOST", "coop-host");
+    if (!envHost.empty())
         m_hostAddress = envHost;
 
     const char* envJoinPassword = std::getenv("COOP_JOIN_PASSWORD");
     if (envJoinPassword)
         m_joinPassword = envJoinPassword;
+    else
+    {
+        const std::string commandLinePassword = ReadCommandLineOption("coop-password");
+        if (!commandLinePassword.empty())
+            m_joinPassword = commandLinePassword;
+    }
 
     const char* envServerAccess = std::getenv("COOP_SERVER_ACCESS_MODE");
     if (envServerAccess && envServerAccess[0])
@@ -37363,10 +37414,10 @@ void ModMain::ApplyAutoStartFromEnvironment()
     if (envServerPassword)
         m_serverPassword = envServerPassword;
 
-    const char* envPort = std::getenv("COOP_PORT");
-    if (envPort && envPort[0])
+    const std::string envPort = ResolveStartupSetting("COOP_PORT", "coop-port");
+    if (!envPort.empty())
     {
-        const int parsedPort = std::atoi(envPort);
+        const int parsedPort = std::atoi(envPort.c_str());
         if (parsedPort >= 1 && parsedPort <= 65535)
             m_networkPort = parsedPort;
     }
@@ -37404,7 +37455,7 @@ void ModMain::ApplyAutoStartFromEnvironment()
     }
     else
     {
-        LogCoop(std::string("unknown COOP_AUTOSTART mode: ") + autoStart);
+        LogCoop("unknown autostart mode: " + autoStart);
     }
 }
 

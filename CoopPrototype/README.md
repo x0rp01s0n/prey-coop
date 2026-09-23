@@ -31,6 +31,31 @@ Saved Games/Arkane Studios/Prey/CoopPrototype/coop_config.xml
 
 It stores the generated account ID, player name/model, Host settings, favorites, recents, last address/port, HUD/nameplate settings and friendly-fire policy. A corrupt file is quarantined and rebuilt with a new generated UUID. Platform identity is selectable in Profile; generated UUIDs are the safe default for local multi-instance testing.
 
+### Nucleus Co-op
+
+Nucleus handlers can bypass the multiplayer menu and assign each instance its
+role through executable arguments:
+
+```javascript
+Game.UseNucleusEnvironment = true;
+Game.Play = function() {
+    var coopArgs;
+    if (Context.PlayerID === 0) {
+        coopArgs = "-coop-autostart host -coop-port 27015";
+    } else {
+        coopArgs = "-coop-autostart client -coop-host 127.0.0.1 -coop-port 27015";
+    }
+    Context.StartArguments = (Context.StartArguments || "") + " " + coopArgs;
+};
+```
+
+The options are `-coop-autostart host|client`, `-coop-host <IPv4>`,
+`-coop-port <1-65535>` and optional `-coop-password <password>`. The existing
+`COOP_AUTOSTART`, `COOP_HOST`, `COOP_PORT` and `COOP_JOIN_PASSWORD` environment
+variables remain supported and take precedence. Transfer scratch files are
+isolated per process, so simultaneous instances under the same Windows user do
+not overwrite each other even when Nucleus leaves `TEMP` and `TMP` shared.
+
 ## Ownership Model
 
 - `PlayerOwned`: inventory, abilities, equipment, status and survival values belong to one account and one Host save key. A received player replacement is selected by exact account token and enters immediately before Vanilla's native `PostSerialize` reference/equipment callbacks; the mod does not transplant a custom GameState graph.
