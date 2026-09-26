@@ -546,6 +546,8 @@ bool ModMain::DebugDetonatePlayerGrenadeResult(const std::string& kindName, std:
         archetypeId = kLureGrenadeProjectileArchetype;
     else if (kindName == "nullwave")
         archetypeId = kNullwaveGrenadeProjectileArchetype;
+    else if (kindName == "recycler")
+        archetypeId = kRecyclerGrenadeProjectileArchetype;
     else
     {
         detail = "unknown_kind_" + kindName;
@@ -585,6 +587,27 @@ bool ModMain::DebugDetonatePlayerGrenadeResult(const std::string& kindName, std:
     params.pArchetype = archetype;
     params.pClass = archetype->GetClass();
     params.vPosition = playerEntity->GetWorldPos() + playerEntity->GetWorldRotation().GetColumn1() * 3.0f;
+    if (kindName == "recycler")
+    {
+        Vec3 sharedDropCenter(ZERO);
+        size_t sharedDropCount = 0;
+        for (const auto& entry : m_sharedDrops)
+        {
+            const SharedDropRecord& record = entry.second;
+            IEntity* dropEntity = record.live && record.localEntityId != INVALID_ENTITYID
+                ? gEnv->pEntitySystem->GetEntity(record.localEntityId)
+                : nullptr;
+            if (!dropEntity)
+                continue;
+            sharedDropCenter += dropEntity->GetWorldPos();
+            ++sharedDropCount;
+        }
+        if (sharedDropCount != 0)
+        {
+            params.vPosition = sharedDropCenter / static_cast<float>(sharedDropCount);
+            params.vPosition.z += 0.5f;
+        }
+    }
     params.qRotation = playerEntity->GetWorldRotation();
     params.vScale = Vec3(1.0f);
 
@@ -599,6 +622,7 @@ bool ModMain::DebugDetonatePlayerGrenadeResult(const std::string& kindName, std:
         detail = "spawn_failed_" + guardReason;
         return false;
     }
+    const EntityId entityId = entity->GetId();
 
     CArkProjectile* projectile = nullptr;
     CoopRuntimeGuards::TryGuardedCall(
@@ -621,14 +645,36 @@ bool ModMain::DebugDetonatePlayerGrenadeResult(const std::string& kindName, std:
         detail = "owner_failed_" + guardReason;
         return false;
     }
-    CArkProjectileGrenade* grenade = static_cast<CArkProjectileGrenade*>(projectile);
-    const bool detonated = CoopRuntimeGuards::TryGuardedVoidCall(
-        "debug grenade DoDetonation",
-        [grenade]() { grenade->DoDetonation(); },
-        &guardReason);
+    bool detonated = false;
+    if (kindName == "recycler")
+    {
+        CArkProjectileRecyclerGrenade* grenade = nullptr;
+        CoopRuntimeGuards::TryGuardedCall(
+            "debug recycler GetProjectileGrenadeFromEntityId",
+            [entityId]() { return CArkProjectileRecyclerGrenade::GetProjectileGrenadeFromEntityId(entityId); },
+            grenade,
+            &guardReason);
+        if (grenade)
+        {
+            bool nativeResult = false;
+            detonated = CoopRuntimeGuards::TryGuardedCall(
+                "debug recycler Detonate",
+                [grenade]() { return grenade->Detonate(); },
+                nativeResult,
+                &guardReason) && nativeResult;
+        }
+    }
+    else
+    {
+        CArkProjectileGrenade* grenade = static_cast<CArkProjectileGrenade*>(projectile);
+        detonated = CoopRuntimeGuards::TryGuardedVoidCall(
+            "debug grenade DoDetonation",
+            [grenade]() { grenade->DoDetonation(); },
+            &guardReason);
+    }
     detail =
         "kind_" + kindName +
-        "_entity_" + std::to_string(entity->GetId()) +
+        "_entity_" + std::to_string(entityId) +
         "_archetype_" + std::to_string(archetypeId) +
         "_detonated_" + std::to_string(detonated ? 1 : 0) +
         "_reason_" + (guardReason.empty() ? std::string("-") : guardReason);
@@ -2677,6 +2723,7 @@ void ModMain::HandleHazardEvent(const CoopProtocol::HazardEventPacket& packet)
     params.vScale = Vec3(1.0f);
 
     IEntity* entity = nullptr;
+    EntityId spawnedEntityId = INVALID_ENTITYID;
     ++m_hazardEventApplyDepth;
     const bool spawned = CoopRuntimeGuards::TryGuardedCall(
         "hazard recycler SpawnEntityFromArchetype",
@@ -2686,17 +2733,35 @@ void ModMain::HandleHazardEvent(const CoopProtocol::HazardEventPacket& packet)
     bool detonated = false;
     if (spawned && entity)
     {
-        m_remoteHazardEntityIds.insert(entity->GetId());
+        spawnedEntityId = entity->GetId();
+        m_remoteHazardEntityIds.insert(spawnedEntityId);
         if (kind == CoopProtocol::HazardEventKind::RecyclerDetonate)
         {
             CArkProjectileRecyclerGrenade* grenade = nullptr;
             CoopRuntimeGuards::TryGuardedCall(
                 "hazard recycler GetProjectileGrenadeFromEntityId",
-                [entity]() { return CArkProjectileRecyclerGrenade::GetProjectileGrenadeFromEntityId(entity->GetId()); },
+                [spawnedEntityId]() { return CArkProjectileRecyclerGrenade::GetProjectileGrenadeFromEntityId(spawnedEntityId); },
                 grenade,
                 &guardReason);
             if (grenade)
             {
+                MarkRemoteRecyclerGrenadeForHook(grenade);
+                CArkProjectile* projectile = nullptr;
+                CoopRuntimeGuards::TryGuardedCall(
+                    "hazard recycler GetProjectileFromEntityId",
+                    [spawnedEntityId]() { return CArkProjectile::GetProjectileFromEntityId(spawnedEntityId); },
+                    projectile,
+                    &guardReason);
+                if (projectile)
+                {
+                    const EntityId remoteOwnerId = m_proxyEntityId != INVALID_ENTITYID
+                        ? m_proxyEntityId
+                        : 0;
+                    CoopRuntimeGuards::TryGuardedVoidCall(
+                        "hazard recycler set remote owner",
+                        [projectile, remoteOwnerId]() { projectile->m_ownerId = remoteOwnerId; },
+                        nullptr);
+                }
                 CoopRuntimeGuards::TryGuardedCall(
                     "hazard recycler Detonate",
                     [grenade]() { return grenade->Detonate(); },
@@ -2709,7 +2774,7 @@ void ModMain::HandleHazardEvent(const CoopProtocol::HazardEventPacket& packet)
             CArkProjectile* projectile = nullptr;
             CoopRuntimeGuards::TryGuardedCall(
                 "hazard grenade GetProjectileFromEntityId",
-                [entity]() { return CArkProjectile::GetProjectileFromEntityId(entity->GetId()); },
+                [spawnedEntityId]() { return CArkProjectile::GetProjectileFromEntityId(spawnedEntityId); },
                 projectile,
                 &guardReason);
             if (projectile)
@@ -2733,8 +2798,8 @@ void ModMain::HandleHazardEvent(const CoopProtocol::HazardEventPacket& packet)
 
     if (!spawned || !entity || !detonated)
     {
-        if (entity)
-            gEnv->pEntitySystem->RemoveEntity(entity->GetId(), true);
+        if (spawnedEntityId != INVALID_ENTITYID && gEnv->pEntitySystem->GetEntity(spawnedEntityId))
+            gEnv->pEntitySystem->RemoveEntity(spawnedEntityId, true);
         ++m_hazardEventDropped;
         m_lastHazardEvent = "hazard_grenade_apply_failed_" + guardReason;
         return;
@@ -2744,7 +2809,7 @@ void ModMain::HandleHazardEvent(const CoopProtocol::HazardEventPacket& packet)
     m_lastHazardEvent =
         "applied_grenade_event_" + std::to_string(packet.eventId) +
         "_kind_" + std::to_string(packet.eventKind) +
-        "_entity_" + std::to_string(entity->GetId()) +
+        "_entity_" + std::to_string(spawnedEntityId) +
         "_arch_" + std::to_string(packet.archetypeId);
 }
 
@@ -2765,5 +2830,6 @@ void ModMain::ResetHazardEventState(const char* reason)
     }
     m_sentLocalHazardEntityIds.clear();
     m_remoteHazardEntityIds.clear();
+    m_remoteRecyclerGrenades.clear();
     m_lastHazardEvent = reason && reason[0] ? reason : "reset";
 }

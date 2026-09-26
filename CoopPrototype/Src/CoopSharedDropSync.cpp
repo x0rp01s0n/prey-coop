@@ -587,7 +587,8 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
     const bool roleAllowsCommand =
         (m_networkMode == CoopNetworkMode::Host &&
             (command == CoopProtocol::SharedDropCommand::Spawn ||
-                command == CoopProtocol::SharedDropCommand::PickupRequest)) ||
+                command == CoopProtocol::SharedDropCommand::PickupRequest ||
+                command == CoopProtocol::SharedDropCommand::RemoveRequest)) ||
         (m_networkMode == CoopNetworkMode::Client &&
             (command == CoopProtocol::SharedDropCommand::Spawn ||
                 command == CoopProtocol::SharedDropCommand::PickupCommit ||
@@ -693,6 +694,57 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
         return;
     }
 
+    if (command == CoopProtocol::SharedDropCommand::RemoveRequest)
+    {
+        if (m_networkMode != CoopNetworkMode::Host)
+        {
+            ++m_sharedDropDropped;
+            return;
+        }
+
+        if (!record.live)
+        {
+            CoopSerialSequence::Advance(m_sharedDropSequence);
+            CoopProtocol::SharedDropPacket commit;
+            const bool pickedUp = record.pickupWinnerPeerHash != 0;
+            const CoopProtocol::SharedDropCommand terminalCommand = pickedUp
+                ? CoopProtocol::SharedDropCommand::PickupCommit
+                : CoopProtocol::SharedDropCommand::Remove;
+            if (BuildSharedDropPacket(commit, terminalCommand, record, record.pickupWinnerPeerHash))
+                SendSharedDropTo(commit, m_remoteAddress, m_remotePort, "shared drop duplicate remove request commit failed");
+            ++m_sharedDropDuplicateCommits;
+            m_lastSharedDropEvent = "replayed_remove_commit_id_" + std::to_string(record.stableSpawnId);
+            return;
+        }
+
+        if (packet.objectVersion != record.version)
+        {
+            ++m_sharedDropDropped;
+            m_lastSharedDropEvent = "remove_request_rejected_id_" + std::to_string(record.stableSpawnId);
+            return;
+        }
+
+        record.version += 1;
+        record.live = false;
+        record.pickupPending = false;
+        record.localPickupGranted = false;
+        record.nativePickupInProgress = false;
+        record.pickupWinnerPeerHash = 0;
+        std::string detail;
+        RemoveSharedDropLocal(record, false, detail);
+        CoopSerialSequence::Advance(m_sharedDropSequence);
+        CoopProtocol::SharedDropPacket commit;
+        if (!BuildSharedDropPacket(commit, CoopProtocol::SharedDropCommand::Remove, record) ||
+            !SendSharedDropTo(commit, m_remoteAddress, m_remotePort, "shared drop remove request commit failed"))
+        {
+            ++m_sharedDropDropped;
+            return;
+        }
+        ++m_sharedDropApplied;
+        m_lastSharedDropEvent = "committed_remote_remove_id_" + std::to_string(record.stableSpawnId);
+        return;
+    }
+
     if (command == CoopProtocol::SharedDropCommand::PickupCommit || command == CoopProtocol::SharedDropCommand::Remove)
     {
         if (packet.objectVersion <= record.version)
@@ -707,7 +759,10 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
             command == CoopProtocol::SharedDropCommand::PickupCommit &&
             packet.targetPeerHash == GetLocalAccountToken();
         std::string detail;
-        if (!RemoveSharedDropLocal(record, grant, detail))
+        record.nativePickupInProgress = true;
+        const bool removed = RemoveSharedDropLocal(record, grant, detail);
+        record.nativePickupInProgress = false;
+        if (!removed)
         {
             ++m_sharedDropDropped;
             m_lastSharedDropEvent = "commit_remove_failed_" + detail;
@@ -1037,8 +1092,44 @@ void ModMain::OnSharedDropEntityRemoved(EntityId entityId)
             ++m_sharedDropApplied;
         }
     }
+    else if (m_networkMode == CoopNetworkMode::Client &&
+        m_hasRemoteEndpoint &&
+        IsSessionGameplayReady())
+    {
+        CoopSerialSequence::Advance(m_sharedDropSequence);
+        CoopProtocol::SharedDropPacket packet;
+        if (BuildSharedDropPacket(packet, CoopProtocol::SharedDropCommand::RemoveRequest, removedRecord) &&
+            SendSharedDropTo(packet, m_remoteAddress, m_remotePort, "shared drop remove request failed"))
+        {
+            ++m_sharedDropApplied;
+        }
+    }
     m_lastSharedDropEvent =
         "unexpected_entity_retire_id_" + std::to_string(stableSpawnId) +
         "_entity_" + std::to_string(entityId) +
         "_terminal_" + std::to_string(m_networkMode == CoopNetworkMode::Host ? 1 : 0);
+}
+
+void ModMain::MarkRemoteRecyclerGrenadeForHook(CArkProjectileRecyclerGrenade* grenade)
+{
+    if (grenade)
+        m_remoteRecyclerGrenades.insert(grenade);
+}
+
+void ModMain::OnRemoteRecyclerGrenadeDestroyedForHook(CArkProjectileRecyclerGrenade* grenade)
+{
+    m_remoteRecyclerGrenades.erase(grenade);
+}
+
+bool ModMain::ShouldSuppressRemoteRecyclerForSharedDrop(
+    const CArkProjectileRecyclerGrenade* grenade,
+    EntityId targetEntityId) const
+{
+    // Recycler processing continues for several frames after Detonate returns,
+    // and its entity can retire before those callbacks. Track the native
+    // recycler object until Destroy rather than relying on either short lifetime.
+    return grenade &&
+        m_remoteRecyclerGrenades.find(grenade) != m_remoteRecyclerGrenades.end() &&
+        targetEntityId != INVALID_ENTITYID &&
+        m_sharedDropByEntityId.find(targetEntityId) != m_sharedDropByEntityId.end();
 }

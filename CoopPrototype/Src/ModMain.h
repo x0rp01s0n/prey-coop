@@ -1718,6 +1718,11 @@ public:
     void OnNativeSharedItemPicked(EntityId itemEntityId, EntityId pickerId, bool success, const char* reason);
     void CaptureLocalPlayerPickupRecovery(EntityId pickerId, const char* reason);
     void OnSharedDropEntityRemoved(EntityId entityId);
+    void MarkRemoteRecyclerGrenadeForHook(CArkProjectileRecyclerGrenade* grenade);
+    void OnRemoteRecyclerGrenadeDestroyedForHook(CArkProjectileRecyclerGrenade* grenade);
+    bool ShouldSuppressRemoteRecyclerForSharedDrop(
+        const CArkProjectileRecyclerGrenade* grenade,
+        EntityId targetEntityId) const;
     bool ShouldDeferSharedStorageOpen(CArkExternalInventoryUI* ui, ArkInventory* inventory, const char* reason);
     void OnSharedStorageTransfer(CArkItem* item, IArkInventory* source, IArkInventory* target, const char* reason);
     void OnSharedStorageClosed(ArkInventory* inventory, const char* reason);
@@ -3343,6 +3348,7 @@ private:
     std::unordered_set<uint64_t> m_sentExplosiveTankEventGuids;
     std::unordered_set<EntityId> m_sentLocalHazardEntityIds;
     std::unordered_set<EntityId> m_remoteHazardEntityIds;
+    std::unordered_set<const CArkProjectileRecyclerGrenade*> m_remoteRecyclerGrenades;
     std::string m_lastHazardEvent = "-";
     uint64_t m_dialogueLeaseDialogueId = 0;
     uint64_t m_dialogueLeasePendingId = 0;
