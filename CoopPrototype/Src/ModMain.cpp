@@ -19483,25 +19483,23 @@ static void CArkItem_Drop_Hook(CArkItem* item, int dropCount, const Vec3* altPos
     const EntityId localPlayerId = ArkPlayer::GetInstancePtr()
         ? ArkPlayer::GetInstance().GetEntityId()
         : INVALID_ENTITYID;
-    unsigned ownerId = 0;
-    if (item)
-        TryGuardedCall("shared drop owner before", [item]() { return item->GetOwnerId(); }, ownerId, nullptr);
-
-    bool localPlayerDrop = ownerId == localPlayerId;
-    if (!localPlayerDrop && item && ArkPlayer::GetInstancePtr())
+    bool localPlayerDrop = false;
+    if (item && localPlayerId != INVALID_ENTITYID)
     {
         ArkInventory* inventory = GetArkInventoryExtensionFromEntity(ArkPlayer::GetInstance().GetEntity());
-        bool inventoryContainsItem = false;
         if (inventory)
         {
             TryGuardedCall(
                 "shared drop inventory membership before",
                 [inventory, item]() { return inventory->Contains(item->GetEntityId()); },
-                inventoryContainsItem,
+                localPlayerDrop,
                 nullptr);
         }
-        localPlayerDrop = inventoryContainsItem;
     }
+
+    // Inventory overflow temporarily assigns the picker as owner, then calls
+    // Drop to roll the failed pickup back when its menu closes. Only an item
+    // that was actually in the inventory before Drop is a player-authored drop.
 
     const CArkItem* previousSource = s_activeSharedDropSource;
     CArkItem* previousClone = s_activeSharedDropClone;
