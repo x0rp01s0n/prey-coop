@@ -668,6 +668,7 @@ uint32_t ModMain::ReconcileLocalPlayerWeaponsFromInventory(const char* reason, b
 
     uint32_t repaired = 0;
     uint32_t weaponCandidates = 0;
+    std::vector<unsigned int> inventoryWeaponIds;
     for (const unsigned itemId : inventoryItemIds)
     {
         CArkItem* item = FindCArkItemForWeaponRepair(itemSystem, itemId, guardReason);
@@ -675,8 +676,66 @@ uint32_t ModMain::ReconcileLocalPlayerWeaponsFromInventory(const char* reason, b
             continue;
 
         ++weaponCandidates;
+        inventoryWeaponIds.push_back(itemId);
         if (EnsureLocalPlayerWeaponRegistered(itemId, reason && reason[0] ? reason : "weapon reconcile"))
             ++repaired;
+    }
+
+    // Spawn-and-give restores weapon ownership and registration, but it does
+    // not run the native presentation pass that hides stored weapons. Match a
+    // vanilla inventory here: only the equipped/pending weapon is visible.
+    // Do not disable physics or mark weapons invisible; their normal equip
+    // path owns those states and must be able to show the entity again.
+    unsigned equippedOrPending = 0;
+    const bool haveEquippedOrPending = TryGuardedCall(
+        "coop weapon reconcile equipped-or-pending presentation",
+        [&weaponComponent]() -> unsigned
+        {
+            return weaponComponent.GetEquippedOrToEquipWeaponId();
+        },
+        equippedOrPending,
+        &guardReason);
+
+    uint32_t hiddenStoredWeapons = 0;
+    if (haveEquippedOrPending && gEnv && gEnv->pEntitySystem)
+    {
+        for (const unsigned itemId : inventoryWeaponIds)
+        {
+            if (itemId == equippedOrPending)
+                continue;
+
+            IEntity* weaponEntity = gEnv->pEntitySystem->GetEntity(itemId);
+            if (!weaponEntity)
+                continue;
+
+            bool alreadyHidden = false;
+            std::string presentationReason;
+            TryGuardedCall(
+                "coop weapon reconcile stored weapon IsHidden",
+                [weaponEntity]() -> bool
+                {
+                    return weaponEntity->IsHidden();
+                },
+                alreadyHidden,
+                &presentationReason);
+            if (alreadyHidden)
+                continue;
+
+            if (TryGuardedVoidCall(
+                    "coop weapon reconcile hide stored weapon",
+                    [weaponEntity]()
+                    {
+                        weaponEntity->Hide(true);
+                    },
+                    &presentationReason))
+            {
+                ++hiddenStoredWeapons;
+            }
+            else if (!presentationReason.empty())
+            {
+                guardReason = presentationReason;
+            }
+        }
     }
 
     if (quickSelect && IsLikelyRuntimeCppObject(quickSelect, sizeof(ArkQuickSelectComponent)))
@@ -696,6 +755,9 @@ uint32_t ModMain::ReconcileLocalPlayerWeaponsFromInventory(const char* reason, b
         " inventoryItems=" + std::to_string(inventoryItemIds.size()) +
         " weaponCandidates=" + std::to_string(weaponCandidates) +
         " repaired=" + std::to_string(repaired) +
+        " hiddenStored=" + std::to_string(hiddenStoredWeapons) +
+        " equippedOrPending=" +
+            (haveEquippedOrPending ? std::to_string(equippedOrPending) : std::string("?")) +
         (reason && reason[0] ? " reason=" + std::string(reason) : std::string()) +
         (guardReason.empty() ? std::string() : " guard=" + StatusToken(guardReason)));
 
