@@ -13596,6 +13596,16 @@ static void ArkProjectileRecyclerGrenade_HandleEntityInArea_Hook(
     const bool recycling)
 {
     const EntityId projectileId = ResolveRecyclerGrenadeEntityId(grenade);
+    if (gMod && gMod->ShouldSuppressRemoteRecyclerForSharedDrop(grenade, static_cast<EntityId>(entityId)))
+    {
+        gMod->RecordRecyclerGrenadeTrace(
+            "HandleEntityInArea suppressed remote shared drop",
+            projectileId,
+            static_cast<EntityId>(entityId),
+            recycling ? 1u : 0u,
+            "authoritative remove pending");
+        return;
+    }
     if (gMod)
     {
         const std::string detail = BuildRecyclerGrenadeDetail(
@@ -13627,6 +13637,18 @@ static bool ArkProjectileRecyclerGrenade_RecycleEntity_Hook(
     const bool inLOS)
 {
     const EntityId projectileId = ResolveRecyclerGrenadeEntityId(grenade);
+    if (gMod && gMod->ShouldSuppressRemoteRecyclerForSharedDrop(grenade, static_cast<EntityId>(entityId)))
+    {
+        gMod->RecordRecyclerGrenadeTrace(
+            "RecycleEntity suppressed remote shared drop",
+            projectileId,
+            static_cast<EntityId>(entityId),
+            inLOS ? 1u : 0u,
+            "authoritative remove pending");
+        return false;
+    }
+    if (gMod)
+        gMod->MarkLocalRecyclerSharedDropForHook(grenade, static_cast<EntityId>(entityId));
     if (gMod)
     {
         const std::string detail = BuildRecyclerGrenadeDetail(grenade, inLOS ? "inLOS=1" : "inLOS=0");
@@ -13638,6 +13660,8 @@ static bool ArkProjectileRecyclerGrenade_RecycleEntity_Hook(
             detail.c_str());
     }
     const bool result = s_hookArkProjectileRecyclerGrenadeRecycleEntity.InvokeOrig(grenade, entityId, inLOS);
+    if (gMod && !result)
+        gMod->UnmarkLocalRecyclerSharedDropForHook(grenade, static_cast<EntityId>(entityId));
     if (gMod)
     {
         const std::string detail = BuildRecyclerGrenadeDetail(
@@ -13714,6 +13738,7 @@ static void ArkProjectileRecyclerGrenade_Destroy_Hook(
     s_hookArkProjectileRecyclerGrenadeDestroy.InvokeOrig(grenade, deleting, destroyImmediate);
     if (gMod)
     {
+        gMod->OnRemoteRecyclerGrenadeDestroyedForHook(grenade);
         gMod->RecordRecyclerGrenadeTrace(
             "Destroy after",
             projectileId,
