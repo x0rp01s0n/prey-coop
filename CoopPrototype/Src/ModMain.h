@@ -2034,9 +2034,14 @@ private:
         uint64_t ownerPeerHash = 0;
         EntityId localEntityId = INVALID_ENTITYID;
         uint32_t version = 0;
+        uint32_t pickupTransactionSequence = 0;
         int count = 0;
         bool live = false;
         bool pickupPending = false;
+        bool pickupGrantReceived = false;
+        bool pickupResultSent = false;
+        bool pickupResultSucceeded = false;
+        float pickupRetrySecondsRemaining = 0.0f;
         bool localPickupGranted = false;
         bool nativePickupInProgress = false;
         uint64_t pickupWinnerPeerHash = 0;
@@ -2045,6 +2050,11 @@ private:
     bool BuildSharedDropPacket(CoopProtocol::SharedDropPacket& packet, CoopProtocol::SharedDropCommand command, const SharedDropRecord& record, uint64_t targetPeerHash = 0) const;
     bool MaterializeSharedDrop(const CoopProtocol::SharedDropPacket& packet, SharedDropRecord& record, std::string& detail);
     bool RemoveSharedDropLocal(SharedDropRecord& record, bool grantToLocalPlayer, std::string& detail);
+    void ReleaseSharedDropReservation(SharedDropRecord& record, uint64_t peerHash, uint32_t transactionSequence, const char* reason);
+    void ReleaseSharedDropReservationsForPeer(uint64_t peerHash);
+    bool SendSharedDropPickupResult(SharedDropRecord& record, bool success);
+    bool SendSharedDropToPeer(const CoopProtocol::SharedDropPacket& packet, uint64_t peerHash, const char* failurePrefix);
+    void TickSharedDropPickupRetries(float frameTime);
     void ResetSharedDropState(const char* reason);
     struct SharedStorageRecord
     {
