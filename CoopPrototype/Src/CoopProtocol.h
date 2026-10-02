@@ -7,7 +7,7 @@
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 249;
+constexpr uint16_t kProtocolVersion = 250;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -439,7 +439,13 @@ enum class SharedDropCommand : uint16_t
     PickupCommit = 3,
     Remove = 4,
     RemoveRequest = 5,
+    PickupGrant = 6,
+    PickupResult = 7,
+    PickupRelease = 8,
 };
+
+constexpr uint16_t kSharedDropFlagLive = 1u << 0;
+constexpr uint16_t kSharedDropFlagPickupSucceeded = 1u << 1;
 
 enum class SharedStorageCommand : uint16_t
 {

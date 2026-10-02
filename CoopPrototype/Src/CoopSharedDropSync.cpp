@@ -118,7 +118,7 @@ bool ModMain::BuildSharedDropPacket(
     packet.targetPeerHash = targetPeerHash;
     packet.archetypeId = record.archetypeId;
     packet.command = static_cast<uint16_t>(command);
-    packet.flags = record.live ? 1u : 0u;
+    packet.flags = record.live ? CoopProtocol::kSharedDropFlagLive : 0u;
     packet.count = record.count;
 
     IEntity* entity = gEnv && gEnv->pEntitySystem && record.localEntityId != INVALID_ENTITYID
@@ -155,6 +155,37 @@ bool ModMain::SendSharedDropTo(
     {
         return false;
     }
+    ++m_sharedDropSent;
+    return true;
+}
+
+bool ModMain::SendSharedDropToPeer(
+    const CoopProtocol::SharedDropPacket& packet,
+    uint64_t peerHash,
+    const char* failurePrefix)
+{
+    if (m_networkMode != CoopNetworkMode::Host || peerHash == 0)
+        return false;
+
+    const auto peerIt = m_remotePeers.find(peerHash);
+    if (peerIt == m_remotePeers.end() || !peerIt->second.sessionReady ||
+        peerIt->second.address == 0 || peerIt->second.port == 0)
+    {
+        return false;
+    }
+
+    if (!QueueReliablePayloadToEndpoint(
+            static_cast<uint16_t>(CoopProtocol::PacketType::SharedDrop),
+            &packet,
+            sizeof(packet),
+            peerIt->second.address,
+            peerIt->second.port,
+            GetLocalAccountToken(),
+            failurePrefix))
+    {
+        return false;
+    }
+
     ++m_sharedDropSent;
     return true;
 }
@@ -312,6 +343,13 @@ bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerI
     // authoritative transaction. OnNativeSharedItemPicked commits it afterward.
     if (m_networkMode == CoopNetworkMode::Host)
     {
+        if (record.pickupPending)
+        {
+            ++m_sharedDropPickupSuppressions;
+            m_lastSharedDropEvent =
+                "suppressed_host_pickup_reserved_id_" + std::to_string(record.stableSpawnId);
+            return true;
+        }
         record.nativePickupInProgress = true;
         return false;
     }
@@ -327,13 +365,27 @@ bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerI
 
     CoopSerialSequence::Advance(m_sharedDropSequence);
     CoopProtocol::SharedDropPacket packet;
-    if (!BuildSharedDropPacket(packet, CoopProtocol::SharedDropCommand::PickupRequest, record) ||
-        !SendSharedDropTo(packet, m_remoteAddress, m_remotePort, "shared drop pickup request failed"))
+    if (!BuildSharedDropPacket(packet, CoopProtocol::SharedDropCommand::PickupRequest, record))
     {
         ++m_sharedDropDropped;
         return true;
     }
     record.pickupPending = true;
+    record.pickupGrantReceived = false;
+    record.pickupResultSent = false;
+    record.pickupResultSucceeded = false;
+    record.pickupRetrySecondsRemaining = 0.0f;
+    record.localPickupGranted = false;
+    record.pickupWinnerPeerHash = 0;
+    record.pickupTransactionSequence = packet.sequence;
+    if (!SendSharedDropTo(packet, m_remoteAddress, m_remotePort, "shared drop pickup request failed"))
+    {
+        record.pickupPending = false;
+        record.pickupTransactionSequence = 0;
+        ++m_sharedDropDropped;
+        return true;
+    }
+    record.pickupRetrySecondsRemaining = 0.25f;
     ++m_sharedDropPickupRequests;
     m_lastSharedDropEvent =
         "sent_pickup_request_id_" + std::to_string(record.stableSpawnId) +
@@ -365,8 +417,13 @@ void ModMain::OnNativeSharedItemPicked(EntityId itemEntityId, EntityId pickerId,
     }
     record.live = false;
     record.pickupPending = false;
+    record.pickupGrantReceived = false;
+    record.pickupResultSent = false;
+    record.pickupResultSucceeded = false;
+    record.pickupRetrySecondsRemaining = 0.0f;
     record.localPickupGranted = true;
     record.pickupWinnerPeerHash = GetLocalAccountToken();
+    record.pickupTransactionSequence = 0;
     record.version += 1;
 
     IEntity* grantedEntity = gEnv && gEnv->pEntitySystem
@@ -579,6 +636,127 @@ bool ModMain::RemoveSharedDropLocal(SharedDropRecord& record, bool grantToLocalP
     return ok;
 }
 
+bool ModMain::SendSharedDropPickupResult(SharedDropRecord& record, bool success)
+{
+    if (record.pickupTransactionSequence == 0 || m_networkMode != CoopNetworkMode::Client ||
+        !m_hasRemoteEndpoint || !IsSessionGameplayReady())
+    {
+        return false;
+    }
+
+    CoopProtocol::SharedDropPacket packet;
+    if (!BuildSharedDropPacket(packet, CoopProtocol::SharedDropCommand::PickupResult, record, GetRemoteAccountToken()))
+        return false;
+    packet.sequence = record.pickupTransactionSequence;
+    packet.flags = success ? CoopProtocol::kSharedDropFlagPickupSucceeded : 0u;
+    const bool sent = SendSharedDropTo(
+        packet,
+        m_remoteAddress,
+        m_remotePort,
+        "shared drop pickup result failed");
+    if (sent)
+    {
+        record.pickupResultSent = true;
+        record.pickupResultSucceeded = success;
+        record.pickupRetrySecondsRemaining = 0.0f;
+        m_lastSharedDropEvent =
+            std::string(success ? "sent_pickup_success_id_" : "sent_pickup_failure_id_") +
+            std::to_string(record.stableSpawnId) +
+            "_transaction_" + std::to_string(record.pickupTransactionSequence);
+    }
+    return sent;
+}
+
+void ModMain::TickSharedDropPickupRetries(float frameTime)
+{
+    if (m_networkMode != CoopNetworkMode::Client || !m_hasRemoteEndpoint || !IsSessionGameplayReady())
+        return;
+
+    const float delta = std::isfinite(frameTime) && frameTime > 0.0f
+        ? std::min(frameTime, 0.25f)
+        : 0.0f;
+    for (auto& entry : m_sharedDrops)
+    {
+        SharedDropRecord& record = entry.second;
+        if (!record.pickupPending || record.pickupTransactionSequence == 0 ||
+            (record.pickupGrantReceived && record.pickupResultSent))
+            continue;
+
+        record.pickupRetrySecondsRemaining = std::max(
+            0.0f,
+            record.pickupRetrySecondsRemaining - delta);
+        if (record.pickupRetrySecondsRemaining > 0.0f)
+            continue;
+
+        if (!record.pickupGrantReceived)
+        {
+            CoopProtocol::SharedDropPacket request;
+            if (BuildSharedDropPacket(request, CoopProtocol::SharedDropCommand::PickupRequest, record))
+            {
+                request.sequence = record.pickupTransactionSequence;
+                SendSharedDropTo(request, m_remoteAddress, m_remotePort, "shared drop pickup request retry failed");
+            }
+            record.pickupRetrySecondsRemaining = 0.25f;
+        }
+        else
+        {
+            if (!SendSharedDropPickupResult(record, record.pickupResultSucceeded))
+                record.pickupRetrySecondsRemaining = 0.25f;
+        }
+    }
+}
+
+void ModMain::ReleaseSharedDropReservation(
+    SharedDropRecord& record,
+    uint64_t peerHash,
+    uint32_t transactionSequence,
+    const char* reason)
+{
+    ++record.version;
+    record.live = true;
+    record.pickupPending = false;
+    record.pickupGrantReceived = false;
+    record.pickupResultSent = false;
+    record.pickupResultSucceeded = false;
+    record.pickupRetrySecondsRemaining = 0.0f;
+    record.localPickupGranted = false;
+    record.pickupWinnerPeerHash = 0;
+    record.pickupTransactionSequence = 0;
+
+    if (m_networkMode != CoopNetworkMode::Host || !m_hasRemoteEndpoint || !IsSessionGameplayReady())
+        return;
+
+    CoopProtocol::SharedDropPacket release;
+    if (BuildSharedDropPacket(release, CoopProtocol::SharedDropCommand::PickupRelease, record, peerHash))
+    {
+        release.sequence = transactionSequence;
+        const bool sent = peerHash != 0
+            ? SendSharedDropToPeer(release, peerHash, "shared drop pickup release failed")
+            : SendSharedDropTo(release, m_remoteAddress, m_remotePort, "shared drop pickup release failed");
+        if (sent)
+            ++m_sharedDropPickupSuppressions;
+    }
+    m_lastSharedDropEvent =
+        "released_pickup_reservation_id_" + std::to_string(record.stableSpawnId) +
+        "_reason_" + (reason ? reason : "-");
+}
+
+void ModMain::ReleaseSharedDropReservationsForPeer(uint64_t peerHash)
+{
+    if (m_networkMode != CoopNetworkMode::Host || peerHash == 0)
+        return;
+
+    for (auto& entry : m_sharedDrops)
+    {
+        SharedDropRecord& record = entry.second;
+        if (!record.pickupPending || record.pickupWinnerPeerHash != peerHash)
+            continue;
+
+        const uint32_t transactionSequence = record.pickupTransactionSequence;
+        ReleaseSharedDropReservation(record, 0, transactionSequence, "peer_removed");
+    }
+}
+
 void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
 {
     ++m_sharedDropReceived;
@@ -588,16 +766,31 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
         (m_networkMode == CoopNetworkMode::Host &&
             (command == CoopProtocol::SharedDropCommand::Spawn ||
                 command == CoopProtocol::SharedDropCommand::PickupRequest ||
+                command == CoopProtocol::SharedDropCommand::PickupResult ||
                 command == CoopProtocol::SharedDropCommand::RemoveRequest)) ||
         (m_networkMode == CoopNetworkMode::Client &&
             (command == CoopProtocol::SharedDropCommand::Spawn ||
                 command == CoopProtocol::SharedDropCommand::PickupCommit ||
-                command == CoopProtocol::SharedDropCommand::Remove));
+                command == CoopProtocol::SharedDropCommand::Remove ||
+                command == CoopProtocol::SharedDropCommand::PickupGrant ||
+                command == CoopProtocol::SharedDropCommand::PickupRelease));
+    const bool targetAllowsCommand =
+        (m_networkMode == CoopNetworkMode::Host &&
+            command == CoopProtocol::SharedDropCommand::PickupResult &&
+            packet.targetPeerHash == GetLocalAccountToken()) ||
+        (m_networkMode == CoopNetworkMode::Client &&
+            (command == CoopProtocol::SharedDropCommand::PickupGrant ||
+                command == CoopProtocol::SharedDropCommand::PickupRelease) &&
+            (packet.targetPeerHash == GetLocalAccountToken() ||
+                (command == CoopProtocol::SharedDropCommand::PickupRelease && packet.targetPeerHash == 0))) ||
+        (command != CoopProtocol::SharedDropCommand::PickupResult &&
+            command != CoopProtocol::SharedDropCommand::PickupGrant &&
+            command != CoopProtocol::SharedDropCommand::PickupRelease);
     if (packet.worldEpoch != m_localWorldEpoch ||
         packet.hostSaveKeyHash == 0 ||
         packet.hostSaveKeyHash != CurrentHostSaveKeyHash() ||
         packet.areaId != m_localLevelId || packet.stableSpawnId == 0 || packet.archetypeId == 0 ||
-        packet.sourcePeerHash == 0 || packet.sourcePeerHash != remotePeerHash || !roleAllowsCommand ||
+        packet.sourcePeerHash == 0 || packet.sourcePeerHash != remotePeerHash || !roleAllowsCommand || !targetAllowsCommand ||
         (command == CoopProtocol::SharedDropCommand::Spawn && !IsFiniteTransform(packet)))
     {
         ++m_sharedDropDropped;
@@ -647,12 +840,16 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
 
     if (command == CoopProtocol::SharedDropCommand::PickupRequest)
     {
-        if (m_networkMode == CoopNetworkMode::Host && !record.live && record.pickupWinnerPeerHash != 0)
+        if (m_networkMode != CoopNetworkMode::Host || packet.sequence == 0)
         {
-            // A repeated request can arrive after the first reliable commit was
-            // queued. Re-broadcast the same terminal decision; peers apply it
-            // idempotently and only the original winner receives the item.
-            CoopSerialSequence::Advance(m_sharedDropSequence);
+            ++m_sharedDropDropped;
+            return;
+        }
+
+        if (!record.live && record.pickupWinnerPeerHash != 0)
+        {
+            // Requests after a terminal decision receive the existing result;
+            // never answer a terminal record with a live reservation release.
             CoopProtocol::SharedDropPacket commit;
             if (BuildSharedDropPacket(
                     commit,
@@ -660,6 +857,7 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
                     record,
                     record.pickupWinnerPeerHash))
             {
+                commit.sequence = record.pickupTransactionSequence;
                 SendSharedDropTo(commit, m_remoteAddress, m_remotePort, "shared drop duplicate request commit failed");
             }
             ++m_sharedDropPickupSuppressions;
@@ -667,30 +865,275 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
             return;
         }
 
-        if (m_networkMode != CoopNetworkMode::Host || !record.live || packet.objectVersion != record.version)
+        if (record.pickupPending)
         {
+            if (record.pickupWinnerPeerHash == packet.sourcePeerHash &&
+                record.pickupTransactionSequence == packet.sequence)
+            {
+                CoopProtocol::SharedDropPacket grant;
+                if (BuildSharedDropPacket(grant, CoopProtocol::SharedDropCommand::PickupGrant, record, packet.sourcePeerHash))
+                {
+                    grant.sequence = packet.sequence;
+                    SendSharedDropToPeer(grant, packet.sourcePeerHash, "shared drop duplicate grant failed");
+                }
+                m_lastSharedDropEvent = "replayed_pickup_grant_id_" + std::to_string(record.stableSpawnId);
+            }
+            else
+            {
+                CoopProtocol::SharedDropPacket release;
+                if (BuildSharedDropPacket(release, CoopProtocol::SharedDropCommand::PickupRelease, record, packet.sourcePeerHash))
+                {
+                    release.sequence = packet.sequence;
+                    SendSharedDropToPeer(release, packet.sourcePeerHash, "shared drop competing request release failed");
+                }
+                ++m_sharedDropPickupSuppressions;
+            }
+            return;
+        }
+
+        if (!record.live || packet.objectVersion != record.version)
+        {
+            if (!record.live)
+            {
+                CoopProtocol::SharedDropPacket removal;
+                if (BuildSharedDropPacket(removal, CoopProtocol::SharedDropCommand::Remove, record))
+                {
+                    removal.sequence = packet.sequence;
+                    SendSharedDropTo(removal, m_remoteAddress, m_remotePort, "shared drop terminal request removal failed");
+                }
+            }
+            else
+            {
+                CoopProtocol::SharedDropPacket release;
+                if (BuildSharedDropPacket(release, CoopProtocol::SharedDropCommand::PickupRelease, record, packet.sourcePeerHash))
+                {
+                    release.sequence = packet.sequence;
+                    SendSharedDropToPeer(release, packet.sourcePeerHash, "shared drop rejected pickup release failed");
+                }
+            }
             ++m_sharedDropDropped;
             m_lastSharedDropEvent = "pickup_request_rejected_id_" + std::to_string(record.stableSpawnId);
             return;
         }
 
         record.version += 1;
-        record.live = false;
-        record.pickupPending = false;
+        record.pickupPending = true;
+        record.pickupGrantReceived = false;
+        record.pickupResultSent = false;
+        record.pickupResultSucceeded = false;
+        record.pickupRetrySecondsRemaining = 0.0f;
         record.pickupWinnerPeerHash = packet.sourcePeerHash;
-        std::string detail;
-        RemoveSharedDropLocal(record, false, detail);
-        CoopSerialSequence::Advance(m_sharedDropSequence);
-        CoopProtocol::SharedDropPacket commit;
-        if (!BuildSharedDropPacket(commit, CoopProtocol::SharedDropCommand::PickupCommit, record, packet.sourcePeerHash) ||
-            !SendSharedDropTo(commit, m_remoteAddress, m_remotePort, "shared drop pickup commit failed"))
+        record.pickupTransactionSequence = packet.sequence;
+
+        CoopProtocol::SharedDropPacket grant;
+        if (!BuildSharedDropPacket(grant, CoopProtocol::SharedDropCommand::PickupGrant, record, packet.sourcePeerHash))
         {
+            ReleaseSharedDropReservation(record, packet.sourcePeerHash, packet.sequence, "grant_build_failed");
             ++m_sharedDropDropped;
             return;
         }
-        ++m_sharedDropPickupCommits;
-        ++m_sharedDropApplied;
-        m_lastSharedDropEvent = "committed_remote_pickup_id_" + std::to_string(record.stableSpawnId);
+        grant.sequence = packet.sequence;
+        if (!SendSharedDropToPeer(grant, packet.sourcePeerHash, "shared drop pickup grant failed"))
+        {
+            ReleaseSharedDropReservation(record, packet.sourcePeerHash, packet.sequence, "grant_send_failed");
+            ++m_sharedDropDropped;
+            return;
+        }
+        ++m_sharedDropPickupRequests;
+        m_lastSharedDropEvent =
+            "reserved_pickup_id_" + std::to_string(record.stableSpawnId) +
+            "_transaction_" + std::to_string(packet.sequence);
+        return;
+    }
+
+    if (command == CoopProtocol::SharedDropCommand::PickupResult)
+    {
+        const bool success = (packet.flags & CoopProtocol::kSharedDropFlagPickupSucceeded) != 0;
+        const bool activeReservation =
+            record.pickupPending &&
+            record.pickupWinnerPeerHash == packet.sourcePeerHash &&
+            record.pickupTransactionSequence == packet.sequence &&
+            record.version == packet.objectVersion;
+        if (!activeReservation)
+        {
+            // A retransmitted success after the commit is safe to answer
+            // idempotently, but stale failures never alter a newer lifetime.
+            if (success && !record.live &&
+                record.pickupWinnerPeerHash == packet.sourcePeerHash &&
+                record.pickupTransactionSequence == packet.sequence)
+            {
+                CoopProtocol::SharedDropPacket commit;
+                if (BuildSharedDropPacket(commit, CoopProtocol::SharedDropCommand::PickupCommit, record, packet.sourcePeerHash))
+                {
+                    commit.sequence = packet.sequence;
+                    SendSharedDropTo(commit, m_remoteAddress, m_remotePort, "shared drop replayed result commit failed");
+                }
+            }
+            else
+            {
+                ++m_sharedDropDropped;
+                m_lastSharedDropEvent = "pickup_result_rejected_id_" + std::to_string(record.stableSpawnId);
+            }
+            return;
+        }
+
+        if (!success)
+        {
+            ReleaseSharedDropReservation(record, packet.sourcePeerHash, packet.sequence, "native_pickup_failed");
+            ++m_sharedDropPickupSuppressions;
+            return;
+        }
+
+        record.version += 1;
+        record.live = false;
+        record.pickupPending = false;
+        record.pickupGrantReceived = false;
+        record.pickupResultSent = false;
+        record.pickupResultSucceeded = true;
+        record.pickupRetrySecondsRemaining = 0.0f;
+        record.localPickupGranted = false;
+        record.pickupWinnerPeerHash = packet.sourcePeerHash;
+        record.pickupTransactionSequence = packet.sequence;
+        std::string detail;
+        RemoveSharedDropLocal(record, false, detail);
+
+        CoopProtocol::SharedDropPacket commit;
+        if (BuildSharedDropPacket(commit, CoopProtocol::SharedDropCommand::PickupCommit, record, packet.sourcePeerHash))
+        {
+            commit.sequence = packet.sequence;
+            if (SendSharedDropTo(commit, m_remoteAddress, m_remotePort, "shared drop pickup commit failed"))
+            {
+                ++m_sharedDropPickupCommits;
+                ++m_sharedDropApplied;
+            }
+            else
+                ++m_sharedDropDropped;
+        }
+        m_lastSharedDropEvent =
+            "committed_remote_pickup_id_" + std::to_string(record.stableSpawnId) +
+            "_transaction_" + std::to_string(packet.sequence) +
+            "_" + detail;
+        return;
+    }
+
+    if (command == CoopProtocol::SharedDropCommand::PickupGrant)
+    {
+        if (m_networkMode != CoopNetworkMode::Client ||
+            !record.pickupPending || packet.sequence == 0 ||
+            packet.sequence != record.pickupTransactionSequence)
+        {
+            ++m_sharedDropDropped;
+            m_lastSharedDropEvent = "stale_pickup_grant_id_" + std::to_string(record.stableSpawnId);
+            return;
+        }
+
+        if (record.pickupGrantReceived)
+        {
+            SendSharedDropPickupResult(record, record.pickupResultSucceeded);
+            return;
+        }
+        if (!record.live || packet.objectVersion != record.version + 1)
+        {
+            ++m_sharedDropDropped;
+            m_lastSharedDropEvent = "invalid_pickup_grant_version_id_" + std::to_string(record.stableSpawnId);
+            return;
+        }
+
+        record.version = packet.objectVersion;
+        record.pickupGrantReceived = true;
+        record.pickupRetrySecondsRemaining = 0.0f;
+        const EntityId entityId = record.localEntityId;
+        CArkItem* item = entityId != INVALID_ENTITYID
+            ? CArkItem::GetItemFromEntityId(entityId)
+            : nullptr;
+        const EntityId pickerId = ArkPlayer::GetInstancePtr()
+            ? ArkPlayer::GetInstance().GetEntityId()
+            : INVALID_ENTITYID;
+        bool pickedUp = false;
+        std::string reason;
+        if (item && pickerId != INVALID_ENTITYID)
+        {
+            record.nativePickupInProgress = true;
+            ++m_sharedDropApplyDepth;
+            const bool guarded = CoopRuntimeGuards::TryGuardedCall(
+                "shared drop granted native PickUp",
+                [item, pickerId]() { return item->PickUp(pickerId, false); },
+                pickedUp,
+                &reason);
+            --m_sharedDropApplyDepth;
+            record.nativePickupInProgress = false;
+            pickedUp = guarded && pickedUp;
+        }
+
+        if (pickedUp)
+        {
+            record.live = false;
+            record.localPickupGranted = true;
+            record.pickupWinnerPeerHash = GetLocalAccountToken();
+            IEntity* grantedEntity = gEnv && gEnv->pEntitySystem
+                ? gEnv->pEntitySystem->GetEntity(entityId)
+                : nullptr;
+            CArkItem* grantedItem = grantedEntity ? CArkItem::GetItemFromEntityId(entityId) : item;
+            const bool isWeapon = CoopItemClassification::IsRealWeaponInventoryItem(grantedItem, reason);
+            if (grantedEntity && !isWeapon)
+                SetSharedDropWorldPresentation(*grantedEntity, false, reason);
+            EnsureLocalPlayerWeaponRegistered(entityId, "shared drop grant");
+            if (!grantedEntity)
+            {
+                m_sharedDropByEntityId.erase(entityId);
+                record.localEntityId = INVALID_ENTITYID;
+            }
+        }
+        else
+        {
+            record.live = true;
+            record.localPickupGranted = false;
+            record.pickupWinnerPeerHash = GetLocalAccountToken();
+        }
+
+        record.pickupResultSucceeded = pickedUp;
+        SendSharedDropPickupResult(record, pickedUp);
+        if (!pickedUp)
+            m_lastSharedDropEvent =
+                "native_pickup_failed_id_" + std::to_string(record.stableSpawnId) +
+                "_reason_" + (reason.empty() ? "rejected" : reason);
+        return;
+    }
+
+    if (command == CoopProtocol::SharedDropCommand::PickupRelease)
+    {
+        const bool peerRemovalRelease = packet.targetPeerHash == 0;
+        if (m_networkMode != CoopNetworkMode::Client || packet.sequence == 0 ||
+            (!peerRemovalRelease && packet.sequence != record.pickupTransactionSequence) ||
+            packet.objectVersion <= record.version ||
+            (packet.flags & CoopProtocol::kSharedDropFlagLive) == 0)
+        {
+            ++m_sharedDropDropped;
+            m_lastSharedDropEvent = "stale_pickup_release_id_" + std::to_string(record.stableSpawnId);
+            return;
+        }
+
+        if (!peerRemovalRelease && record.localPickupGranted)
+        {
+            // Preserve a successful local native pickup if its matching
+            // reservation release is replayed by the reliable transport.
+            SendSharedDropPickupResult(record, true);
+            record.pickupPending = false;
+            m_lastSharedDropEvent = "pickup_release_after_success_id_" + std::to_string(record.stableSpawnId);
+            return;
+        }
+
+        record.version = packet.objectVersion;
+        record.live = true;
+        record.pickupPending = false;
+        record.pickupGrantReceived = false;
+        record.pickupResultSent = false;
+        record.pickupResultSucceeded = false;
+        record.pickupRetrySecondsRemaining = 0.0f;
+        record.localPickupGranted = false;
+        record.pickupWinnerPeerHash = 0;
+        record.pickupTransactionSequence = 0;
+        m_lastSharedDropEvent = "pickup_released_id_" + std::to_string(record.stableSpawnId);
         return;
     }
 
@@ -752,15 +1195,47 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
             ++m_sharedDropDuplicateCommits;
             return;
         }
-        record.version = packet.objectVersion;
-        record.pickupPending = false;
-        record.pickupWinnerPeerHash = packet.targetPeerHash;
         const bool grant =
             command == CoopProtocol::SharedDropCommand::PickupCommit &&
             packet.targetPeerHash == GetLocalAccountToken();
+
+        if (grant)
+        {
+            // The winner already ran native PickUp after receiving PickupGrant.
+            // A commit only seals that successful local transaction; calling
+            // PickUp again here recreates the full-inventory duplicate bug.
+            if (!record.localPickupGranted ||
+                packet.sequence == 0 || packet.sequence != record.pickupTransactionSequence)
+            {
+                ++m_sharedDropDropped;
+                m_lastSharedDropEvent = "pickup_commit_without_local_success_id_" +
+                    std::to_string(record.stableSpawnId);
+                return;
+            }
+            record.version = packet.objectVersion;
+            record.live = false;
+            record.pickupPending = false;
+            record.pickupGrantReceived = false;
+            record.pickupResultSent = false;
+            record.pickupResultSucceeded = true;
+            record.pickupWinnerPeerHash = packet.targetPeerHash;
+            ++m_sharedDropApplied;
+            m_lastSharedDropEvent = "finalized_local_pickup_id_" +
+                std::to_string(record.stableSpawnId) +
+                "_transaction_" + std::to_string(packet.sequence);
+            return;
+        }
+
+        record.version = packet.objectVersion;
+        record.pickupPending = false;
+        record.pickupGrantReceived = false;
+        record.pickupResultSent = false;
+        record.pickupResultSucceeded = false;
+        record.pickupWinnerPeerHash = packet.targetPeerHash;
+        record.pickupTransactionSequence = packet.sequence;
         std::string detail;
         record.nativePickupInProgress = true;
-        const bool removed = RemoveSharedDropLocal(record, grant, detail);
+        const bool removed = RemoveSharedDropLocal(record, false, detail);
         record.nativePickupInProgress = false;
         if (!removed)
         {

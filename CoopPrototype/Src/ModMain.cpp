@@ -35952,6 +35952,7 @@ void ModMain::MainUpdate(unsigned updateFlags)
     TickPendingRemoteCorpsePhantomResults();
 
     TickNetwork(frameTime);
+    TickSharedDropPickupRetries(frameTime);
     TickChat(frameTime, GetNowSeconds());
     TickRemotePlayerProxySmoothing(frameTime);
     TickRemoteDoorPowerConvergence(frameTime);
@@ -70097,6 +70098,7 @@ void ModMain::RemoveRemotePeer(uint64_t accountToken, const char* reason, bool a
     if (peer.runtimeSessionNonce != 0)
         m_retiredRuntimeSessionNonces[accountToken].insert(peer.runtimeSessionNonce);
     m_remotePeers.erase(it);
+    ReleaseSharedDropReservationsForPeer(accountToken);
     for (const EntityId entityId : reclaimedTurretEntities)
     {
         IEntity* entity = gEnv && gEnv->pEntitySystem
