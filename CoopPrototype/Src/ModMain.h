@@ -1557,6 +1557,8 @@ public:
         uint32_t weaponModCount = 0;
         uint32_t weaponModTotalLevel = 0;
         std::vector<std::pair<uint64_t, int>> weaponMods;
+        EntityId pendingRestoreEntityId = INVALID_ENTITYID; // Runtime-only placement retry; not serialized.
+        bool pendingRestoreBlocked = false; // Runtime-only fail-closed marker for ambiguous native insertion.
     };
 
     struct PlayerAbilityState
