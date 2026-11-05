@@ -88,6 +88,8 @@ set(SOURCE_FILES
 	CoopRuntimeGuards.h
 	CoopHookStats.cpp
 	CoopHookStats.h
+	CoopPerfDiagnostics.cpp
+	CoopPerfDiagnostics.h
 	CoopRuntimeLog.cpp
 	CoopRuntimeLog.h
 	CoopRuntimeConfig.cpp

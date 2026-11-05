@@ -3,6 +3,7 @@
 #include "CoopFilesystem.h"
 #include "CoopProfilePath.h"
 #include "CoopRuntimeLog.h"
+#include "CoopPerfDiagnostics.h"
 #include "CoopItemClassification.h"
 #include "CoopPtrHygiene.h"
 #include "CoopNativeFragmentPayload.h"
@@ -2888,6 +2889,7 @@ uint64_t ModMain::GetPlayerSidecarRecoveryJournalRevision() const
 
 bool ModMain::WriteLocalPlayerRecoveryJournal(const char* reason)
 {
+    CoopPerfDiagnostics::ScopedTimer perfPrepareTimer(CoopPerfDiagnostics::Metric::RecoveryJournalPrepare);
     const std::string journalPathString = GetPlayerSidecarRecoveryJournalPath();
     const std::string sourcePathString = GetPlayerSidecarPath();
     if (journalPathString.empty() || sourcePathString.empty())
@@ -2945,7 +2947,13 @@ bool ModMain::WriteLocalPlayerRecoveryJournal(const char* reason)
     const std::filesystem::path journalPath = CoopFilesystem::FromUtf8(journalPathString);
     std::error_code error;
     std::filesystem::create_directories(journalPath.parent_path(), error);
-    if (error || !WritePlayerSidecarPayloadWithHash(journalPath, payload))
+    bool journalWritten = false;
+    if (!error)
+    {
+        CoopPerfDiagnostics::ScopedTimer perfWriteTimer(CoopPerfDiagnostics::Metric::RecoveryJournalAtomicWrite);
+        journalWritten = WritePlayerSidecarPayloadWithHash(journalPath, payload);
+    }
+    if (error || !journalWritten)
     {
         LogCoop("player recovery journal write failed saveKey=" + saveKey);
         return false;
@@ -3248,6 +3256,7 @@ bool ModMain::SaveLocalPlayerSidecar(const char* reason)
         return false;
     }
 
+    CoopPerfDiagnostics::ScopedTimer perfSerializeTimer(CoopPerfDiagnostics::Metric::SidecarPayloadSerialize);
     std::ostringstream output;
     output.imbue(std::locale::classic());
     output << std::fixed << std::setprecision(6);
@@ -3488,7 +3497,14 @@ bool ModMain::SaveLocalPlayerSidecar(const char* reason)
         WriteNativeCaptureSidecarSection(output, m_lastNativePlayerSaveCapture);
 
     const std::string payload = output.str();
-    if (payload.empty() || !WritePlayerSidecarPayloadWithHash(path, payload))
+    perfSerializeTimer.Stop();
+    bool sidecarWritten = false;
+    if (!payload.empty())
+    {
+        CoopPerfDiagnostics::ScopedTimer perfWriteTimer(CoopPerfDiagnostics::Metric::SidecarAtomicWrite);
+        sidecarWritten = WritePlayerSidecarPayloadWithHash(path, payload);
+    }
+    if (payload.empty() || !sidecarWritten)
     {
         ++m_playerSidecarFailCount;
         m_lastPlayerSidecarEvent = "save failed: write error";
@@ -4580,6 +4596,7 @@ void ModMain::QueuePlayerSidecarInventoryRestore(
 
 bool ModMain::TryRestorePendingPlayerSidecarInventory(const char* reason, bool nativeRestoreWindow)
 {
+    CoopPerfDiagnostics::ScopedTimer perfRestoreTimer(CoopPerfDiagnostics::Metric::InventoryRestoreAttempt);
     if (!m_pendingPlayerSidecarInventoryRestore)
         return true;
 

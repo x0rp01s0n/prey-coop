@@ -2,6 +2,7 @@
 #include "CoopRuntimeGuards.h"
 #include "CoopChat.h"
 #include "CoopHookStats.h"
+#include "CoopPerfDiagnostics.h"
 #include "CoopWorkstationSync.h"
 #include "CoopSerialSequence.h"
 #include "CoopSessionHelloPolicy.h"
@@ -31482,6 +31483,22 @@ void ModMain::InstallCrashExceptionHandler()
         LogCoop("runtime log initialization failed");
     }
 
+    if (CoopPerfDiagnostics::Enabled())
+    {
+        std::filesystem::path perfOutputDirectory;
+        perfOutputDirectory = CoopFilesystem::EnvironmentPath("COOP_PERF_OUTPUT_DIR");
+        if (perfOutputDirectory.empty() && !profileRoot.empty())
+        {
+            perfOutputDirectory = profileRoot / "CoopPrototype" / "Diagnostics" / "Performance";
+        }
+        else if (perfOutputDirectory.empty())
+        {
+            perfOutputDirectory = std::filesystem::path(".");
+        }
+        const bool configured = CoopPerfDiagnostics::ConfigureOutputDirectory(perfOutputDirectory);
+        LogCoop(std::string("performance diagnostics output configured=") + (configured ? "1" : "0"));
+    }
+
     if (!g_purecallTraceHandlerInstalled)
     {
         g_previousPurecallHandler = _set_purecall_handler(&CoopPurecallTraceHandler);
@@ -35708,16 +35725,28 @@ void ModMain::MainUpdate(unsigned updateFlags)
 {
     const float frameTime = gEnv && gEnv->pTimer ? gEnv->pTimer->GetFrameTime() : 0.0f;
     const float realFrameTime = gEnv && gEnv->pTimer ? gEnv->pTimer->GetRealFrameTime() : frameTime;
+    CoopPerfDiagnostics::UpdateScope perfUpdateScope(frameTime, realFrameTime, updateFlags);
+    if (perfUpdateScope.Active())
+    {
+        const char* networkRole = m_networkMode == CoopNetworkMode::Host ? "host" :
+            m_networkMode == CoopNetworkMode::Client ? "client" : "off";
+        perfUpdateScope.SetContext(
+            networkRole,
+            IsGameReady(),
+            IsSessionGameplayReady(),
+            m_saveLoadGuardActive,
+            m_playerSidecarInventoryPending);
+    }
 
     // Refresh the bounded report outside the log hot path. This keeps the
     // release diagnostic available without turning every emitted event into a
     // synchronous disk write.
     CoopRuntimeLog::Flush();
 
-    // Periodic self-profiling dump (issue #2): hook cost breakdown + guarded
-    // call / VirtualQuery totals straight into Game.log, independent of the
-    // extractor status writer. Once per ~10 s at 60 fps (600 frames).
+    if (!CoopPerfDiagnostics::Capturing())
     {
+        // Preserve the release hook report cadence unless the opt-in
+        // diagnostic writer owns the same counters at its two-second cadence.
         static std::atomic<uint32_t> s_hookStatFrameCounter{0};
         static std::atomic<uint64_t> s_lastDumpGuardNs{0};
         static std::atomic<uint64_t> s_lastDumpVq{0};
