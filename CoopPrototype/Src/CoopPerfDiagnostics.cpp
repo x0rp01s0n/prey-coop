@@ -1,3 +1,7 @@
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "CoopPerfDiagnostics.h"
 
 #include "CoopHookStats.h"
