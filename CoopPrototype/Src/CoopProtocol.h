@@ -7,7 +7,7 @@
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 249;
+constexpr uint16_t kProtocolVersion = 254;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -276,13 +276,18 @@ constexpr uint32_t kAreaObjectDoorStateFlagLocked = 1u << 2;
 constexpr uint32_t kAreaObjectDoorStateFlagScriptState = 1u << 3;
 constexpr uint32_t kAreaObjectDoorStateFlagPowerSupplied = 1u << 4;
 constexpr uint32_t kAreaObjectDoorStateFlagDisrupted = 1u << 5;
+constexpr uint32_t kAreaObjectDoorStateFlagExplicitOpen = 1u << 6;
+// Live-event evidence only: the sender's own player was in the native area.
+constexpr uint32_t kAreaObjectDoorStateFlagSenderInside = 1u << 7;
 constexpr uint32_t kAreaObjectDoorStateFlagMask =
     kAreaObjectDoorStateFlagSnapshot |
     kAreaObjectDoorStateFlagPowered |
     kAreaObjectDoorStateFlagLocked |
     kAreaObjectDoorStateFlagScriptState |
     kAreaObjectDoorStateFlagPowerSupplied |
-    kAreaObjectDoorStateFlagDisrupted;
+    kAreaObjectDoorStateFlagDisrupted |
+    kAreaObjectDoorStateFlagExplicitOpen |
+    kAreaObjectDoorStateFlagSenderInside;
 constexpr uint16_t kAreaObjectEventWorldItemRemoved = 4;
 constexpr uint16_t kAreaObjectEventKeypadLocked = 5;
 constexpr uint16_t kAreaObjectEventKeycardReaderLocked = 6;
