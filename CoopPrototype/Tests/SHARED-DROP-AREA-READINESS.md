@@ -2,6 +2,63 @@
 
 ## Follow-up On 2026-11-14
 
+V38 production source `98b9c9d` includes current main `f2cd255`, protocol 258.
+Ten native Windows scenarios completed on the same DLL:
+
+| Scenarios | Native boundary checked |
+| --- | --- |
+| 1 | Solo Host pickup, repeated pickup, offline redrop and live rejoin |
+| 1 | Native area travel, Client Area Authority pickup/redrop, continuing stop/rehost |
+| 2 | Saved public drops originating from either player, hard Host restart, pickup and consumed-source rejoin |
+| 2 | Rollback before a later drop and before a later pickup |
+| 1 | Cold offline Host load, assigned pickup before networking starts, rehost and native save/reload |
+| 1 | Full Client inventory, saved assigned remainder, Host crash, free space and delivery |
+| 1 | Client stack at 999 receives two: checkpoint contains delivered 1 / remaining 1; restart delivers only the remainder |
+| 1 | Full Host inventory, saved assigned remainder, crash, offline delivery and rehost |
+
+Native inventory quantities/cells, visible world entities and exact persisted
+receipts were checked independently. Repeated pickup and subsequent save/reload
+must not grant again or recreate the public source. The offline case additionally
+removed the delivered item and observed no stale entitlement regrant. This does
+not prove a further checkpoint reload after that final removal.
+
+Diagnostic DLL SHA256:
+`550f6d98d5ce9abf38b2d65bf4e0dffa576a10df4abdf26a6ce4f750c34268cd`.
+The normal Release build also succeeds with `COOP_ESCROW_NATIVE_TEST_CONTROLS=OFF`:
+`932bf33b3aa154e17d4131ba886f9a041130d708811bbe7026bed2efc2f682c3`.
+All 14 archived production source hashes match `98b9c9d` in each of these archives:
+
+| Evidence archive | Completed cases | SHA256 |
+| --- | --- | --- |
+| `checkpoint-final-v38-20261114-evidence.zip` | Solo, split, both saved-public crash cases | `88eda5945a18bf6e7e411b1e61aa77b0f0d374e47842361d73158c01f0bd82ec` |
+| `checkpoint-final-v38-remaining-20261114-evidence.zip` | Both rollback cases, cold offline pickup, full Client | `1ae726859088ed30fe2993f3182972fb973b5370c5dd106d9392b47818aa0898` |
+| `checkpoint-final-v38-overflow-20261114-evidence.zip` | Partial Client stack, full Host | `65e571f6f4a876441077e78286db09cf5128946aa0f5161bc2966ae84026f80a` |
+
+These are completed individual cases, not three wholly passing invocations.
+The first invocation stopped on a helper/wrapper timestamp directory collision;
+the second stopped because placing the stack first fragmented the filler grid.
+Those harness defects were corrected and the remaining cases rerun without any
+production source change. Another retained attempt expected an overflow menu
+after a successful partial stack transfer; vanilla returned without a menu, so
+the test now checks that closed state as well as the exact delta and receipt.
+An earlier extra save immediately after native reload was refused by vanilla;
+that extra checkpoint operation is not counted as passing proof.
+
+Every invocation restored the original isolated profiles/mods using complete
+path/size/SHA256 manifests. No disposable game remains running. Helpers, build
+logs, normal-build cache and restoration manifests are in
+`checkpoint-v38-final-support-20261114-complete.zip`, SHA256
+`a1dc879683166befa0e632123780fa6fb90663af91b45b9efe79254c29cb3ea8`.
+All archive integrity checks pass. Evidence is retained on disk outside Git.
+
+The 600 focused automated checks pass; engine/IO fakes are distinguished from
+native proof in [the checkpoint audit](PLAYER-CHECKPOINT-RECOVERY.md).
+The controlled native fixture does not cover every weapon/ammo/condition variant
+or reproduce the reported recycler-grenade crash. The changes use the existing
+shared-drop identity, delivery receipts and checkpoint Store, not another journal.
+
+### Earlier Candidates
+
 V36 reran the solo and split-area cases on current main, including native travel,
 stop/rehost, offline collection/redrop, and repeated pickup/rejoin. Four hard Host
 restart cases also passed: saved public sources from either player, a drop after
@@ -20,11 +77,11 @@ zero in both inventories and no public source. V36 retires the acquired lifetime
 before vanilla redrop and assigns a fresh identity. This is a shared-drop
 lifecycle fix, not an additional journal.
 
-V36 is not final proof for the later pending-remainder changes. A production
+V36 was not final proof for the later pending-remainder changes. A production
 function regression subsequently found that transfer preparation discarded an
 already-assigned, partially delivered receipt on a new transport session. That
-case and serialization-point checkpoint staging still need native verification.
-The PR remains on hold until those checks finish.
+case and serialization-point checkpoint staging required the V38 verification
+recorded above.
 
 V32, protocol 258, fixes both V30 counterexamples below without another journal:
 publication creates a fresh lifetime even when the Host is alone; ownership
@@ -46,12 +103,12 @@ verified after that run.
 Further selected-production tests exposed and fixed two follow-up cases:
 duplicate saved entities bearing one source ID, and loss of the catalog when a
 continuing Host stops/rehosts. Offline native inventory membership must retire
-the catalog entry without deleting the inventory object. These additions still
-need the final native run, including the earlier crash/rollback matrix and
-integration with the now-merged PR61/PR62. Do not treat V32 evidence as proof of
-those later changes. The original V30 failures remain recorded below.
+the catalog entry without deleting the inventory object. Those additions were
+subsequently checked by the V38 matrix above with merged PR61/PR62. V32 evidence
+alone is not proof of those later changes. The original V30 failures remain
+recorded below.
 
-## Candidate And Scope
+## Historical V30 Scope
 
 Native Windows pair, protocol 257, V30 DLL SHA256:
 `1f7be032d80613ad65ebdb4c78767da8016e9404deffba5e7cc28beea1de55a2`.
@@ -144,10 +201,9 @@ and persistence are faked dependencies in that suite; it is not split-area
 gameplay proof. The earlier V28 crash/rejoin and rollback results remain valid
 for their pinned candidate and do not establish V30 split-area behavior.
 
-## Release Decision
+## Historical V30 Decision
 
-Hold the PR update as merge-ready while the split-area pickup and solo redrop
-gaps remain.
+The PR update was held while the split-area pickup and solo redrop gaps remained.
 No new journal or forced inventory grant was added to hide this failure.
 
 Both native instances were stopped and the original isolated profiles/mod files

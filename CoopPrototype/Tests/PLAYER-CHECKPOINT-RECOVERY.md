@@ -1,12 +1,12 @@
 # Player Checkpoints And Recovery
 
-Local follow-up to PR60. Current candidate protocol 258. Not pushed or merged.
-
-The [2026-11-14 native readiness audit](SHARED-DROP-AREA-READINESS.md) records the
-V36 solo, split-area, continuing-rehost and crash/rollback passes on current main.
-The candidate is still on hold for native verification of assigned remainders
-across a cold Host restart and the later serialization-point staging changes.
-Earlier successful tests below are pinned to their stated candidate.
+PR60 follow-up, protocol 258. The production source at `98b9c9d` includes main
+`f2cd255`. The [2026-11-14 native readiness audit](SHARED-DROP-AREA-READINESS.md)
+records ten completed V38 Windows lifecycle scenarios, including cold Host
+restart with full inventories and partially delivered stacks. The 600 automated
+checks below also pass. This is verification of those boundaries, not a claim of
+exhaustive item coverage. Earlier successful tests remain pinned to their stated
+candidate.
 
 ## Contract
 
@@ -27,6 +27,10 @@ Stopping networking retains that known Host world and its pending native save.
 Offline forward saves use the same final-writer checkpoint path. A cold offline
 load instead initializes only the local Host account's checkpoint bound to the
 exact loaded native file; it does not adopt newer live or Client recovery files.
+Its assigned shared-drop remainders are restored before offline native pickup,
+not deferred until networking starts. An explicit offline load also discards the
+previous world's in-memory deliveries. Ordinary offline loads with no remainder
+do not create a shared-drop session.
 Network Clients and pending automatic Client joins do not initialize that Store.
 Pending or failed native loads cannot start hosting; attempting a Client join
 does not clear that fence. Ordinary area transitions retain continuity.
@@ -69,21 +73,21 @@ invalidates continuity until a successful native load.
 
 ## Automated Checks
 
-The current candidate passes 592 checks across the following suites. Layout,
+The current candidate passes 600 checks across the following suites. Layout,
 door evidence/range and SessionHello policy checks also pass. The delivery shell
 runner repeats the 15 snapshot selection checks; those are counted only once.
 
 | Checks | Coverage |
 | --- | --- |
-| 78 | Transaction contention, cancellation, disconnects, duplicate/reordered/lost packets, source lifetimes, split-area routing and replay completion |
+| 80 | Transaction contention, cancellation, disconnects, duplicate/reordered/lost packets, source lifetimes, split-area routing, offline delivery and invalidated native-input sources |
 | 36 | Native-delivery dependency controls, overflow callbacks, offline assigned remainders and optional journal failures |
 | 52 | Receipt parsing, validation and upload merge |
 | 15 | Whole inventory/receipt snapshot selection |
 | 36 | Canonical/journal selection, forward-save rebinding, ACK retirement, revision floors and offline preservation |
 | 171 | Production checkpoint Store and metadata against filesystem fixtures, including serialization-point staging |
-| 164 | Selected-production save completion, explicit loaded-world lifecycle, offline save/load continuity, timeline barriers and reliable world-change handling |
+| 167 | Selected-production save completion, explicit loaded-world lifecycle, offline save/load continuity, timeline barriers and reliable world-change handling |
 | 22 | Native-save path resolver against filesystem fixtures |
-| 18 | Production receipt transfer/restore, batch persistence and Host checkpoint staging with IO dependencies faked |
+| 21 | Production receipt transfer/restore, offline session identity, batch persistence and Host checkpoint staging with IO dependencies faked |
 
 The filesystem suite executes the production Store with real temporary files:
 live versus frozen state, same-slot replacement, continuing saves, restart,
@@ -107,7 +111,7 @@ Offline cases include pending writes across teardown, both role-entry gates,
 failure fencing, and a cold load's captured target remaining authoritative even
 if incidental save callbacks change the general last-path field. A native
 Client or pending automatic Client join cannot bootstrap a local Host Store.
-164 passed.
+167 passed.
 
 The actual native-save resolver also runs against temporary filesystem fixtures.
 22 checks cover exact final-writer user aliases, campaign identity, missing-file
@@ -117,6 +121,30 @@ The selected-production and delivery suites fake their native engine/transport
 dependencies. The counts above are not native gameplay proof.
 
 ## Native Windows Checks
+
+### V38 Current Candidate
+
+The same diagnostic DLL and production source passed solo pickup/redrop,
+split-area travel under Client Area Authority, saved public sources from either
+player after a hard Host restart, and rollback across a later drop or pickup.
+Consumed sources stayed absent after rejoin.
+
+Four additional cold-restart cases retained assigned remainders: a full Client
+inventory, a Client stack at 999 receiving two units, a full Host inventory, and
+Host pickup while still offline before rehosting. The partial case saved exactly
+one delivered unit and one remaining unit, then delivered only that remainder
+after room became available. Repeated native pickup and subsequent native
+save/reload retained the exact final count. The offline case also checked the
+Host's completed receipt and removal without an old entitlement granting again.
+Host inventory remained native-save owned throughout.
+
+Native inventory cells, actual world entities and persisted receipt rows were
+the oracles. The fixture uses bananas, wrenches and junk; it does not establish
+all weapon condition/ammo variants or the reported recycler-grenade crash.
+Build hashes, archives, harness corrections and verified restoration are listed
+in [the lifecycle audit](SHARED-DROP-AREA-READINESS.md).
+
+### V21 Earlier Candidate
 
 The final V21 verification DLL was built on Windows, with diagnostic-only native
 UI controls enabled. Its SHA-256 is
