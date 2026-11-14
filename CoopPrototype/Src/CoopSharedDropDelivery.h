@@ -1,5 +1,7 @@
 #pragma once
 
+#include "CoopWeaponState.h"
+
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
@@ -25,13 +27,15 @@ struct Entry
     uint32_t deliveredCount = 0;
     uint32_t transactionSequence = 0;
     uint32_t objectVersion = 0;
+    CoopWeaponState::State weaponState = {};
 };
 
 inline bool IsValid(const Entry& row)
 {
     return row.hostSessionId != 0 && row.stableSpawnId != 0 && row.archetypeId != 0 &&
         row.count != 0 && row.count <= static_cast<uint32_t>(std::numeric_limits<int>::max()) &&
-        row.deliveredCount <= row.count && row.transactionSequence != 0 && row.objectVersion != 0;
+        row.deliveredCount <= row.count && row.transactionSequence != 0 && row.objectVersion != 0 &&
+        CoopWeaponState::IsValid(row.weaponState);
 }
 
 inline bool SameLifetime(const Entry& a, const Entry& b)
@@ -42,7 +46,8 @@ inline bool SameLifetime(const Entry& a, const Entry& b)
 inline bool SameCommit(const Entry& a, const Entry& b)
 {
     return SameLifetime(a, b) && a.archetypeId == b.archetypeId && a.count == b.count &&
-        a.transactionSequence == b.transactionSequence && a.objectVersion == b.objectVersion;
+        a.transactionSequence == b.transactionSequence && a.objectVersion == b.objectVersion &&
+        CoopWeaponState::Same(a.weaponState, b.weaponState);
 }
 
 inline bool ReadUnsigned(std::string_view& text, uint64_t& value)
@@ -68,8 +73,7 @@ inline bool ParseEntry(std::string_view text, Entry& row)
         if (!ReadUnsigned(text, value))
             return false;
     }
-    if (text.find_first_not_of(" \t") != std::string_view::npos ||
-        values[3] > UINT32_MAX || values[4] > UINT32_MAX ||
+    if (values[3] > UINT32_MAX || values[4] > UINT32_MAX ||
         values[5] > UINT32_MAX || values[6] > UINT32_MAX)
     {
         return false;
@@ -77,7 +81,7 @@ inline bool ParseEntry(std::string_view text, Entry& row)
     row = {values[0], values[1], values[2], static_cast<uint32_t>(values[3]),
         static_cast<uint32_t>(values[4]), static_cast<uint32_t>(values[5]),
         static_cast<uint32_t>(values[6])};
-    return IsValid(row);
+    return CoopWeaponState::ReadSuffix(text, row.weaponState) && IsValid(row);
 }
 
 inline bool ParseSection(
@@ -147,7 +151,9 @@ inline void WriteSection(std::ostream& output, const std::vector<Entry>& rows, u
     {
         output << kEntryPrefix << row.hostSessionId << ' ' << row.stableSpawnId << ' '
             << row.archetypeId << ' ' << row.count << ' ' << row.deliveredCount << ' '
-            << row.transactionSequence << ' ' << row.objectVersion << '\n';
+            << row.transactionSequence << ' ' << row.objectVersion;
+        CoopWeaponState::WriteSuffix(output, row.weaponState);
+        output << '\n';
     }
 }
 

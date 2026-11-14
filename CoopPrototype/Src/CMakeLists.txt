@@ -84,6 +84,8 @@ set(SOURCE_FILES
     CoopSharedDropSync.cpp
     CoopSharedDropDelivery.cpp
     CoopSharedDropDelivery.h
+    CoopWeaponState.h
+    CoopNativeWeaponState.h
     CoopSharedStorageSync.cpp
 	CoopPlayerState.cpp
 	CoopPlayerFallRecovery.cpp

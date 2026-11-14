@@ -33,11 +33,21 @@ struct Quat {
     Quat() = default;
     explicit Quat(int) {}
     Quat(float a, float b, float c, float d) : w(a), v(b, c, d) {}
+    Quat GetNormalized() const { return *this; }
+};
+struct IEntityArchetype { void* GetClass() { return this; } };
+struct SEntitySpawnParams {
+    const char* sName = nullptr;
+    IEntityArchetype* pArchetype = nullptr;
+    void* pClass = nullptr;
+    Vec3 vPosition, vScale;
+    Quat qRotation;
 };
 struct IEntity {
     EntityId id = 0;
     bool hidden = false;
     std::string name = "";
+    unsigned presentationChanges = 0;
     const char* GetName() const { return name.c_str(); }
     void SetName(const char* value) { name = value; }
     EntityId GetId() const { return id; }
@@ -46,11 +56,21 @@ struct IEntity {
     Quat GetWorldRotation() const { return {}; }
 };
 struct IEntityIt;
+struct CArkItem;
 struct IEntityItPtr : std::shared_ptr<IEntityIt> {
     IEntityItPtr(IEntityIt* value) : std::shared_ptr<IEntityIt>(value) {}
 };
 struct EntitySystem {
     std::unordered_map<EntityId, IEntity> entities;
+    IEntityArchetype archetype;
+    std::vector<std::shared_ptr<CArkItem>> spawnedItems;
+    unsigned spawnCalls = 0;
+    IEntityArchetype* GetEntityArchetype(uint64_t) { return &archetype; }
+    IEntity* FindEntityByName(const char* name) {
+        for (auto& entry : entities) if (entry.second.name == name) return &entry.second;
+        return nullptr;
+    }
+    IEntity* SpawnEntityFromArchetype(IEntityArchetype*, const SEntitySpawnParams&, bool);
     IEntity* GetEntity(EntityId id) {
         auto found = entities.find(id);
         return found == entities.end() ? nullptr : &found->second;
@@ -87,6 +107,9 @@ struct CArkItem {
     unsigned inventoryCount = 0;
     int count = 1;
     uint64_t archetype = 99;
+    CoopWeaponState::State weaponState{};
+    unsigned resetCountCalls = 0;
+    void ResetCount(int value) { ++resetCountCalls; count = value; }
     static inline std::unordered_map<EntityId, CArkItem*> items;
     static inline std::function<bool(CArkItem*)> beforePickup;
     static CArkItem* GetItemFromEntityId(EntityId id) {
@@ -110,6 +133,16 @@ struct CArkItem {
         return accept;
     }
 };
+IEntity* EntitySystem::SpawnEntityFromArchetype(IEntityArchetype*, const SEntitySpawnParams& params, bool) {
+    const EntityId id = 300 + ++spawnCalls;
+    auto item = std::make_shared<CArkItem>();
+    item->id = id;
+    CArkItem::items[id] = item.get();
+    spawnedItems.push_back(item);
+    entities[id].id = id;
+    entities[id].name = params.sName;
+    return &entities[id];
+}
 struct ArkPlayer {
     EntityId id = 1;
     bool ready = true;
@@ -139,6 +172,7 @@ namespace CoopItemClassification {
 bool IsRealWeaponInventoryItem(CArkItem*, std::string&) { return false; }
 }
 bool SetSharedDropWorldPresentation(IEntity& entity, bool visible, std::string&) {
+    ++entity.presentationChanges;
     entity.hidden = !visible;
     return true;
 }
@@ -210,6 +244,20 @@ public:
     uint64_t CurrentHostSaveKeyHash() const { return 20; }
     bool IsSessionGameplayReady() const { return gameplayReady; }
     bool IsSharedDropWorldReady() const;
+    unsigned weaponCaptures = 0, weaponApplies = 0;
+    bool failWeaponCapture = false, failWeaponApply = false;
+    bool CaptureSharedDropWeaponState(CArkItem* item, CoopWeaponState::State& state, std::string&) {
+        ++weaponCaptures;
+        if (failWeaponCapture) return false;
+        state = item->weaponState;
+        return true;
+    }
+    bool ApplySharedDropWeaponState(EntityId id, const CoopWeaponState::State& state, std::string&) {
+        ++weaponApplies;
+        if (failWeaponApply) return false;
+        CArkItem::items.at(id)->weaponState = state;
+        return true;
+    }
     bool IsSharedDropServiceReady() const;
     void DetachSharedDropEntities();
     uint64_t BuildSharedDropStableId(uint64_t, const Vec3&, uint32_t) const;
@@ -258,7 +306,11 @@ public:
     unsigned deliveryRestoreCalls = 0;
     void RestoreCommittedSharedDropDeliveries() { ++deliveryRestoreCalls; }
     void EnsureLocalPlayerWeaponRegistered(EntityId, const char*) {}
-    bool MaterializeSharedDrop(const CoopProtocol::SharedDropPacket& packet, SharedDropRecord& record, std::string&) {
+    bool useActualMaterialize = false;
+    bool MaterializeSharedDropActual(const CoopProtocol::SharedDropPacket&, SharedDropRecord&, std::string&);
+    bool MaterializeSharedDrop(const CoopProtocol::SharedDropPacket& packet, SharedDropRecord& record, std::string& detail) {
+        if (useActualMaterialize) return MaterializeSharedDropActual(packet, record, detail);
+        if (!CoopWeaponState::Decode(packet.weaponState, record.weaponState)) return false;
         ++materializeCalls;
         if (!allowMaterialize) throw std::runtime_error("unexpected spawn materialization dispatch");
         record.stableSpawnId = packet.stableSpawnId;
@@ -355,6 +407,11 @@ struct Fixture {
         }
     }
     ModMain::SharedDropRecord& row(ModMain& peer) { return peer.m_sharedDrops.at(stable); }
+    Packet snapshot() {
+        Packet packet;
+        require(host.BuildSharedDropPacket(packet, Command::Spawn, row(host)), "snapshot fixture encoding");
+        return packet;
+    }
     static Packet take(ModMain& peer, Command command) {
         auto found = std::find_if(peer.sent.begin(), peer.sent.end(), [command](const auto& sent) {
             return static_cast<Command>(sent.packet.command) == command;
@@ -1042,6 +1099,35 @@ void competingLossyTransportNeverDuplicatesOwnership() {
 int main(int argc, char**) {
     if (argc != 1) return 2;
     const std::vector<std::pair<std::string, std::function<void()>>> tests = {
+        {"weapon_metadata_survives_all_pickup_phases", [] {
+            Fixture f;
+            const CoopWeaponState::State state{true, 37, 6, {{41, 3}}};
+            for (auto* peer : {&f.host, &f.first, &f.second}) f.row(*peer).weaponState = state;
+            auto commit = f.commit();
+            CoopWeaponState::State decoded;
+            require(CoopWeaponState::Decode(commit.weaponState, decoded) &&
+                CoopWeaponState::Same(decoded, state) && f.host.durable.size() == 1 &&
+                CoopWeaponState::Same(f.host.durable[0].entry.weaponState, state),
+                "committed wire or entitlement lost source weapon values");
+            Fixture::deliver(f.first, commit);
+            Fixture::deliver(f.first, commit);
+            require(f.firstItem.nativeCalls == 1 && f.firstItem.inventoryCount == 1,
+                "metadata-bearing duplicate commit repeated pickup");
+        }},
+        {"conflicting_weapon_metadata_cannot_commit", [] {
+            Fixture f;
+            for (auto* peer : {&f.host, &f.first, &f.second})
+                f.row(*peer).weaponState = {true, 37, 6, {{41, 3}}};
+            auto ready = f.ready();
+            ++ready.weaponState.ammoLoaded;
+            Fixture::deliver(f.host, ready);
+            require(f.host.durable.empty() && f.row(f.host).live,
+                "changed weapon identity acquired an entitlement");
+            ready.weaponState.modCount = 17;
+            Fixture::deliver(f.host, ready);
+            require(f.host.durable.empty() && f.row(f.host).live,
+                "malformed weapon payload acquired an entitlement");
+        }},
         {"prepare_has_no_native_mutation", prepareHasNoNativeMutation},
         {"commit_persists_before_native_pickup", successfulPickup},
         {"host_local_implicit_ready_durable_commit", hostLocalPickupUsesDurableCommit},
@@ -1149,6 +1235,114 @@ int main(int argc, char**) {
             require(f.row(f.host).localEntityId == 103 && f.host.m_sharedDropByEntityId.at(103) == stable &&
                 f.host.materializeCalls == 0 && f.entities.GetEntity(103),
                 "return duplicated or lost the native saved source");
+        }},
+        {"saved_weapon_recovery_reads_native_state_instead_of_applying_cached_state", [] {
+            for (const bool known : {false, true}) {
+                Fixture f;
+                f.entities.entities.at(103).name = "CoopSharedDrop_77";
+                f.hostItem.weaponState = {true, 37, 6, {{41, 3}}, true};
+                f.row(f.host).weaponState = {true, 100, 15, {}, false};
+                f.host.DetachSharedDropEntities();
+                if (!known) f.host.m_sharedDrops.clear();
+                f.host.RecoverSavedSharedDrops();
+                require(CoopWeaponState::Same(f.row(f.host).weaponState, f.hostItem.weaponState) &&
+                    f.host.weaponCaptures == 1 && f.host.weaponApplies == 0 &&
+                    f.hostItem.resetCountCalls == 0 && f.entities.spawnCalls == 0 &&
+                    f.entities.GetEntity(103)->presentationChanges == 0,
+                    "saved source was rewritten instead of adopted from native state");
+            }
+        }},
+        {"snapshot_reuses_native_weapon_without_resetting_instance_fields", [] {
+            Fixture f;
+            f.first.useActualMaterialize = true;
+            f.entities.entities.at(101).name = "CoopSharedDrop_77";
+            const CoopWeaponState::State native{true, 37, 6, {{41, 3}}, true};
+            f.firstItem.weaponState = native;
+            auto packet = f.snapshot();
+            require(CoopWeaponState::Encode({true, 100, 15, {}, false}, packet.weaponState), "fixture encoding");
+            ModMain::SharedDropRecord record;
+            std::string detail;
+            for (unsigned repeat = 0; repeat < 3; ++repeat)
+                require(f.first.MaterializeSharedDrop(packet, record, detail), "saved native source not rebound");
+            require(record.localEntityId == 101 && CoopWeaponState::Same(record.weaponState, native) &&
+                CoopWeaponState::Same(f.firstItem.weaponState, native) &&
+                f.first.weaponCaptures == 3 && f.first.weaponApplies == 0 &&
+                f.firstItem.resetCountCalls == 0 && f.entities.spawnCalls == 0,
+                "snapshot or duplicate replay overwrote native weapon fields");
+        }},
+        {"snapshot_capture_failure_preserves_native_weapon", [] {
+            Fixture f;
+            f.first.useActualMaterialize = true;
+            f.first.failWeaponCapture = true;
+            f.entities.entities.at(101).name = "CoopSharedDrop_77";
+            auto packet = f.snapshot();
+            ModMain::SharedDropRecord record;
+            std::string detail;
+            require(!f.first.MaterializeSharedDrop(packet, record, detail) && f.entities.GetEntity(101) &&
+                f.first.weaponApplies == 0 && f.firstItem.resetCountCalls == 0 && f.entities.spawnCalls == 0,
+                "failed adoption mutated, removed or replaced a native source");
+        }},
+        {"snapshot_native_source_conflicts_do_not_replace_or_modify_it", [] {
+            for (unsigned conflict = 0; conflict < 4; ++conflict) {
+                Fixture f;
+                f.first.useActualMaterialize = true;
+                f.entities.entities.at(101).name = "CoopSharedDrop_77";
+                if (conflict == 0) ++f.firstItem.archetype;
+                if (conflict == 1) ++f.firstItem.count;
+                if (conflict == 2) f.entities.GetEntity(101)->hidden = true;
+                if (conflict == 3) ArkPlayer::instance.inventory.members.insert(101);
+                auto packet = f.snapshot();
+                ModMain::SharedDropRecord record;
+                std::string detail;
+                require(!f.first.MaterializeSharedDrop(packet, record, detail) &&
+                    f.entities.GetEntity(101) && f.entities.spawnCalls == 0 &&
+                    f.first.weaponApplies == 0 && f.firstItem.resetCountCalls == 0,
+                    "source conflict caused replacement or mutation of a native entity");
+            }
+        }},
+        {"received_snapshot_binds_native_weapon_and_duplicate_is_read_only", [] {
+            Fixture f;
+            f.first.useActualMaterialize = true;
+            f.first.m_sharedDrops.clear();
+            f.first.m_sharedDropByEntityId.clear();
+            f.entities.entities.at(101).name = "CoopSharedDrop_77";
+            const CoopWeaponState::State native{true, 37, 6, {{41, 3}}, true};
+            f.firstItem.weaponState = native;
+            auto packet = f.snapshot();
+            Fixture::deliver(f.first, packet);
+            Fixture::deliver(f.first, packet);
+            require(f.row(f.first).localEntityId == 101 &&
+                CoopWeaponState::Same(f.row(f.first).weaponState, native) &&
+                f.first.weaponCaptures == 1 && f.first.weaponApplies == 0 &&
+                f.firstItem.resetCountCalls == 0 && f.entities.spawnCalls == 0,
+                "received snapshot replay rewrote or duplicated a native saved weapon");
+        }},
+        {"new_network_weapon_receives_metadata_only_on_creation", [] {
+            Fixture f;
+            f.first.useActualMaterialize = true;
+            auto packet = f.snapshot();
+            const CoopWeaponState::State sent{true, 37, 6, {{41, 3}}, true};
+            require(CoopWeaponState::Encode(sent, packet.weaponState), "fixture encoding");
+            ModMain::SharedDropRecord record;
+            std::string detail;
+            require(f.first.MaterializeSharedDrop(packet, record, detail), "network copy not spawned");
+            CArkItem* spawned = CArkItem::GetItemFromEntityId(record.localEntityId);
+            require(spawned && spawned->resetCountCalls == 1 && f.first.weaponApplies == 1 &&
+                CoopWeaponState::Same(spawned->weaponState, sent), "new copy lost metadata");
+            require(f.first.MaterializeSharedDrop(packet, record, detail) &&
+                spawned->resetCountCalls == 1 && f.first.weaponApplies == 1 && f.entities.spawnCalls == 1,
+                "replayed spawn reapplied metadata to an existing native instance");
+        }},
+        {"new_network_weapon_apply_failure_removes_only_new_copy", [] {
+            Fixture f;
+            f.first.useActualMaterialize = true;
+            f.first.failWeaponApply = true;
+            auto packet = f.snapshot();
+            ModMain::SharedDropRecord record;
+            std::string detail;
+            require(!f.first.MaterializeSharedDrop(packet, record, detail) &&
+                f.entities.spawnCalls == 1 && !f.entities.GetEntity(301) && f.entities.GetEntity(101),
+                "failed new copy was retained or an unrelated source was removed");
         }},
         {"continuing_offline_host_redrop_gets_fresh_identity_without_network", [] {
             for (const bool committed : {false, true}) {

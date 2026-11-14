@@ -181,6 +181,8 @@ bool ModMain::BuildSharedDropPacket(
     packet.qx = record.rotation.v.x;
     packet.qy = record.rotation.v.y;
     packet.qz = record.rotation.v.z;
+    if (!CoopWeaponState::Encode(record.weaponState, packet.weaponState))
+        return false;
 
     IEntity* entity = IsSharedDropWorldReady() && record.areaId == m_localLevelId && record.localEntityId != INVALID_ENTITYID
         ? gEnv->pEntitySystem->GetEntity(record.localEntityId)
@@ -319,6 +321,14 @@ void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const 
         CoopRuntimeGuards::TryGuardedCall("shared drop GetCount", [item]() { return item->GetCount(); }, count, nullptr);
     count = std::max(1, count);
 
+    CoopWeaponState::State weaponState;
+    if (!CaptureSharedDropWeaponState(item, weaponState, guardReason))
+    {
+        ++m_sharedDropDropped;
+        m_lastSharedDropEvent = "drop_weapon_capture_failed_" + guardReason;
+        return;
+    }
+
     if (m_networkMode == CoopNetworkMode::Client)
     {
         // Publish only after the durable local pair no longer owns the drop.
@@ -342,6 +352,7 @@ void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const 
     SharedDropRecord record;
     record.areaId = m_localLevelId;
     record.archetypeId = archetypeId;
+    record.weaponState = std::move(weaponState);
     record.ownerPeerHash = GetLocalAccountToken();
     record.localEntityId = entity->GetId();
     record.version = 1;
@@ -589,6 +600,7 @@ bool ModMain::CommitSharedDropPickup(
     delivery.count = static_cast<uint32_t>(record.count);
     delivery.transactionSequence = transactionSequence;
     delivery.objectVersion = record.version + 1;
+    delivery.weaponState = record.weaponState;
     if (!StoreCommittedSharedDropDelivery(winnerPeerHash, delivery))
     {
         ReleaseSharedDropReservation(record, winnerPeerHash, transactionSequence, "ownership_store_failed");
@@ -648,7 +660,9 @@ bool ModMain::MaterializeSharedDrop(
     SharedDropRecord& record,
     std::string& detail)
 {
-    if (!gEnv || !gEnv->pEntitySystem || !IsFiniteTransform(packet))
+    CoopWeaponState::State weaponState;
+    if (!gEnv || !gEnv->pEntitySystem || !IsFiniteTransform(packet) ||
+        !CoopWeaponState::Decode(packet.weaponState, weaponState))
     {
         detail = "missing_entity_system_or_bad_transform";
         return false;
@@ -686,7 +700,14 @@ bool ModMain::MaterializeSharedDrop(
             detail = "saved_source_conflict";
             return false;
         }
+        // The native save already restored this instance. Only adopt its identity.
+        if (!CaptureSharedDropWeaponState(existing, weaponState, reason))
+        {
+            detail = "saved_weapon_capture_failed_" + reason;
+            return false;
+        }
     }
+    const bool reused = entity != nullptr;
     ++m_sharedDropApplyDepth;
     const bool spawned = entity || CoopRuntimeGuards::TryGuardedCall(
         "shared drop SpawnEntityFromArchetype",
@@ -708,22 +729,33 @@ bool ModMain::MaterializeSharedDrop(
         return false;
     }
 
-    ++m_sharedDropApplyDepth;
-    CoopRuntimeGuards::TryGuardedVoidCall(
-        "shared drop ResetCount",
-        [item, &packet]() { item->ResetCount(std::max(1, packet.count)); },
-        &reason);
-    --m_sharedDropApplyDepth;
+    if (!reused)
+    {
+        ++m_sharedDropApplyDepth;
+        CoopRuntimeGuards::TryGuardedVoidCall(
+            "shared drop ResetCount",
+            [item, &packet]() { item->ResetCount(std::max(1, packet.count)); },
+            &reason);
+        --m_sharedDropApplyDepth;
+
+        if (!ApplySharedDropWeaponState(entity->GetId(), weaponState, reason))
+        {
+            gEnv->pEntitySystem->RemoveEntity(entity->GetId(), true);
+            detail = "weapon_state_apply_failed_" + reason;
+            return false;
+        }
+    }
 
     record.stableSpawnId = packet.stableSpawnId;
+    record.weaponState = std::move(weaponState);
     record.areaId = packet.areaId;
     record.archetypeId = packet.archetypeId;
     record.ownerPeerHash = packet.sourcePeerHash;
     record.localEntityId = entity->GetId();
     record.version = packet.objectVersion;
     record.count = std::max(1, packet.count);
-    record.position = params.vPosition;
-    record.rotation = params.qRotation;
+    record.position = entity->GetWorldPos();
+    record.rotation = entity->GetWorldRotation();
     record.live = true;
     record.pickupPending = false;
     record.localPickupGranted = false;
@@ -852,6 +884,8 @@ void ModMain::RestoreCommittedSharedDropDeliveries()
             packet.objectVersion = delivery.objectVersion;
             packet.count = static_cast<int>(delivery.count - delivery.deliveredCount);
             packet.sourcePeerHash = GetLocalAccountToken();
+            if (!CoopWeaponState::Encode(delivery.weaponState, packet.weaponState))
+                continue;
             const Vec3 position = player->GetEntity()->GetWorldPos();
             packet.px = position.x;
             packet.py = position.y;
@@ -1015,6 +1049,13 @@ void ModMain::ReleaseSharedDropReservationsForPeer(uint64_t peerHash)
 void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
 {
     ++m_sharedDropReceived;
+    CoopWeaponState::State weaponState;
+    if (!CoopWeaponState::Decode(packet.weaponState, weaponState))
+    {
+        ++m_sharedDropDropped;
+        m_lastSharedDropEvent = "rejected_weapon_state";
+        return;
+    }
     const uint64_t remotePeerHash = GetRemoteAccountToken();
     const auto command = static_cast<CoopProtocol::SharedDropCommand>(packet.command);
     const bool roleAllowsCommand =
@@ -1116,6 +1157,7 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
             record.stableSpawnId = packet.stableSpawnId;
             record.areaId = packet.areaId;
             record.archetypeId = packet.archetypeId;
+            record.weaponState = weaponState;
             record.ownerPeerHash = packet.sourcePeerHash;
             record.version = packet.objectVersion;
             record.count = std::max(1, packet.count);
@@ -1145,7 +1187,8 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
         return;
     }
     SharedDropRecord& record = found->second;
-    if (record.areaId != packet.areaId || record.archetypeId != packet.archetypeId)
+    if (record.areaId != packet.areaId || record.archetypeId != packet.archetypeId ||
+        !CoopWeaponState::Same(record.weaponState, weaponState))
     {
         ++m_sharedDropDropped;
         m_lastSharedDropEvent = "record_identity_conflict";
@@ -1600,10 +1643,16 @@ void ModMain::RecoverSavedSharedDrops()
             record.localEntityId = entity->GetId();
             record.position = entity->GetWorldPos();
             record.rotation = entity->GetWorldRotation();
+            std::string stateReason;
+            if (!CaptureSharedDropWeaponState(item, record.weaponState, stateReason))
+                continue;
             m_sharedDropByEntityId[entity->GetId()] = stableId;
             RetireLivePropTrackingForSharedDrop(entity->GetId());
-            std::string detail;
-            SetSharedDropWorldPresentation(*entity, !record.pickupPending, detail);
+            if (record.pickupPending)
+            {
+                std::string detail;
+                SetSharedDropWorldPresentation(*entity, false, detail);
+            }
             continue;
         }
         if (entity->IsHidden())
@@ -1619,6 +1668,9 @@ void ModMain::RecoverSavedSharedDrops()
         record.live = true;
         record.position = entity->GetWorldPos();
         record.rotation = entity->GetWorldRotation();
+        std::string captureReason;
+        if (!CaptureSharedDropWeaponState(item, record.weaponState, captureReason))
+            continue;
         m_sharedDrops.emplace(stableId, record);
         m_sharedDropByEntityId[entity->GetId()] = stableId;
         RetireLivePropTrackingForSharedDrop(entity->GetId());

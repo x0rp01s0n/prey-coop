@@ -8,6 +8,7 @@
 #include "CoopNativeFragmentPayload.h"
 #include "CoopInventoryRestoreLayout.h"
 #include "CoopRuntimeGuards.h"
+#include "CoopNativeWeaponState.h"
 
 #include <algorithm>
 #include <array>
@@ -789,12 +790,12 @@ bool TryReadPassiveItemState(
                     IsLikelyRuntimeCppObject(static_cast<CArkWeapon*>(concreteItem), sizeof(CArkWeapon)))
                 {
                     CArkWeapon* weapon = static_cast<CArkWeapon*>(concreteItem);
-                    outState.weaponCondition = weapon->m_condition;
-                    outState.weaponAmmoLoaded = weapon->m_numAmmoLoaded;
-                    outState.weaponMods.reserve(weapon->m_weaponMods.m_weaponModIds.size());
-                    for (const auto& mod : weapon->m_weaponMods.m_weaponModIds)
+                    const auto captured = CoopWeaponState::CaptureNative(*weapon);
+                    outState.weaponCondition = captured.condition;
+                    outState.weaponAmmoLoaded = captured.ammoLoaded;
+                    outState.weaponMods = captured.mods;
+                    for (const auto& mod : outState.weaponMods)
                     {
-                        outState.weaponMods.emplace_back(mod.first, mod.second);
                         if (mod.second > 0)
                             outState.weaponModTotalLevel += static_cast<uint32_t>(mod.second);
                     }
@@ -945,22 +946,21 @@ void TryApplySidecarFlagsToRestoredItem(
     if (sidecarItem.isWeapon &&
         IsLikelyRuntimeCppObject(static_cast<CArkWeapon*>(item), sizeof(CArkWeapon)))
     {
+        bool weaponApplied = false;
         if (TryGuardedVoidCall(
                 "coop restore apply weapon fields",
                 [&]()
                 {
                     CArkWeapon* weapon = static_cast<CArkWeapon*>(item);
-                    weapon->m_condition = sidecarItem.weaponCondition;
-                    weapon->m_numAmmoLoaded = sidecarItem.weaponAmmoLoaded;
-                    weapon->m_weaponMods.Clear();
-                    for (const auto& mod : sidecarItem.weaponMods)
-                    {
-                        const int level = std::clamp(mod.second, 0, 16);
-                        for (int i = 0; i < level; ++i)
-                            weapon->m_weaponMods.AddMod(mod.first);
-                    }
+                    CoopWeaponState::State state;
+                    state.present = true;
+                    state.condition = sidecarItem.weaponCondition;
+                    state.ammoLoaded = sidecarItem.weaponAmmoLoaded;
+                    state.mods = sidecarItem.weaponMods;
+                    // Legacy sidecars do not contain the world's ammo-loot flag.
+                    weaponApplied = CoopWeaponState::ApplyNative(*weapon, state, false);
                 },
-                &reason))
+                &reason) && weaponApplied)
         {
             AppendDetail(detail,
                 "weaponFieldsApplied item=" + std::to_string(itemId) +

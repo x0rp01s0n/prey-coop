@@ -38,6 +38,8 @@ if reservation is None:
 actual = reservation.group(0) + "\n" + actual
 actual += section(cpp, "bool ParsePositiveInteger(", "int ParseAttemptCount(")
 actual += "\n".join(section(cpp, start, end) for start, end in methods)
+actual += section(cpp, "bool ModMain::MaterializeSharedDrop(", "bool ModMain::RemoveSharedDropLocal(").replace(
+    "bool ModMain::MaterializeSharedDrop(", "bool ModMain::MaterializeSharedDropActual(", 1)
 main_cpp = (root / "Src/ModMain.cpp").read_text()
 actual += section(main_cpp, "bool IsSharedDropReplayPayload(", "bool IsAreaScopedReliablePayload(")
 actual += section(main_cpp, "bool IsAreaScopedReliablePayload(", "bool IsReliableTransferStartPayload(")

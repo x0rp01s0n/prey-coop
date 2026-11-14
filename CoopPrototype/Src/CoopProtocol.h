@@ -3,11 +3,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#include "CoopWeaponState.h"
 
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 258;
+constexpr uint16_t kProtocolVersion = 259;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -882,6 +883,7 @@ struct SharedDropPacket
     float qx = 0.0f;
     float qy = 0.0f;
     float qz = 0.0f;
+    CoopWeaponState::Wire weaponState;
 };
 
 struct SharedStoragePacket

@@ -2056,6 +2056,7 @@ private:
         Quat rotation = Quat(IDENTITY);
         int count = 0;
         bool live = false;
+        CoopWeaponState::State weaponState;
         bool pickupPending = false;
         bool pickupGrantReceived = false;
         bool pickupResultSent = false;
@@ -2072,6 +2073,8 @@ private:
     };
     uint64_t BuildSharedDropStableId(uint64_t archetypeId, const Vec3& position, uint32_t sequence) const;
     bool IsSharedDropWorldReady() const;
+    bool CaptureSharedDropWeaponState(CArkItem* item, CoopWeaponState::State& state, std::string& reason);
+    bool ApplySharedDropWeaponState(EntityId itemId, const CoopWeaponState::State& state, std::string& reason);
     bool IsSharedDropServiceReady() const;
     void DetachSharedDropEntities();
     bool BuildSharedDropPacket(CoopProtocol::SharedDropPacket& packet, CoopProtocol::SharedDropCommand command, const SharedDropRecord& record, uint64_t targetPeerHash = 0) const;

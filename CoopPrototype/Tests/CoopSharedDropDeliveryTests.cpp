@@ -28,6 +28,7 @@ struct SharedDropPacket {
     uint32_t areaId = 0, objectVersion = 0;
     int count = 0;
     float px = 0, py = 0, pz = 0;
+    CoopWeaponState::Wire weaponState;
 };
 }
 struct CArkProjectileRecyclerGrenade {};
@@ -175,6 +176,7 @@ public:
         m_pendingClientPlayerStateUpload = true;
     }
     bool EnsureLocalPlayerWeaponRegistered(unsigned, const char*) { ++registrations; return true; }
+    CoopWeaponState::State appliedWeaponState;
     void StopNetwork() {
         ++stops;
         m_networkMode = CoopNetworkMode::Off;
@@ -191,6 +193,8 @@ public:
     void RestoreCommittedSharedDropDeliveries();
     bool ShouldSuppressRecyclerForSharedDrop(const CArkProjectileRecyclerGrenade*, EntityId) const;
     bool MaterializeSharedDrop(const CoopProtocol::SharedDropPacket& packet, SharedDropRecord& record, std::string&) {
+        if (!CoopWeaponState::Decode(packet.weaponState, record.weaponState)) return false;
+        appliedWeaponState = record.weaponState;
         const EntityId id = 100 + ++materializeCalls;
         gEnv->pEntitySystem->entities.emplace(id, IEntity{});
         CArkItem& item = materializedItems[id];
@@ -246,6 +250,29 @@ struct Fixture {
 
 int main() {
     const std::vector<std::pair<const char*, std::function<void()>>> tests = {
+        {"weapon_delivery_retains_committed_metadata", [] {
+            Fixture f;
+            f.record().weaponState = {true, 37, 6, {{41, 3}}};
+            require(f.mod.TryDeliverCommittedSharedDrop(f.record()), "weapon delivery failed");
+            require(CoopWeaponState::Same(f.receipt().weaponState, f.record().weaponState) &&
+                CoopWeaponState::Same(f.mod.recovery.rows[0].weaponState, f.record().weaponState),
+                "native delivery or durable receipt lost weapon metadata");
+        }},
+        {"retired_weapon_source_rebuilds_with_metadata", [] {
+            Fixture f;
+            const CoopWeaponState::State state{true, 37, 6, {{41, 3}}};
+            f.record().weaponState = state;
+            CoopSharedDropDelivery::Entry entry{40,90,100,5,0,8,3};
+            entry.weaponState = state;
+            f.mod.m_localSharedDropDeliveries.push_back(entry);
+            f.entities.entities.erase(7); CArkItem::items.erase(7);
+            f.record().localEntityId = INVALID_ENTITYID;
+            f.mod.RestoreCommittedSharedDropDeliveries();
+            require(f.mod.materializeCalls == 1 && f.receipt().deliveredCount == 5 &&
+                CoopWeaponState::Same(f.record().weaponState, state) &&
+                CoopWeaponState::Same(f.mod.appliedWeaponState, state),
+                "reconstruction reset metadata to archetype defaults");
+        }},
         {"continuing_offline_host_finishes_owned_remainder_without_client_journal", [] {
             Fixture f;
             f.mod.m_networkMode = CoopNetworkMode::Off;

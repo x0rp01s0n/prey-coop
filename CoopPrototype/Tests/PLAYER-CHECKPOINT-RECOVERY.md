@@ -1,12 +1,16 @@
 # Player Checkpoints And Recovery
 
-PR60 follow-up, protocol 258. The production source at `98b9c9d` includes main
-`f2cd255`. The [2026-11-14 native readiness audit](SHARED-DROP-AREA-READINESS.md)
+PR60 follow-up, protocol 259. The earlier production source at `98b9c9d` includes
+main `f2cd255`. The [2026-11-14 native readiness audit](SHARED-DROP-AREA-READINESS.md)
 records ten completed V38 Windows lifecycle scenarios, including cold Host
-restart with full inventories and partially delivered stacks. The 600 automated
+restart with full inventories and partially delivered stacks. The 645 automated
 checks below also pass. This is verification of those boundaries, not a claim of
 exhaustive item coverage. Earlier successful tests remain pinned to their stated
 candidate.
+
+The [weapon-state follow-up](SHARED-DROP-WEAPON-STATE.md), based on `f03fb4d`,
+adds native upgraded-weapon crash/journal/checkpoint comparisons and records the
+normal Release build. Historical runs below retain their original build scope.
 
 ## Contract
 
@@ -73,15 +77,15 @@ invalidates continuity until a successful native load.
 
 ## Automated Checks
 
-The current candidate passes 600 checks across the following suites. Layout,
+The current candidate passes 645 checks across the following suites. Layout,
 door evidence/range and SessionHello policy checks also pass. The delivery shell
 runner repeats the 15 snapshot selection checks; those are counted only once.
 
 | Checks | Coverage |
 | --- | --- |
-| 80 | Transaction contention, cancellation, disconnects, duplicate/reordered/lost packets, source lifetimes, split-area routing, offline delivery and invalidated native-input sources |
-| 36 | Native-delivery dependency controls, overflow callbacks, offline assigned remainders and optional journal failures |
-| 52 | Receipt parsing, validation and upload merge |
+| 89 | Transaction contention, cancellation, disconnects, duplicate/reordered/lost packets, source lifetimes, saved-weapon rebinds and split-area routing |
+| 38 | Native-delivery dependency controls, weapon metadata, overflow callbacks, offline assigned remainders and optional journal failures |
+| 86 | Receipt parsing, weapon metadata/stat application, validation and upload merge |
 | 15 | Whole inventory/receipt snapshot selection |
 | 36 | Canonical/journal selection, forward-save rebinding, ACK retirement, revision floors and offline preservation |
 | 171 | Production checkpoint Store and metadata against filesystem fixtures, including serialization-point staging |

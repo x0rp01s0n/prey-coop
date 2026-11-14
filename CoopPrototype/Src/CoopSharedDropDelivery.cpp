@@ -112,6 +112,7 @@ bool ModMain::TryDeliverCommittedSharedDrop(SharedDropRecord& record, bool inter
         entry.count = static_cast<uint32_t>(std::max(1, record.count));
         entry.transactionSequence = record.pickupTransactionSequence;
         entry.objectVersion = record.version;
+        entry.weaponState = record.weaponState;
         m_localSharedDropDeliveries.push_back(entry);
         delivery = std::prev(m_localSharedDropDeliveries.end());
         record.pickupDeliveryStored = false;
@@ -119,7 +120,8 @@ bool ModMain::TryDeliverCommittedSharedDrop(SharedDropRecord& record, bool inter
     if (delivery->archetypeId != record.archetypeId ||
         delivery->count != static_cast<uint32_t>(std::max(1, record.count)) ||
         delivery->transactionSequence != record.pickupTransactionSequence || delivery->objectVersion != record.version ||
-        delivery->deliveredCount > delivery->count)
+        delivery->deliveredCount > delivery->count ||
+        !CoopWeaponState::Same(delivery->weaponState, record.weaponState))
     {
         m_lastSharedDropEvent = "delivery_receipt_mismatch_id_" + std::to_string(record.stableSpawnId);
         return false;

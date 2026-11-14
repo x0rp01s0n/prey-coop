@@ -2,6 +2,8 @@
 
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -146,11 +148,119 @@ void MergeChecks()
     Check(!CoopSharedDropDelivery::MergeForUpload(incoming, {historicalPending}, kSession + 1),
         "merge cannot exceed bounded entry limit");
 }
+
+void WeaponChecks()
+{
+    using namespace CoopWeaponState;
+    const State source{true, 37.125f, 6, {{UINT64_MAX, 2}, {41, 3}}, true};
+    Wire wire;
+    State decoded;
+    Check(Encode(source, wire) && Decode(wire, decoded) && Same(source, decoded),
+        "weapon wire preserves exact condition ammo and upgrades");
+    Check(sizeof(Wire) == 216, "weapon wire has stable fixed layout");
+    std::swap(decoded.mods[0], decoded.mods[1]);
+    Check(Same(source, decoded), "upgrade ordering is not identity");
+    for (int field = 0; field != 10; ++field)
+    {
+        Wire invalid = wire;
+        if (field == 0) invalid.present = 2;
+        if (field == 1) invalid.condition = std::numeric_limits<float>::quiet_NaN();
+        if (field == 2) invalid.condition = std::numeric_limits<float>::infinity();
+        if (field == 3) invalid.ammoLoaded = -1;
+        if (field == 4) invalid.modCount = kMaxMods + 1;
+        if (field == 5) invalid.modIds[1] = invalid.modIds[0];
+        if (field == 6) invalid.modLevels[0] = 17;
+        if (field == 7) invalid.modIds[kMaxMods - 1] = 1;
+        if (field == 8) invalid.present = 0;
+        if (field == 9) invalid.ammoLooted = 2;
+        Check(!Decode(invalid, decoded), "malformed weapon wire rejected");
+    }
+    State maximum{true, 100, 1000000, {}};
+    for (size_t i = 0; i < kMaxMods; ++i)
+        maximum.mods.emplace_back(i + 1, 16);
+    Check(Encode(maximum, wire) && Decode(wire, decoded) && Same(maximum, decoded),
+        "maximum bounded weapon metadata round trips");
+    maximum.mods.emplace_back(99, 1);
+    Check(!Encode(maximum, wire), "oversized native upgrade list rejected without truncation");
+
+    Entry row = Row();
+    row.weaponState = source;
+    std::vector<Entry> rows;
+    bool present = false;
+    Check(CoopSharedDropDelivery::ParseSection(Section({row}), rows, present) &&
+        rows.size() == 1 && Same(rows[0].weaponState, source),
+        "receipt round trip retains exact weapon metadata");
+    Entry changed = row;
+    ++changed.weaponState.ammoLoaded;
+    rows = {changed};
+    Check(!CoopSharedDropDelivery::SameCommit(row, changed) &&
+        !CoopSharedDropDelivery::MergeForUpload(rows, {row}, kSession),
+        "upload cannot change committed weapon metadata");
+    for (const char* suffix : {"w1 0 -1 0", "w1 0 0 17", "w1 0 0 1 42 0",
+             "w1 0 0 2 42 1 42 2", "w1 0 0 0 extra", "w2 0 0 0"})
+        Check(!ReadSuffix(suffix, decoded), "malformed weapon receipt rejected");
+    Check(ReadSuffix("", decoded) && !decoded.present, "legacy receipt remains readable");
+
+    struct Mods
+    {
+        std::map<uint64_t, int> m_weaponModIds;
+        unsigned clears = 0, adds = 0;
+        void Clear() { ++clears; m_weaponModIds.clear(); }
+        void AddMod(uint64_t id) { ++adds; ++m_weaponModIds[id]; }
+    };
+    struct StatModifier { int m_StatName; float m_Modifier; };
+    struct Level { std::vector<StatModifier> m_StatModifiers{{1, 2.0f}}; };
+    struct Definition {
+        std::string m_Name = "upgrade";
+        Level level;
+        const Level* GetLevelWeaponMod(int n) const { return n <= 3 ? &level : nullptr; }
+    };
+    struct Library {
+        Definition definition;
+        const Definition* GetWeaponModByID(uint64_t id) const { return id == 99 ? nullptr : &definition; }
+    } library;
+    struct Stats {
+        float value = 10;
+        void AddModifier(int, float delta, const std::string&) { value += delta; }
+    };
+    struct Weapon {
+        float m_condition = 100;
+        int m_numAmmoLoaded = 15;
+        Mods m_weaponMods;
+        bool m_bHasAmmoBeenLooted = false;
+        Stats m_statsComponent;
+        void InitializeStats() { m_statsComponent.value = 10; }
+    } weapon;
+    Check(ApplyNative(weapon, source, library), "native apply accepts known upgrade definitions");
+    Check(Same(CaptureNative(weapon), source) && weapon.m_weaponMods.clears == 1 &&
+        weapon.m_weaponMods.adds == 5, "native apply restores values and exact upgrade levels");
+    Check(weapon.m_statsComponent.value == 20, "upgrade levels also restore functional native stats");
+    ApplyNative(weapon, source, library);
+    Check(weapon.m_weaponMods.clears == 1 && weapon.m_weaponMods.adds == 5,
+        "repeated apply does not stack native upgrade effects");
+    Check(weapon.m_statsComponent.value == 20, "repeated apply leaves functional stats unchanged");
+    State unknown = source;
+    unknown.mods = {{99, 1}};
+    Check(!ApplyNative(weapon, unknown, library) && Same(CaptureNative(weapon), source),
+        "unknown upgrade refuses apply before changing the weapon");
+    unknown.mods = {{1, 4}};
+    Check(!ApplyNative(weapon, unknown, library) && weapon.m_statsComponent.value == 20,
+        "missing native upgrade level refuses partial restore");
+    State unmodified{true, 50, 0, {}};
+    ApplyNative(weapon, unmodified, library);
+    Check(Same(CaptureNative(weapon), unmodified) && weapon.m_weaponMods.clears == 2,
+        "unmodified source clears replica defaults");
+    Check(weapon.m_statsComponent.value == 10, "removing upgrades resets their functional stats");
+    weapon.m_bHasAmmoBeenLooted = true;
+    ApplyNative(weapon, unmodified, library, false);
+    Check(weapon.m_bHasAmmoBeenLooted, "legacy sidecar apply does not overwrite unknown loot state");
+}
 }
 
 int main()
 {
     ParserChecks();
     MergeChecks();
+    WeaponChecks();
     std::cout << "Shared-drop receipt parser and upload merge: " << g_checks << " checks passed\n";
 }
