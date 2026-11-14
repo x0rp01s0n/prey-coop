@@ -13,6 +13,8 @@
 #include <vector>
 
 #include "CoopProtocol.h"
+#include "CoopPlayerStateStore.h"
+#include "CoopSharedDropDelivery.h"
 #include "CoopReliableReorderBuffer.h"
 #include "CoopSessionHelloPolicy.h"
 #include "CoopDamagePolicy.h"
@@ -33,6 +35,7 @@
 #include "CoopAreaObjectJournal.h"
 #include "CoopAreaStateOverlay.h"
 #include "CoopSaveStateBridge.h"
+#include "CoopSharedDropDelivery.h"
 #include "NullUi.h"
 
 #include <Chairloader/IChairRender.h>
@@ -1346,6 +1349,7 @@ private:
     {
         uint32_t transferId = 0;
         uint32_t worldEpoch = 0;
+        uint64_t timelineId = 0;
         uint32_t totalBytes = 0;
         uint32_t chunkCount = 0;
         uint32_t receivedChunks = 0;
@@ -1625,6 +1629,8 @@ public:
         bool hasStatuses = false;
         bool hasQuickSelect = false;
         bool hasNativeCapture = false;
+        bool hasSharedDropDeliveries = false;
+        uint64_t sharedDropHostSessionId = 0;
         uint64_t equippedWeaponArchetypeId = 0;
         std::vector<PlayerInventoryItemState> inventory;
         std::vector<PlayerAbilityState> abilities;
@@ -1632,6 +1638,7 @@ public:
         std::vector<PlayerChipsetState> chipsets;
         std::vector<PlayerStatusState> statuses;
         std::vector<PlayerQuickSelectState> quickSelect;
+        std::vector<CoopSharedDropDelivery::Entry> sharedDropDeliveries;
         NativeSideBlobCaptureState nativeCapture;
     };
 
@@ -1715,8 +1722,10 @@ public:
     void OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const char* reason);
     void OnNativeRecyclerIngredientSpawned(EntityId itemEntityId, const char* reason);
     bool ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerId, const char* reason);
-    void OnNativeSharedItemPicked(EntityId itemEntityId, EntityId pickerId, bool success, const char* reason);
     void CaptureLocalPlayerPickupRecovery(EntityId pickerId, const char* reason);
+    uint64_t BeginCommittedSharedDropInventoryTransfer(CArkItem* item, IArkInventory* target, int& countBefore);
+    void EndCommittedSharedDropInventoryTransfer(uint64_t stableSpawnId, int countBefore, IArkInventory* target);
+    bool IsSharedDropDeliveryRecoveryRequired() const { return m_sharedDropDeliveryRecoveryRequired; }
     void OnSharedDropEntityRemoved(EntityId entityId);
     void MarkRemoteRecyclerGrenadeForHook(CArkProjectileRecyclerGrenade* grenade);
     void MarkLocalRecyclerSharedDropForHook(
@@ -1726,7 +1735,7 @@ public:
         const CArkProjectileRecyclerGrenade* grenade,
         EntityId targetEntityId);
     void OnRemoteRecyclerGrenadeDestroyedForHook(CArkProjectileRecyclerGrenade* grenade);
-    bool ShouldSuppressRemoteRecyclerForSharedDrop(
+    bool ShouldSuppressRecyclerForSharedDrop(
         const CArkProjectileRecyclerGrenade* grenade,
         EntityId targetEntityId) const;
     bool ShouldDeferSharedStorageOpen(CArkExternalInventoryUI* ui, ArkInventory* inventory, const char* reason);
@@ -1985,7 +1994,7 @@ private:
     void HandleStoryEvent(const CoopProtocol::StoryEventPacket& packet);
     void HandleAreaObjectEvent(const CoopProtocol::AreaObjectEventPacket& packet);
     void ResetStoryEventState(const char* lastEvent);
-    void ResetAreaObjectEventState(const char* lastEvent);
+    void ResetAreaObjectEventState(const char* lastEvent, bool preserveAreaDrops = false);
     bool QueueLocalStoryEventForHook(uint16_t eventKind, uint64_t targetId, int32_t count, uint16_t flags, const char* reason, const char* textValue = nullptr, uint64_t contextEntityGuid = 0, uint64_t contextCharacterId = 0, uint16_t contextFlags = 0, int32_t contextChannel = -1);
     bool ApplyStoryEventMutation(const CoopProtocol::StoryEventPacket& packet, std::string& detail);
     bool QueueLocalAreaObjectEventForHook(uint16_t eventKind, uint64_t targetGuid, uint16_t value, uint32_t flags, const char* reason, int32_t count = 0, const char* textValue = nullptr);
@@ -2035,6 +2044,8 @@ private:
         EntityId localEntityId = INVALID_ENTITYID;
         uint32_t version = 0;
         uint32_t pickupTransactionSequence = 0;
+        Vec3 position = Vec3(ZERO);
+        Quat rotation = Quat(IDENTITY);
         int count = 0;
         bool live = false;
         bool pickupPending = false;
@@ -2042,20 +2053,38 @@ private:
         bool pickupResultSent = false;
         bool pickupResultSucceeded = false;
         float pickupRetrySecondsRemaining = 0.0f;
+        std::chrono::steady_clock::time_point pickupReservationDeadline;
+        bool pickupCommitted = false;
+        bool pickupDeliveryInProgress = false;
+        bool pickupDeliveryAttempted = false;
+        bool pickupDeliveryStored = false;
         bool localPickupGranted = false;
         bool nativePickupInProgress = false;
         uint64_t pickupWinnerPeerHash = 0;
     };
     uint64_t BuildSharedDropStableId(uint64_t archetypeId, const Vec3& position, uint32_t sequence) const;
+    bool IsSharedDropWorldReady() const;
+    bool IsSharedDropServiceReady() const;
+    void DetachSharedDropEntities();
     bool BuildSharedDropPacket(CoopProtocol::SharedDropPacket& packet, CoopProtocol::SharedDropCommand command, const SharedDropRecord& record, uint64_t targetPeerHash = 0) const;
     bool MaterializeSharedDrop(const CoopProtocol::SharedDropPacket& packet, SharedDropRecord& record, std::string& detail);
-    bool RemoveSharedDropLocal(SharedDropRecord& record, bool grantToLocalPlayer, std::string& detail);
+    bool RemoveSharedDropLocal(SharedDropRecord& record, std::string& detail);
     void ReleaseSharedDropReservation(SharedDropRecord& record, uint64_t peerHash, uint32_t transactionSequence, const char* reason);
     void ReleaseSharedDropReservationsForPeer(uint64_t peerHash);
     bool SendSharedDropPickupResult(SharedDropRecord& record, bool success);
+    bool SendSharedDropPickupReady(SharedDropRecord& record, bool ready);
+    uint64_t EnsureSharedDropHostSessionId();
+    bool TryDeliverCommittedSharedDrop(SharedDropRecord& record, bool interactive = true);
+    bool CommitSharedDropPickup(SharedDropRecord& record, uint64_t winnerPeerHash, uint32_t transactionSequence);
+    bool PersistLocalSharedDropDelivery(SharedDropRecord& record);
+    void ProcessSharedDropDeliveryRecoveryFault();
+    void RestoreCommittedSharedDropDeliveries();
     bool SendSharedDropToPeer(const CoopProtocol::SharedDropPacket& packet, uint64_t peerHash, const char* failurePrefix);
     void TickSharedDropPickupRetries(float frameTime);
-    void ResetSharedDropState(const char* reason);
+    void ResetSharedDropState(const char* reason, bool preserveAreaDrops = false);
+    void RecoverSavedSharedDrops();
+    void ReplaySharedDrops();
+    void PruneUnboundSharedDrops();
     struct SharedStorageRecord
     {
         uint64_t guid = 0;
@@ -2255,6 +2284,15 @@ private:
     std::string GetHostPlayerStatePathForAccount(uint64_t accountToken) const;
     std::string GetHostPlayerStatePathForAccountAndSave(uint64_t accountToken, const std::string& saveKey) const;
     std::string BuildHostSaveStateKey(const std::string& savePathOrName) const;
+    bool OpenHostPlayerStateTimeline(const std::string& savePath, bool explicitLoad);
+    void FinishHostInventoryWorldLoad(bool loadFailed);
+    bool CaptureHostPlayerCheckpoint(const std::string& savePath);
+    void BeginHostCheckpointSave(const std::string& savePath);
+    void ObserveHostCheckpointSaveWrite(const std::string& savePath, bool result);
+    void ResetPendingHostCheckpointSave();
+    bool HasPendingHostCheckpointSave();
+    bool HasContinuingHostInventoryWorld() const;
+    void TickHostCheckpointSave();
     std::string BuildLegacyHostSaveStateKey(const std::string& savePathOrName) const;
     bool WriteDefaultHostPlayerStateFile(const std::string& path, const std::string& username);
     uint32_t CarryForwardHostPlayerStatesForSave(
@@ -2907,6 +2945,10 @@ private:
     bool SaveLocalPlayerSidecar(const char* reason);
     bool LoadLocalPlayerSidecar(PlayerSidecarState& state);
     bool LoadPlayerSidecarFromPath(const std::string& path, PlayerSidecarState& state);
+    bool StoreCommittedSharedDropDelivery(uint64_t accountToken, const CoopSharedDropDelivery::Entry& entry);
+    bool MergeSharedDropDeliveriesForUpload(const std::string& incomingPath, const std::string& storedPath);
+    bool PrepareSharedDropDeliveriesForHostTransfer(const std::string& path);
+    bool ReconcileRecoveryPlayerStateSnapshot(PlayerSidecarState& state, const PlayerSidecarState& hostState);
     bool HasValidPlayerSidecarRecoveryJournal() const;
     uint64_t GetPlayerSidecarRecoveryJournalRevision() const;
     bool WriteLocalPlayerRecoveryJournal(const char* reason);
@@ -3323,6 +3365,10 @@ private:
     float m_remoteAreaObjectEchoSuppressSeconds = 0.0f;
     uint32_t m_localAreaObjectCommandMutationDepth = 0;
     std::unordered_map<uint64_t, SharedDropRecord> m_sharedDrops;
+    bool m_sharedDropRecoveryRequired = true;
+    uint64_t m_sharedDropHostSessionId = 0;
+    bool m_sharedDropDeliveryRecoveryRequired = false;
+    std::vector<CoopSharedDropDelivery::Entry> m_localSharedDropDeliveries;
     std::unordered_map<EntityId, uint64_t> m_sharedDropByEntityId;
     uint32_t m_sharedDropSequence = 0;
     uint32_t m_sharedDropSent = 0;
@@ -4190,6 +4236,12 @@ private:
     std::string m_saveTransferSourcePath;
     std::string m_saveTransferReceivePath;
     std::string m_playerStateTransferSourcePath;
+    std::vector<uint8_t> m_playerStateTransferBytes;
+    uint64_t m_playerStateTransferTimelineId = 0;
+    uint32_t m_playerStateUploadAckTransferId = 0;
+    uint32_t m_playerStateUploadAckChecksum = 0;
+    uint64_t m_playerStateUploadAckRevision = 0;
+    uint64_t m_playerStateUploadAckSnapshotRevision = 0;
     std::string m_clientDisconnectTransferSourcePath;
     std::string m_playerStateTransferReceivePath;
     std::string m_areaJournalTransferSourcePath;
@@ -4214,6 +4266,19 @@ private:
     std::string m_clientLocalAreaEnteredByTransitionLevel;
     std::string m_hostPlayerStateSentUsername;
     std::string m_currentHostSaveStateKey;
+    uint64_t m_currentHostTimelineId = 0;
+    uint64_t m_localInventoryCapturedRevision = 0;
+    bool m_clientHostTimelineRestorePending = false;
+    std::unique_ptr<CoopPlayerStateStore::Store> m_hostPlayerStateStore;
+    enum class HostInventorySession
+    {
+        NeedsCheckpointRestore,
+        LoadingCheckpoint,
+        CheckpointLoadFailed,
+        Continuing
+    };
+    HostInventorySession m_hostInventorySession = HostInventorySession::NeedsCheckpointRestore;
+    std::string m_pendingHostInventoryLoadPath;
     std::string m_pendingHostPlayerStateReason;
     std::string m_pendingHostPlayerStateSaveKey;
     std::string m_pendingClientPlayerStateUploadReason;
@@ -4689,6 +4754,20 @@ private:
     bool m_hostInternalSnapshotSaveActive = false;
     bool m_hostInternalSnapshotWriteCompleteReceived = false;
     bool m_hostInternalSnapshotWriteCompleteObserved = false;
+    struct PendingHostCheckpointSave
+    {
+        std::string path;
+        std::string saveKey;
+        std::string nativeScope;
+        std::string completedPath;
+        bool returned = false;
+        bool writeComplete = false;
+        bool writeResult = false;
+        bool conflict = false;
+        std::chrono::steady_clock::time_point deadline;
+    };
+    std::mutex m_hostCheckpointSaveMutex;
+    PendingHostCheckpointSave m_hostCheckpointSave;
     bool m_hostInternalSnapshotRetryPending = false;
     bool m_clientInternalPlayerSnapshotSaveActive = false;
     bool m_clientPlayerSnapshotForUploadPending = false;

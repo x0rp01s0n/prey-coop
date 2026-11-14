@@ -76,9 +76,13 @@ set(SOURCE_FILES
 	NullUi.cpp
 	NullUi.h
     CoopPlayerSidecar.cpp
+    CoopPlayerStateStore.cpp
+    CoopPlayerStateStore.h
     CoopPtrHygiene.cpp
     CoopPtrHygiene.h
     CoopSharedDropSync.cpp
+    CoopSharedDropDelivery.cpp
+    CoopSharedDropDelivery.h
     CoopSharedStorageSync.cpp
 	CoopPlayerState.cpp
 	CoopPlayerFallRecovery.cpp
@@ -112,6 +116,10 @@ set(SOURCE_FILES
 )
 
 add_library(${MOD_NAME} SHARED ${SOURCE_FILES})
+option(COOP_ESCROW_NATIVE_TEST_CONTROLS "Enable diagnostic-only native overflow UI controls" OFF)
+if(COOP_ESCROW_NATIVE_TEST_CONTROLS)
+    set_property(SOURCE ModMain.cpp APPEND PROPERTY COMPILE_DEFINITIONS COOP_ESCROW_NATIVE_TEST_CONTROLS=1)
+endif()
 target_link_libraries(${MOD_NAME}
 	CommonMod
 	ws2_32

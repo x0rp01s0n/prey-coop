@@ -9,6 +9,7 @@
 #include "CoopRuntimeConfig.h"
 #include "CoopFilesystem.h"
 #include "CoopProfilePath.h"
+#include "CoopPlayerStateStore.h"
 #include "CoopPtrHygiene.h"
 #include "CoopDamagePolicy.h"
 #include "CoopCampaignAreaFacts.generated.h"
@@ -209,6 +210,9 @@
 #include <Prey/GameDll/ark/ui/arkplayerhitdeathui.h>
 #include <Prey/GameDll/ark/ui/arkexternalinventoryui.h>
 #include <Prey/GameDll/ark/ui/ArkPDAComponent.h>
+#if defined(COOP_ESCROW_NATIVE_TEST_CONTROLS)
+#include <Prey/GameDll/ark/ArkAuxiliaryInventory.h>
+#endif
 #include <Prey/GameDll/ark/ui/arkuihud.h>
 #include <Prey/GameDll/ark/ui/IUIModule.h>
 #include <Prey/GameDll/ark/ui/ArkLauncherMenu.h>
@@ -3391,6 +3395,17 @@ bool IsCrossWorldReliablePayload(uint16_t payloadType)
         payloadType == static_cast<uint16_t>(CoopProtocol::PacketType::PeerPresence);
 }
 
+bool IsSharedDropReplayPayload(uint16_t payloadType, const void* payload, uint16_t payloadSize)
+{
+    if (payloadType != static_cast<uint16_t>(CoopProtocol::PacketType::SharedDrop) ||
+        !payload || payloadSize != sizeof(CoopProtocol::SharedDropPacket))
+        return false;
+    CoopProtocol::SharedDropPacket packet = {};
+    std::memcpy(&packet, payload, sizeof(packet));
+    return packet.command == static_cast<uint16_t>(CoopProtocol::SharedDropCommand::Spawn) ||
+        packet.command == static_cast<uint16_t>(CoopProtocol::SharedDropCommand::SnapshotEnd);
+}
+
 bool IsAreaScopedReliablePayload(uint16_t payloadType)
 {
     switch (static_cast<CoopProtocol::PacketType>(payloadType))
@@ -3405,7 +3420,6 @@ bool IsAreaScopedReliablePayload(uint16_t payloadType)
     case CoopProtocol::PacketType::EnemyMannequinAction:
     case CoopProtocol::PacketType::AreaObjectEvent:
     case CoopProtocol::PacketType::EnemyRoster:
-    case CoopProtocol::PacketType::SharedDrop:
     case CoopProtocol::PacketType::SharedStorage:
     case CoopProtocol::PacketType::HazardEvent:
     case CoopProtocol::PacketType::CorpsePhantomRequest:
@@ -3698,6 +3712,7 @@ struct RecoveryStateMetadata
     uint64_t accountToken = 0;
     uint64_t hostAccountToken = 0;
     uint64_t revision = 0;
+    uint64_t timelineId = 0;
     std::string saveKey;
 };
 
@@ -3776,6 +3791,13 @@ bool ReadRecoveryStateMetadata(
             metadata.saveKey = line.substr(std::strlen("recoverySaveKey="));
             saveKeyPresent = !metadata.saveKey.empty();
         }
+        else if (line.rfind("recoveryTimeline=", 0) == 0)
+        {
+            std::istringstream value(line.substr(std::strlen("recoveryTimeline=")));
+            value >> std::hex >> metadata.timelineId;
+            if (value.fail())
+                return false;
+        }
         else if (line.rfind("recoveryRevision=", 0) == 0)
         {
             std::istringstream revision(line.substr(std::strlen("recoveryRevision=")));
@@ -3784,7 +3806,7 @@ bool ReadRecoveryStateMetadata(
             revisionPresent = !revision.fail() && metadata.revision != 0;
         }
     }
-    return accountPresent && hostAccountPresent && saveKeyPresent && revisionPresent;
+    return accountPresent && hostAccountPresent && saveKeyPresent && revisionPresent && metadata.timelineId != 0;
 }
 
 bool WriteTextFileWithIntegrityHash(const std::filesystem::path& path, const std::string& payload)
@@ -5508,6 +5530,26 @@ bool ResolveReadableSaveFile(const std::string& savePathOrName, std::string& out
 {
     if (savePathOrName.empty() || savePathOrName == "-")
         return false;
+
+    std::string nativePath = savePathOrName;
+    std::replace(nativePath.begin(), nativePath.end(), '\\', '/');
+    std::string lowerPath = nativePath;
+    for (char& ch : lowerPath)
+        ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    constexpr std::string_view userSavePrefix = "%user%/savegames/";
+    if (lowerPath.compare(0, userSavePrefix.size(), userSavePrefix) == 0)
+    {
+        const std::filesystem::path saveRoot = GetPreySaveGamesRoot();
+        const std::string relative = nativePath.substr(userSavePrefix.size());
+        if (saveRoot.empty() || relative.empty() || relative.front() == '/' || relative.find(':') != std::string::npos)
+            return false;
+        const std::filesystem::path suffix = CoopFilesystem::FromUtf8(relative);
+        for (const auto& component : suffix)
+            if (component == "." || component == "..")
+                return false;
+        // Native WriteComplete uses this alias; it already names the exact campaign.
+        return TryReadableSaveCandidate(saveRoot / suffix, outPath);
+    }
 
     if (TryReadableSaveCandidate(CoopFilesystem::FromUtf8(savePathOrName), outPath))
         return true;
@@ -8121,6 +8163,7 @@ static auto s_hookCArkItemTryGiveInventory = CArkItem::FTryGiveInventory.MakeHoo
 static auto s_hookCArkItemDrop = CArkItem::FDrop.MakeHook();
 static auto s_hookCArkItemClone = CArkItem::FClone.MakeHook();
 static auto s_hookCArkItemPickUp = CArkItem::FPickUp.MakeHook();
+static auto s_hookCArkWeaponPickUp = CArkWeapon::FPickUp.MakeHook();
 static auto s_hookArkPlayerWeaponComponentEquipWeapon = ArkPlayerWeaponComponent::FEquipWeaponOv0.MakeHook();
 static auto s_hookCArkWeaponOnEquip = CArkWeapon::FOnEquip.MakeHook();
 static auto s_hookArkRecyclerSpawnNextIngredient = ArkRecycler::FSpawnNextIngredient.MakeHook();
@@ -13596,14 +13639,14 @@ static void ArkProjectileRecyclerGrenade_HandleEntityInArea_Hook(
     const bool recycling)
 {
     const EntityId projectileId = ResolveRecyclerGrenadeEntityId(grenade);
-    if (gMod && gMod->ShouldSuppressRemoteRecyclerForSharedDrop(grenade, static_cast<EntityId>(entityId)))
+    if (gMod && gMod->ShouldSuppressRecyclerForSharedDrop(grenade, static_cast<EntityId>(entityId)))
     {
         gMod->RecordRecyclerGrenadeTrace(
-            "HandleEntityInArea suppressed remote shared drop",
+            "HandleEntityInArea suppressed shared drop",
             projectileId,
             static_cast<EntityId>(entityId),
             recycling ? 1u : 0u,
-            "authoritative remove pending");
+            "reserved delivery or authoritative remove pending");
         return;
     }
     if (gMod)
@@ -13637,14 +13680,14 @@ static bool ArkProjectileRecyclerGrenade_RecycleEntity_Hook(
     const bool inLOS)
 {
     const EntityId projectileId = ResolveRecyclerGrenadeEntityId(grenade);
-    if (gMod && gMod->ShouldSuppressRemoteRecyclerForSharedDrop(grenade, static_cast<EntityId>(entityId)))
+    if (gMod && gMod->ShouldSuppressRecyclerForSharedDrop(grenade, static_cast<EntityId>(entityId)))
     {
         gMod->RecordRecyclerGrenadeTrace(
-            "RecycleEntity suppressed remote shared drop",
+            "RecycleEntity suppressed shared drop",
             projectileId,
             static_cast<EntityId>(entityId),
             inLOS ? 1u : 0u,
-            "authoritative remove pending");
+            "reserved delivery or authoritative remove pending");
         return false;
     }
     if (gMod)
@@ -13686,6 +13729,13 @@ static void ArkProjectileRecyclerGrenade_AddIngredients_Hook(
     EntityId recycledEntityId = INVALID_ENTITYID;
     std::string reason;
     TryGuardedCall("recycler AddIngredients recycled entity GetId", [&recycledEntity]() { return recycledEntity.GetId(); }, recycledEntityId, &reason);
+    if (gMod && gMod->ShouldSuppressRecyclerForSharedDrop(grenade, recycledEntityId))
+    {
+        gMod->RecordRecyclerGrenadeTrace(
+            "AddIngredients suppressed shared drop", projectileId, recycledEntityId, 0u,
+            "reserved delivery or authoritative remove pending");
+        return;
+    }
     if (gMod)
     {
         const std::string detail = BuildRecyclerGrenadeDetail(grenade, "addIngredients");
@@ -19454,9 +19504,16 @@ static bool CArkItem_GiveOwnerPicker_Hook(CArkItem* item, unsigned pickerId)
 
 static bool CArkItem_GiveOwnerInventory_Hook(CArkItem* item, IArkInventory* inventory)
 {
+    int countBefore = -1;
+    const uint64_t deliveryId = gMod
+        ? gMod->BeginCommittedSharedDropInventoryTransfer(item, inventory, countBefore)
+        : 0;
     const bool result = s_hookCArkItemGiveOwnerInventory.InvokeOrig(item, inventory);
     if (gMod)
+    {
+        gMod->EndCommittedSharedDropInventoryTransfer(deliveryId, countBefore, inventory);
         gMod->OnArkItemOwnerMutationHook(item, "GiveOwnerInventory", 0, inventory, result);
+    }
     return result;
 }
 
@@ -19522,6 +19579,9 @@ static void CArkItem_Drop_Hook(CArkItem* item, int dropCount, const Vec3* altPos
         }
     }
 
+    if (gMod && localPlayerDrop && gMod->IsSharedDropDeliveryRecoveryRequired())
+        return;
+
     // Inventory overflow temporarily assigns the picker as owner, then calls
     // Drop to roll the failed pickup back when its menu closes. Only an item
     // that was actually in the inventory before Drop is a player-authored drop.
@@ -19536,7 +19596,10 @@ static void CArkItem_Drop_Hook(CArkItem* item, int dropCount, const Vec3* altPos
     s_activeSharedDropClone = previousClone;
 
     if (gMod && localPlayerDrop)
+    {
+        gMod->MarkLocalInventoryDirty("CArkItem::Drop");
         gMod->OnNativeSharedItemDropped(droppedItem, dropCount, "CArkItem::Drop");
+    }
 }
 
 static bool CArkItem_PickUp_Hook(CArkItem* item, const unsigned pickerId, bool scaleOnLerp)
@@ -19548,18 +19611,24 @@ static bool CArkItem_PickUp_Hook(CArkItem* item, const unsigned pickerId, bool s
         CoopPtrHygiene::LogPtrWith("item_pickup", item, extra);
         CoopPtrHygiene::CheckAbove32("item_pickup", item);
     }
-    const EntityId itemEntityId = item ? item->GetEntityId() : INVALID_ENTITYID;
     if (gMod && gMod->ShouldDeferNativeSharedItemPickup(item, pickerId, "CArkItem::PickUp"))
         return false;
 
     const bool result = s_hookCArkItemPickUp.InvokeOrig(item, pickerId, scaleOnLerp);
     if (gMod)
     {
-        gMod->OnNativeSharedItemPicked(itemEntityId, pickerId, result, "CArkItem::PickUp");
         if (result)
             gMod->CaptureLocalPlayerPickupRecovery(pickerId, "CArkItem::PickUp");
     }
     return result;
+}
+
+static bool CArkWeapon_PickUp_Hook(CArkItem* item, const unsigned pickerId, bool scaleOnLerp)
+{
+    // Weapon overflow and ammo handling can run before or beyond the base call.
+    if (gMod && gMod->ShouldDeferNativeSharedItemPickup(item, pickerId, "CArkWeapon::PickUp"))
+        return false;
+    return s_hookCArkWeaponPickUp.InvokeOrig(item, pickerId, scaleOnLerp);
 }
 
 static bool ArkPlayerWeaponComponent_EquipWeapon_Hook(
@@ -26540,6 +26609,7 @@ void ModMain::EndCoopLoadGuard(const char* reason)
     const bool arkLevelTransitionComplete =
         !loadFailed &&
         m_arkLevelTransitionLoadActive;
+    FinishHostInventoryWorldLoad(loadFailed);
 
     ++m_loadGuardEndCount;
     m_saveLoadGuardActive = false;
@@ -26788,6 +26858,13 @@ void ModMain::EndCoopLoadGuard(const char* reason)
             LogCoop("post-load main update trace frames=" + std::to_string(m_debugPostProxySpawnTraceFrames));
     }
 
+    if (m_hostInventorySession == HostInventorySession::CheckpointLoadFailed &&
+        m_networkMode == CoopNetworkMode::Host)
+    {
+        StopNetwork();
+        QueueCoopHudFeedback("LOAD FAILED - RELOAD A SAVE BEFORE HOSTING", 8.0f);
+    }
+
     if (!loadFailed && !m_pendingAutoStartMode.empty() && m_networkMode == CoopNetworkMode::Off)
     {
         const std::string mode = m_pendingAutoStartMode;
@@ -26824,6 +26901,130 @@ void ModMain::EndCoopLoadGuard(const char* reason)
     LogCoop("load guard end returned");
 }
 
+static std::string NativeHostCheckpointSaveScope(std::string path)
+{
+    for (char& ch : path)
+        ch = ch == '\\' ? '/' : static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    const size_t saveGames = path.find("/savegames/");
+    if (saveGames != std::string::npos)
+        path.erase(0, saveGames + 11);
+    constexpr std::string_view suffix = "/save.csf";
+    if (path.size() > suffix.size() && path.compare(path.size() - suffix.size(), suffix.size(), suffix) == 0)
+        path.resize(path.size() - suffix.size());
+    return path;
+}
+
+void ModMain::BeginHostCheckpointSave(const std::string& savePath)
+{
+    PendingHostCheckpointSave pending;
+    pending.path = savePath;
+    pending.saveKey = BuildHostSaveStateKey(savePath);
+    pending.nativeScope = NativeHostCheckpointSaveScope(savePath);
+    if (pending.nativeScope.find('/') == std::string::npos)
+    {
+        int campaign = -1;
+        uint64_t guid = 0;
+        if (TryGetCurrentCampaignIdentity(campaign, guid))
+            pending.nativeScope = "campaign" + std::to_string(campaign) + "/" + pending.nativeScope;
+        else
+            pending.conflict = true;
+    }
+    pending.deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+    std::lock_guard<std::mutex> lock(m_hostCheckpointSaveMutex);
+    if (!m_hostCheckpointSave.path.empty() || m_hostCheckpointSave.conflict)
+        m_hostCheckpointSave.conflict = true;
+    else
+        m_hostCheckpointSave = std::move(pending);
+}
+
+void ModMain::ObserveHostCheckpointSaveWrite(const std::string& savePath, bool result)
+{
+    const std::string scope = NativeHostCheckpointSaveScope(savePath);
+    {
+        std::lock_guard<std::mutex> lock(m_hostCheckpointSaveMutex);
+        if (m_hostCheckpointSave.path.empty() || m_hostCheckpointSave.nativeScope != scope)
+            return;
+        m_hostCheckpointSave.completedPath = savePath;
+        m_hostCheckpointSave.writeResult = result &&
+            (!m_hostCheckpointSave.writeComplete || m_hostCheckpointSave.writeResult);
+        m_hostCheckpointSave.writeComplete = true;
+    }
+    LogCoop("host inventory checkpoint native write complete result=" +
+        std::to_string(result ? 1 : 0) + " scope=" + scope);
+}
+
+void ModMain::ResetPendingHostCheckpointSave()
+{
+    std::lock_guard<std::mutex> lock(m_hostCheckpointSaveMutex);
+    m_hostCheckpointSave = {};
+}
+
+bool ModMain::HasPendingHostCheckpointSave()
+{
+    std::lock_guard<std::mutex> lock(m_hostCheckpointSaveMutex);
+    return !m_hostCheckpointSave.path.empty() || m_hostCheckpointSave.conflict;
+}
+
+bool ModMain::HasContinuingHostInventoryWorld() const
+{
+    return (m_networkMode == CoopNetworkMode::Host || m_networkMode == CoopNetworkMode::Off) &&
+        m_hostInventorySession == HostInventorySession::Continuing &&
+        m_hostPlayerStateStore && m_currentHostTimelineId != 0 &&
+        !m_currentHostSaveStateKey.empty() && m_currentHostSaveStateKey != "unknown_save";
+}
+
+void ModMain::TickHostCheckpointSave()
+{
+    if (m_networkMode != CoopNetworkMode::Host && !HasContinuingHostInventoryWorld())
+        return;
+    PendingHostCheckpointSave pending;
+    std::string failure;
+    {
+        std::lock_guard<std::mutex> lock(m_hostCheckpointSaveMutex);
+        if (m_hostCheckpointSave.conflict)
+            failure = "overlapping or unscoped native host saves";
+        else if (m_hostCheckpointSave.path.empty())
+            return;
+        else if (m_hostCheckpointSave.returned && m_hostCheckpointSave.writeComplete)
+        {
+            pending = m_hostCheckpointSave;
+            if (!pending.writeResult)
+                failure = "native host save write failed";
+        }
+        else if (std::chrono::steady_clock::now() >= m_hostCheckpointSave.deadline)
+            failure = "native host save write completion timed out";
+        else
+            return;
+        m_hostCheckpointSave = {};
+    }
+    // WriteComplete can run on the writer thread and before SaveGame returns.
+    // Hash and publish only here, after both signals, outside the writer callback.
+    if (failure.empty() && BuildHostSaveStateKey(pending.completedPath) != pending.saveKey)
+        failure = "native host save completion identity changed";
+    if (failure.empty())
+    {
+        const std::string previousSaveKey = m_currentHostSaveStateKey;
+        CarryForwardHostPlayerStatesForSave(previousSaveKey, pending.saveKey, "native host save complete");
+        SetCurrentHostSaveStateKey(pending.saveKey, true);
+        if (!CaptureHostPlayerCheckpoint(pending.completedPath))
+            failure = "co-op inventory checkpoint persistence failed";
+    }
+    if (!failure.empty())
+    {
+        LogCoop(failure + "; stopping session");
+        m_hostInventorySession = HostInventorySession::CheckpointLoadFailed;
+        StopNetwork();
+        QueueCoopHudFeedback("CO-OP CHECKPOINT FAILED - SESSION STOPPED", 8.0f);
+        return;
+    }
+    m_lastSaveLoadPath = pending.completedPath;
+    if (m_networkMode == CoopNetworkMode::Host)
+    {
+        BroadcastHostSaveIdentity("native host save complete");
+        RequestRemotePlayerStateUpload("native host save complete");
+    }
+}
+
 void ModMain::OnCryActionSaveGameRequested(
     const char* path,
     bool quick,
@@ -26833,7 +27034,6 @@ void ModMain::OnCryActionSaveGameRequested(
     const char* checkpointName)
 {
     (void)quick;
-    (void)forceImmediate;
     (void)ignoreDelay;
 
     ++m_saveGameHookCalls;
@@ -26847,8 +27047,12 @@ void ModMain::OnCryActionSaveGameRequested(
         m_networkMode == CoopNetworkMode::Client &&
         m_clientInternalPlayerSnapshotSaveActive;
     const bool internalCoopSnapshot = internalHostSnapshot || internalClientPlayerSnapshot;
-    if (!internalCoopSnapshot)
+    const bool tracksHostCheckpoint =
+        m_networkMode == CoopNetworkMode::Host || HasContinuingHostInventoryWorld();
+    if (!internalCoopSnapshot && !tracksHostCheckpoint)
         m_lastSaveLoadPath = path && path[0] ? path : "-";
+    if (forceImmediate && tracksHostCheckpoint && !internalHostSnapshot)
+        BeginHostCheckpointSave(path && path[0] ? std::string(path) : m_lastSaveLoadPath);
     m_lastSaveLoadEvent =
         std::string(internalCoopSnapshot ? "SaveGame internal snapshot reason=" : "SaveGame reason=") +
         std::to_string(reason);
@@ -26919,21 +27123,20 @@ void ModMain::OnCryActionSaveGameReturned(
         m_lastSaveLoadEvent += " checkpoint=" + StatusToken(checkpointName);
     LogCoop(m_lastSaveLoadEvent);
 
-    if (result && m_networkMode == CoopNetworkMode::Host && !internalHostSnapshot)
+    // Deferred success only queues the save; PostUpdate re-enters with forceImmediate.
+    if (forceImmediate && !internalHostSnapshot &&
+        (m_networkMode == CoopNetworkMode::Host || HasContinuingHostInventoryWorld()))
     {
-        const std::string previousSaveKey = m_currentHostSaveStateKey;
-        const std::string nextSaveKey = BuildHostSaveStateKey(
-            path && path[0] ? std::string(path) : m_lastSaveLoadPath);
-        CarryForwardHostPlayerStatesForSave(
-            previousSaveKey,
-            nextSaveKey,
-            "native host save complete");
-        SetCurrentHostSaveStateKey(nextSaveKey, true);
-        BroadcastHostSaveIdentity("native host save complete");
-        SnapshotLatestHostPlayerStatesForSave(
-            m_currentHostSaveStateKey,
-            "native host save complete");
-        RequestRemotePlayerStateUpload("native host save complete");
+        std::lock_guard<std::mutex> lock(m_hostCheckpointSaveMutex);
+        if (!m_hostCheckpointSave.conflict)
+        {
+            if (!result)
+                m_hostCheckpointSave = {};
+            else if (m_hostCheckpointSave.path.empty())
+                m_hostCheckpointSave.conflict = true;
+            else
+                m_hostCheckpointSave.returned = true;
+        }
     }
 }
 
@@ -27178,6 +27381,7 @@ void ModMain::OnConcreteSaveComplete(void* saveGame, bool successfulSoFar)
 void ModMain::OnActiveSaveWriteComplete(void* activeSave, const char* saveName, void* fileHandleRef, bool result)
 {
     const std::string safeSaveName = ReadRuntimeCString(saveName, 260);
+    ObserveHostCheckpointSaveWrite(safeSaveName, result);
     const std::string completeReason = "ActiveSave::WriteComplete " + StatusToken(safeSaveName);
     if (m_networkMode == CoopNetworkMode::Host &&
         m_saveTransferSnapshotPending &&
@@ -30153,11 +30357,26 @@ void ModMain::OnCryActionLoadGameRequested(const char* path, bool quick, bool ig
 
     ++m_loadGameHookCalls;
     m_lastSaveLoadPath = path && path[0] ? path : "-";
+    if (!m_arkLevelTransitionLoadActive)
+    {
+        m_pendingHostInventoryLoadPath = m_lastSaveLoadPath;
+        ResetPendingHostCheckpointSave();
+        m_hostInventorySession = HostInventorySession::LoadingCheckpoint;
+    }
     if (m_networkMode == CoopNetworkMode::Host || m_pendingAutoStartMode == "host")
     {
+        if (!m_arkLevelTransitionLoadActive)
+        {
+            // An explicit checkpoint load replaces the timeline. Old pending
+            // entitlements must not be delivered into that rolled-back world.
+            m_sharedDropHostSessionId = 0;
+            m_localSharedDropDeliveries.clear();
+        }
         if (m_networkMode == CoopNetworkMode::Host)
             CancelHostPlayerStateUploadsForTimelineChange("manual host load");
         SetCurrentHostSaveStateKey(BuildHostSaveStateKey(m_lastSaveLoadPath), false);
+        if (!m_arkLevelTransitionLoadActive && m_networkMode == CoopNetworkMode::Host)
+            OpenHostPlayerStateTimeline(m_lastSaveLoadPath, true);
         const std::string lowerPath = ToLowerAscii(m_lastSaveLoadPath);
         const bool looksLikeSaveFile =
             lowerPath.find("savegames") != std::string::npos ||
@@ -30211,6 +30430,14 @@ void ModMain::OnCryActionLoadGameFinished(const char* path, int result)
             m_hostManualLoadPreloadTransferStarted = false;
         }
         EndCoopLoadGuard("LoadGame failed");
+        if (m_networkMode == CoopNetworkMode::Host && !m_arkLevelTransitionLoadActive)
+        {
+            // Checkpoint inventory was rebased before parallel Client loads.
+            // Never continue the old world with that different inventory scope.
+            LogCoop("stopping co-op after failed native checkpoint load");
+            StopNetwork();
+            QueueCoopHudFeedback("LOAD FAILED - RELOAD A SAVE BEFORE HOSTING", 8.0f);
+        }
     }
 }
 
@@ -30722,6 +30949,12 @@ void ModMain::OnCoopSystemEvent(int event, std::uintptr_t wparam, std::uintptr_t
     (void)lparam;
 
     const ESystemEvent systemEvent = static_cast<ESystemEvent>(event);
+    if (systemEvent == ESYSTEM_EVENT_LEVEL_POST_UNLOAD &&
+        m_networkMode == CoopNetworkMode::Off && m_sharedDropDeliveryRecoveryRequired)
+    {
+        m_sharedDropDeliveryRecoveryRequired = false;
+        LogCoop("inventory delivery recovery fence cleared after world unload");
+    }
     switch (systemEvent)
     {
     case ESYSTEM_EVENT_LEVEL_LOAD_RESUME_GAME:
@@ -31958,6 +32191,7 @@ void ModMain::InitHooks()
         s_hookCArkItemDrop.SetHookFunc(&CArkItem_Drop_Hook);
         s_hookCArkItemClone.SetHookFunc(&CArkItem_Clone_Hook);
         s_hookCArkItemPickUp.SetHookFunc(&CArkItem_PickUp_Hook);
+        s_hookCArkWeaponPickUp.SetHookFunc(&CArkWeapon_PickUp_Hook);
         s_hookArkRecyclerSpawnNextIngredient.SetHookFunc(&ArkRecycler_SpawnNextIngredient_Hook);
         s_hookArkPlayerWeaponComponentEquipWeapon.SetHookFunc(&ArkPlayerWeaponComponent_EquipWeapon_Hook);
         s_hookCArkWeaponOnEquip.SetHookFunc(&CArkWeapon_OnEquip_Hook);
@@ -35708,6 +35942,8 @@ void ModMain::MainUpdate(unsigned updateFlags)
 {
     const float frameTime = gEnv && gEnv->pTimer ? gEnv->pTimer->GetFrameTime() : 0.0f;
     const float realFrameTime = gEnv && gEnv->pTimer ? gEnv->pTimer->GetRealFrameTime() : frameTime;
+    ProcessSharedDropDeliveryRecoveryFault();
+    TickHostCheckpointSave();
 
     // Refresh the bounded report outside the log hot path. This keeps the
     // release diagnostic available without turning every emitted event into a
@@ -35801,6 +36037,7 @@ void ModMain::MainUpdate(unsigned updateFlags)
         KickRemotePeer(accountToken);
     }
     if (m_multiplayerRestartRequired &&
+        !m_sharedDropDeliveryRecoveryRequired &&
         m_networkMode == CoopNetworkMode::Off &&
         !m_saveLoadGuardActive &&
         !IsGameReady())
@@ -35953,6 +36190,7 @@ void ModMain::MainUpdate(unsigned updateFlags)
 
     TickNetwork(frameTime);
     TickSharedDropPickupRetries(frameTime);
+    ProcessSharedDropDeliveryRecoveryFault();
     TickChat(frameTime, GetNowSeconds());
     TickRemotePlayerProxySmoothing(frameTime);
     TickRemoteDoorPowerConvergence(frameTime);
@@ -38170,6 +38408,8 @@ std::string ModMain::BuildRuntimeControlStatus() const
         << " playerStateChunks=" << (m_playerStateTransferSending ? m_playerStateTransferNextChunk : m_playerStateTransferReceivedChunks) << "/" << m_playerStateTransferChunkCount
         << " playerStateSaveKey=" << StatusToken(m_playerStateTransferSaveKey.empty() ? std::string("-") : m_playerStateTransferSaveKey)
         << " hostSaveKey=" << StatusToken(m_currentHostSaveStateKey.empty() ? std::string("-") : m_currentHostSaveStateKey)
+        << " inventoryTimeline=" << Hex64(m_currentHostTimelineId)
+        << " hostInventorySession=" << static_cast<unsigned>(m_hostInventorySession)
         << " playerStateHostUploads=" << m_hostPlayerStateUploadReceives.size()
             << "/" << m_pendingHostPlayerStateUploadRequests.size()
             << "/" << m_hostPlayerStateUploadRequests
@@ -44411,6 +44651,101 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
                 (guardReason.empty() ? std::string() : "_" + StatusToken(guardReason));
         }
     }
+#if defined(COOP_ESCROW_NATIVE_TEST_CONTROLS)
+    else if (command == "coop_escrow_native_ui")
+    {
+        const std::string verb = args.empty() ? std::string("probe") : ToLowerAscii(args[0]);
+        ArkPlayer* player = ArkPlayer::GetInstancePtr();
+        ArkPDAComponent* pda = player ? player->m_playerComponent.m_pPDAComponent.get() : nullptr;
+        CArkExternalInventoryUI* ui = pda ? pda->m_pExternalInventory.get() : nullptr;
+        ArkAuxiliaryInventory* overflow = pda ? pda->m_pOverflowInventory : nullptr;
+        std::string reason;
+        bool sourceMatches = false;
+        bool open = false;
+        std::vector<EntityId> ids;
+        auto readState = [&]()
+        {
+            ids.clear();
+            return TryGuardedVoidCall(
+                "escrow test native overflow state",
+                [&]()
+                {
+                    ui = pda ? pda->m_pExternalInventory.get() : nullptr;
+                    overflow = pda ? pda->m_pOverflowInventory : nullptr;
+                    open = ui && ui->m_bIsOpen;
+                    sourceMatches = overflow && ui && ui->m_pInventoryUI &&
+                        ui->m_pInventoryUI->m_pExternal == static_cast<IArkInventory*>(overflow);
+                    if (overflow)
+                    {
+                        for (const ArkInventory::StorageCell& cell : overflow->m_storedItems)
+                        {
+                            if (ids.size() >= 64)
+                                break;
+                            ids.push_back(cell.m_entityId);
+                        }
+                    }
+                },
+                &reason);
+        };
+        ok = pda && ui && readState();
+        EntityId requestedId = INVALID_ENTITYID;
+        if (ok && verb == "transfer")
+        {
+            uint64_t parsedId = 0;
+            ok = args.size() == 2 && TryParseUint64(args[1], parsedId) && parsedId != 0 &&
+                parsedId <= std::numeric_limits<EntityId>::max() && open && sourceMatches;
+            if (ok)
+            {
+                requestedId = static_cast<EntityId>(parsedId);
+                ok = std::find(ids.begin(), ids.end(), requestedId) != ids.end();
+            }
+            if (ok)
+                ok = TryGuardedVoidCall(
+                    "escrow test native overflow TransferItem",
+                    [ui, requestedId]() { ui->TransferItem(requestedId); },
+                    &reason);
+        }
+        else if (ok && (verb == "cancel" || verb == "dismiss"))
+        {
+            ok = args.size() == 1 && (verb == "cancel" ? open && sourceMatches : !open);
+            if (ok)
+                ok = TryGuardedVoidCall(
+                    "escrow test native PDA cancel",
+                    [pda]() { pda->TogglePDA(true, false); },
+                    &reason);
+        }
+        else if (ok && (verb != "probe" || args.size() > 1))
+        {
+            ok = false;
+        }
+        if (pda && ui)
+            ok = readState() && ok;
+        std::string sources;
+        for (EntityId id : ids)
+        {
+            CArkItem* item = CArkItem::GetItemFromEntityId(id);
+            int count = -1;
+            int maxStack = -1;
+            if (item)
+            {
+                TryGuardedCall("escrow test overflow source count", [item]() { return item->GetCount(); }, count, nullptr);
+                TryGuardedCall("escrow test overflow source stack limit", [item]() { return item->GetMaxStackSize(); }, maxStack, nullptr);
+            }
+            if (!sources.empty())
+                sources += ",";
+            sources += std::to_string(id) + ":" + std::to_string(count) + ":" + std::to_string(maxStack);
+        }
+        action = ok ? "escrow_ui_" + verb : "escrow_ui_failed";
+        m_lastRuntimeInteropEvent = action +
+            "_open_" + std::to_string(open ? 1 : 0) +
+            "_sourceMatches_" + std::to_string(sourceMatches ? 1 : 0) +
+            "_sources_" + std::to_string(ids.size()) +
+            "_items_" + (sources.empty() ? std::string("none") : sources) +
+            "_requested_" + std::to_string(requestedId) +
+            (reason.empty() ? std::string() : "_reason_" + StatusToken(reason));
+        m_networkStatus = m_lastRuntimeInteropEvent;
+    }
+#endif
     else if (command == "coop_world_ready")
     {
         if (m_networkMode == CoopNetworkMode::Client)
@@ -52433,6 +52768,12 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent, bool resetHos
     m_pendingHostPlayerStateUploadRequestSaveKeys.clear();
     m_deferredHostPlayerStateUploadRequestSaveKeys.clear();
     m_playerStateTransferSourcePath.clear();
+    m_playerStateTransferBytes.clear();
+    m_playerStateTransferTimelineId = 0;
+    m_playerStateUploadAckTransferId = 0;
+    m_playerStateUploadAckChecksum = 0;
+    m_playerStateUploadAckRevision = 0;
+    m_playerStateUploadAckSnapshotRevision = 0;
     m_clientDisconnectTransferSourcePath = preserveClientDisconnectFlush
         ? preservedDisconnectSourcePath
         : std::string();
@@ -52444,7 +52785,10 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent, bool resetHos
     m_hostPlayerStateSentUsername.clear();
     if (resetHostSaveIdentity)
     {
+        ResetPendingHostCheckpointSave();
         m_currentHostSaveStateKey.clear();
+        m_currentHostTimelineId = 0;
+        m_hostPlayerStateStore.reset();
     }
     m_pendingHostSaveLoadBroadcastAfterLoad = false;
     m_hostInternalSnapshotSaveActive = false;
@@ -52512,7 +52856,9 @@ void ModMain::ResetPlayerStateTransferState(const char* lastEvent, bool resetHos
     m_clientRecoveryJournalSourcePath.clear();
     m_clientRecoveryJournalSaveKey.clear();
     m_clientRecoveryJournalHostAccountToken = 0;
-    m_clientAwaitingHostPlayerState = false;
+    if (resetHostSaveIdentity)
+        m_clientHostTimelineRestorePending = false;
+    m_clientAwaitingHostPlayerState = m_clientHostTimelineRestorePending;
     m_hostPlayerStatePreloadSent = false;
     m_receivedPlayerStateInventoryPreparedForNativeLoad = false;
     m_receivedPlayerStateAbilitiesPreparedForNativeLoad = false;
@@ -52600,7 +52946,7 @@ void ModMain::ResetStoryEventState(const char* lastEvent)
     m_applyingRemoteStoryEvent = false;
 }
 
-void ModMain::ResetAreaObjectEventState(const char* lastEvent)
+void ModMain::ResetAreaObjectEventState(const char* lastEvent, bool preserveAreaDrops)
 {
     m_areaStateJournal.Reset();
     if (m_remoteMainLiftPhysicsSuspended && gEnv && gEnv->pEntitySystem)
@@ -52710,7 +53056,7 @@ void ModMain::ResetAreaObjectEventState(const char* lastEvent)
     m_pendingAreaOverlayApplyDelaySeconds = 0.0f;
     m_remoteAreaObjectEchoSuppressSeconds = 0.0f;
     m_localAreaObjectCommandMutationDepth = 0;
-    ResetSharedDropState(lastEvent);
+    ResetSharedDropState(lastEvent, preserveAreaDrops);
     ResetSharedStorageState(lastEvent);
     ResetHazardEventState(lastEvent);
     ResetDialogueLeaseState(lastEvent);
@@ -52719,9 +53065,25 @@ void ModMain::ResetAreaObjectEventState(const char* lastEvent)
 
 void ModMain::StartHost()
 {
-    if (m_multiplayerRestartRequired && !m_saveLoadGuardActive && !IsGameReady())
+    if (m_multiplayerRestartRequired && !m_sharedDropDeliveryRecoveryRequired && !m_saveLoadGuardActive && !IsGameReady())
         m_multiplayerRestartRequired = false;
-    if (m_multiplayerRestartRequired)
+    if (m_hostInventorySession == HostInventorySession::LoadingCheckpoint ||
+        m_hostInventorySession == HostInventorySession::CheckpointLoadFailed ||
+        m_saveLoadGuardActive || m_pendingPostLoadResync || !IsGameReady())
+    {
+        m_networkStatus = "load a save successfully before hosting";
+        QueueCoopHudFeedback("LOAD A SAVE BEFORE HOSTING", 4.0f);
+        LogCoop(m_networkStatus);
+        return;
+    }
+    if (HasPendingHostCheckpointSave())
+    {
+        m_networkStatus = "wait for the co-op inventory checkpoint before hosting";
+        QueueCoopHudFeedback("WAIT FOR CHECKPOINT BEFORE HOSTING", 4.0f);
+        LogCoop(m_networkStatus);
+        return;
+    }
+    if (m_multiplayerRestartRequired || m_sharedDropDeliveryRecoveryRequired)
     {
         m_networkStatus = "restart Prey before starting another multiplayer session";
         m_sessionStatus = "restart required";
@@ -52732,6 +53094,7 @@ void ModMain::StartHost()
 
     const std::string preservedSaveLoadPath = m_lastSaveLoadPath;
     const std::string preservedHostSaveStateKey = m_currentHostSaveStateKey;
+    const bool preserveHostInventoryWorld = HasContinuingHostInventoryWorld();
 
     StopNetwork();
     m_clientConnectStartTime = -1.0f;
@@ -52986,17 +53349,25 @@ void ModMain::StartHost()
     m_lastReliableEvent = "network host start";
     ResetWorldSyncControlState("network host start");
     ResetSaveTransferState("network host start");
-    ResetPlayerStateTransferState("network host start");
+    ResetPlayerStateTransferState("network host start", !preserveHostInventoryWorld);
     if (!preservedSaveLoadPath.empty() && preservedSaveLoadPath != "-")
         m_lastSaveLoadPath = preservedSaveLoadPath;
     if (!preservedHostSaveStateKey.empty())
-        SetCurrentHostSaveStateKey(preservedHostSaveStateKey, false);
+        SetCurrentHostSaveStateKey(preservedHostSaveStateKey, preserveHostInventoryWorld);
     else if (!m_lastSaveLoadPath.empty() && m_lastSaveLoadPath != "-")
         SetCurrentHostSaveStateKey(BuildHostSaveStateKey(m_lastSaveLoadPath), false);
+    OpenHostPlayerStateTimeline(m_lastSaveLoadPath, false);
+    if (m_currentHostTimelineId == 0)
+    {
+        StopNetwork();
+        m_networkStatus = "host inventory checkpoint unavailable";
+        QueueCoopHudFeedback("CHECKPOINT UNAVAILABLE - RELOAD A SAVE BEFORE HOSTING", 8.0f);
+        return;
+    }
     ResetAreaJournalTransferState("network host start");
     ResetAreaLeaseState("network host start");
     ResetStoryEventState("network host start");
-    ResetAreaObjectEventState("network host start");
+    ResetAreaObjectEventState("network host start", preserveHostInventoryWorld);
     ResetLivePropSyncState("network host start");
     ResetLocalPlayerFallRecovery("network host start");
     m_lastRouteKind = "-";
@@ -53179,13 +53550,20 @@ void ModMain::StartHost()
 
 void ModMain::StartClient()
 {
-    if (m_multiplayerRestartRequired && !m_saveLoadGuardActive && !IsGameReady())
+    if (m_multiplayerRestartRequired && !m_sharedDropDeliveryRecoveryRequired && !m_saveLoadGuardActive && !IsGameReady())
         m_multiplayerRestartRequired = false;
-    if (m_multiplayerRestartRequired)
+    if (m_multiplayerRestartRequired || m_sharedDropDeliveryRecoveryRequired)
     {
         m_networkStatus = "restart Prey before starting another multiplayer session";
         m_sessionStatus = "restart required";
         QueueCoopHudFeedback("RESTART PREY BEFORE RECONNECTING", 4.0f);
+        LogCoop(m_networkStatus);
+        return;
+    }
+    if (HasPendingHostCheckpointSave())
+    {
+        m_networkStatus = "wait for the co-op inventory checkpoint before joining";
+        QueueCoopHudFeedback("WAIT FOR CHECKPOINT BEFORE JOINING", 4.0f);
         LogCoop(m_networkStatus);
         return;
     }
@@ -53204,6 +53582,9 @@ void ModMain::StartClient()
         return;
 
     m_networkMode = CoopNetworkMode::Client;
+    m_pendingHostInventoryLoadPath.clear();
+    if (m_hostInventorySession == HostInventorySession::Continuing)
+        m_hostInventorySession = HostInventorySession::NeedsCheckpointRestore;
     m_localRuntimeSessionNonce = CreateRuntimeSessionNonce(this);
     m_sessionHostAccountToken = 0;
     m_clientConnectStartTime = GetNowSeconds();
@@ -53609,6 +53990,9 @@ void ModMain::StartClient()
 
 void ModMain::StopNetwork()
 {
+    const bool preserveHostInventoryWorld = HasContinuingHostInventoryWorld();
+    if (!preserveHostInventoryWorld)
+        ResetPendingHostCheckpointSave();
     ResetChat();
     m_chatTextRates.clear();
     const bool preserveClientInventoryRecovery =
@@ -53703,7 +54087,8 @@ void ModMain::StopNetwork()
         }
     }
 
-    const bool savedNetworkStopSidecar = SaveLocalPlayerSidecar("network stop");
+    const bool savedNetworkStopSidecar = m_networkMode != CoopNetworkMode::Off &&
+        SaveLocalPlayerSidecar("network stop");
     if (preserveClientInventoryRecovery && savedNetworkStopSidecar)
         WriteLocalPlayerRecoveryJournal("network stop recovery fallback");
     ClearJoinOverlayState("network stop");
@@ -53848,11 +54233,11 @@ void ModMain::StopNetwork()
     m_lastReliableEvent = "network stopped";
     ResetWorldSyncControlState("network stopped");
     ResetSaveTransferState("network stopped");
-    ResetPlayerStateTransferState("network stopped");
+    ResetPlayerStateTransferState("network stopped", !preserveHostInventoryWorld);
     ResetAreaJournalTransferState("network stopped");
     ResetAreaLeaseState("network stopped");
     ResetStoryEventState("network stopped");
-    ResetAreaObjectEventState("network stopped");
+    ResetAreaObjectEventState("network stopped", preserveHostInventoryWorld);
     ResetLivePropSyncState("network stopped");
     ResetLocalPlayerFallRecovery("network stopped");
     m_pendingPlayerSidecarSave = false;
@@ -58727,6 +59112,7 @@ bool ModMain::BuildPlayerStateTransferPacket(CoopProtocol::PlayerStateTransferPa
     packet.checksum = m_playerStateTransferChecksum;
     packet.flags = m_playerStateTransferFlags;
     packet.accountToken = m_playerStateTransferAccountToken;
+    packet.timelineId = m_playerStateTransferTimelineId;
     CopyFixedString(packet.username, sizeof(packet.username), m_playerStateTransferUsername);
     CopyFixedString(packet.saveKey, sizeof(packet.saveKey), m_playerStateTransferSaveKey);
     return true;
@@ -58825,9 +59211,15 @@ void ModMain::SetCurrentHostSaveStateKey(const std::string& saveKey, bool retain
         // save key before the incoming save has finished loading.
         ResetAreaJournalTransferState("host save identity changed");
         ResetStoryEventState("host save identity changed");
-        ResetAreaObjectEventState("host save identity changed");
+        ResetAreaObjectEventState("host save identity changed", m_arkLevelTransitionLoadActive);
     }
 
+    if (retainPrevious && m_networkMode == CoopNetworkMode::Client &&
+        m_localInventoryDirty && m_localInventoryDirtySaveKey == m_currentHostSaveStateKey &&
+        m_localInventoryDirtyHostAccountToken == GetSessionHostAccountToken())
+    {
+        m_localInventoryDirtySaveKey = saveKey;
+    }
     m_currentHostSaveStateKey = saveKey;
     ReconcileLocalInventoryDirtyForSaveKey(saveKey);
 }
@@ -59136,6 +59528,9 @@ bool ModMain::SendPacketTo(const void* packet, int packetSize, uint32_t address,
         if (CoopProtocol::IsValidHeader(header))
             packetType = header.type;
     }
+    if (m_sharedDropDeliveryRecoveryRequired &&
+        packetType != static_cast<uint16_t>(CoopProtocol::PacketType::DisconnectNotice))
+        return false;
     const uint32_t attemptedBytes = packetSize > 0 ? static_cast<uint32_t>(packetSize) : 0;
     m_networkTelemetry.RecordWireSendAttempt(packetType, attemptedBytes);
 
@@ -59422,7 +59817,11 @@ bool ModMain::SendSaveTransferTo(const CoopProtocol::SaveTransferPacket& packet,
 
 bool ModMain::SendPlayerStateTransferTo(const CoopProtocol::PlayerStateTransferPacket& packet, uint32_t address, uint16_t port, const char* failurePrefix)
 {
-    if (!SendReliablePayloadTo(static_cast<uint16_t>(CoopProtocol::PacketType::PlayerStateTransfer), &packet, sizeof(packet), address, port, failurePrefix))
+    CoopProtocol::PlayerStateTransferPacket scoped = packet;
+    if (scoped.timelineId == 0)
+        scoped.timelineId = m_currentHostTimelineId;
+    if (scoped.timelineId == 0 ||
+        !SendReliablePayloadTo(static_cast<uint16_t>(CoopProtocol::PacketType::PlayerStateTransfer), &scoped, sizeof(scoped), address, port, failurePrefix))
         return false;
 
     ++m_sentPlayerStateTransferPackets;
@@ -67740,6 +68139,8 @@ bool ModMain::QueueReliablePayloadToEndpoint(
     uint64_t sourceAccountToken,
     const char* failurePrefix)
 {
+    if (m_sharedDropDeliveryRecoveryRequired)
+        return false;
     if (!payload || payloadSize == 0 || payloadSize > CoopProtocol::kReliablePayloadSize)
     {
         ++m_reliableDroppedPackets;
@@ -68265,10 +68666,18 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
         return;
     }
 
+    const bool sharedDropReplayReceiveReady = m_networkMode == CoopNetworkMode::Client &&
+        !m_saveLoadGuardActive &&
+        IsSharedDropReplayPayload(packet.payloadType, packet.payload, packet.payloadSize);
+    const bool sharedDropServiceReceiveReady =
+        reliablePayloadType == CoopProtocol::PacketType::SharedDrop &&
+        packet.payloadSize == sizeof(CoopProtocol::SharedDropPacket) && IsSharedDropServiceReady();
     if (!isCrossWorldControlPayload &&
+        !sharedDropServiceReceiveReady &&
         (m_loadControlNetworkPumpActive ||
             (!IsSessionGameplayReady() &&
-                !(isEnemyReplicationPayload && enemyReplicationReceiveReady))))
+                !(isEnemyReplicationPayload && enemyReplicationReceiveReady) &&
+                !sharedDropReplayReceiveReady)))
     {
         // The authoritative snapshot supersedes gameplay packets emitted
         // during the join window, so retire them in order.
@@ -68636,11 +69045,16 @@ void ModMain::HandleReliablePayload(uint16_t payloadType, const uint8_t* payload
     }
     case CoopProtocol::PacketType::SharedDrop:
     {
-        if (payloadSize != sizeof(CoopProtocol::SharedDropPacket) || !IsSessionGameplayReady())
+        if (payloadSize != sizeof(CoopProtocol::SharedDropPacket))
             return;
 
         CoopProtocol::SharedDropPacket packet = {};
         std::memcpy(&packet, payload, sizeof(packet));
+        const bool initialReplay = m_networkMode == CoopNetworkMode::Client &&
+            !m_saveLoadGuardActive &&
+            IsSharedDropReplayPayload(payloadType, payload, payloadSize);
+        if (!IsSharedDropServiceReady() && !initialReplay)
+            return;
         HandleSharedDrop(packet);
         return;
     }
@@ -69078,16 +69492,6 @@ void ModMain::RelayReliablePayloadToPeers(
     const auto type = static_cast<CoopProtocol::PacketType>(packet.payloadType);
     const bool areaScoped = IsAreaScopedReliablePayload(packet.payloadType);
     const bool sourceInHostArea = IsKnownSameLevel(sourcePeer->levelName, m_localLevelName);
-    bool relaySharedDrop = false;
-    if (!sourceInHostArea &&
-        type == CoopProtocol::PacketType::SharedDrop &&
-        packet.payloadSize == sizeof(CoopProtocol::SharedDropPacket))
-    {
-        CoopProtocol::SharedDropPacket sharedDrop = {};
-        std::memcpy(&sharedDrop, packet.payload, sizeof(sharedDrop));
-        relaySharedDrop =
-            sharedDrop.command == static_cast<uint16_t>(CoopProtocol::SharedDropCommand::Spawn);
-    }
     const bool remoteAreaAuthorityRequest =
         !sourceInHostArea &&
         (type == CoopProtocol::PacketType::EnemyDamageRequest ||
@@ -69113,7 +69517,6 @@ void ModMain::RelayReliablePayloadToPeers(
         type == CoopProtocol::PacketType::StoryEvent ||
         type == CoopProtocol::PacketType::AreaObjectEvent ||
         type == CoopProtocol::PacketType::EnemyRoster ||
-        relaySharedDrop ||
         type == CoopProtocol::PacketType::HazardEvent ||
         remoteAreaAuthorityRequest ||
         remoteEnemyAuthorityCandidate;
@@ -71042,9 +71445,8 @@ bool ModMain::HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet,
         {
             peer.lastPoseSequence = 0;
             ClearRemotePeerPoseSmoothing(peer);
-            ReliableEndpointState& endpointState =
-                m_reliableEndpointStates[MakeEndpointKey(fromAddress, fromPort)];
-            endpointState.recvSequence = 0;
+            // Native loads keep this runtime session's reliable stream alive.
+            // Peer removal resets it when the process incarnation changes.
         }
     }
 
@@ -74609,6 +75011,129 @@ std::string ModMain::GetHostPlayerStatePathForAccountAndSave(uint64_t accountTok
     return CoopFilesystem::ToUtf8(root / safeSaveKey / ("player_account_" + Hex64(accountToken) + ".state"));
 }
 
+static std::string NativePlayerCheckpointFingerprint(const std::string& savePath)
+{
+    std::string resolved;
+    if (!ResolveReadableSaveFile(savePath, resolved))
+        return {};
+    std::ifstream input(CoopFilesystem::FromUtf8(resolved), std::ios::binary);
+    if (!input)
+        return {};
+    uint64_t hash = 14695981039346656037ull;
+    uint64_t size = 0;
+    std::array<char, 65536> buffer;
+    while (input)
+    {
+        input.read(buffer.data(), buffer.size());
+        const std::streamsize count = input.gcount();
+        for (std::streamsize i = 0; i < count; ++i)
+        {
+            hash ^= static_cast<unsigned char>(buffer[static_cast<size_t>(i)]);
+            hash *= 1099511628211ull;
+        }
+        size += static_cast<uint64_t>(count);
+    }
+    if (!input.eof() || size == 0)
+        return {};
+    return std::to_string(size) + "_" + Hex64(hash);
+}
+
+bool ModMain::OpenHostPlayerStateTimeline(const std::string& savePath, bool explicitLoad)
+{
+    const std::string fingerprint = NativePlayerCheckpointFingerprint(savePath);
+    const std::filesystem::path base = GetCoopServerSaveStateRoot();
+    const uint64_t host = GetLocalAccountToken();
+    m_currentHostTimelineId = 0;
+    if (fingerprint.empty() || base.empty() || host == 0)
+    {
+        if (m_hostInventorySession == HostInventorySession::Continuing)
+            m_hostInventorySession = HostInventorySession::NeedsCheckpointRestore;
+        LogCoop("host inventory timeline unavailable: native checkpoint identity missing");
+        return false;
+    }
+    m_hostPlayerStateStore = std::make_unique<CoopPlayerStateStore::Store>(
+        base / ("host_" + Hex64(host)),
+        [](const std::filesystem::path& path, std::string& reason)
+        {
+            bool hash = false;
+            return ValidatePlayerStateIntegrityFile(path, nullptr, &hash, &reason) && hash;
+        });
+    std::string error;
+    // Disk identity selects the checkpoint, not whether this world is still
+    // running. A fresh process or native load must not revive later live state.
+    const bool restoreCheckpoint = explicitLoad ||
+        m_hostInventorySession != HostInventorySession::Continuing;
+    const bool ok = restoreCheckpoint
+        ? m_hostPlayerStateStore->RotateTimeline(m_currentHostSaveStateKey, fingerprint, error)
+        : m_hostPlayerStateStore->Open(m_currentHostSaveStateKey, fingerprint, error);
+    m_currentHostTimelineId = m_hostPlayerStateStore->Timeline();
+    // A missing historical checkpoint establishes a safe empty scope. Actual
+    // I/O failures keep Timeline zero and must not establish continuity.
+    if (m_currentHostTimelineId != 0 &&
+        m_hostInventorySession != HostInventorySession::LoadingCheckpoint &&
+        m_hostInventorySession != HostInventorySession::CheckpointLoadFailed)
+        m_hostInventorySession = HostInventorySession::Continuing;
+    else if (m_currentHostTimelineId == 0 && m_hostInventorySession == HostInventorySession::Continuing)
+        m_hostInventorySession = HostInventorySession::NeedsCheckpointRestore;
+    LogCoop("host inventory timeline=" + Hex64(m_currentHostTimelineId) +
+        " saveKey=" + m_currentHostSaveStateKey +
+        " checkpoint=" + fingerprint +
+        " replace=" + std::to_string(restoreCheckpoint ? 1 : 0) +
+        (error.empty() ? std::string() : " detail=" + error));
+    return ok;
+}
+
+void ModMain::FinishHostInventoryWorldLoad(bool loadFailed)
+{
+    if (m_hostInventorySession != HostInventorySession::LoadingCheckpoint)
+        return;
+    const std::string loadPath = std::move(m_pendingHostInventoryLoadPath);
+    m_pendingHostInventoryLoadPath.clear();
+    if (loadFailed || (m_networkMode == CoopNetworkMode::Host && m_currentHostTimelineId == 0))
+        m_hostInventorySession = HostInventorySession::CheckpointLoadFailed;
+    else if (m_networkMode == CoopNetworkMode::Host)
+        m_hostInventorySession = HostInventorySession::Continuing;
+    else if (m_networkMode == CoopNetworkMode::Off && m_pendingAutoStartMode != "client")
+    {
+        if (loadPath.empty() || loadPath == "-")
+        {
+            m_hostInventorySession = HostInventorySession::CheckpointLoadFailed;
+            return;
+        }
+        SetCurrentHostSaveStateKey(BuildHostSaveStateKey(loadPath), false);
+        OpenHostPlayerStateTimeline(loadPath, true);
+        m_hostInventorySession = m_currentHostTimelineId != 0
+            ? HostInventorySession::Continuing
+            : HostInventorySession::CheckpointLoadFailed;
+        if (m_currentHostTimelineId != 0)
+            m_lastSaveLoadPath = loadPath;
+    }
+    else
+        m_hostInventorySession = HostInventorySession::NeedsCheckpointRestore;
+}
+
+bool ModMain::CaptureHostPlayerCheckpoint(const std::string& savePath)
+{
+    const std::string fingerprint = NativePlayerCheckpointFingerprint(savePath);
+    if (!m_hostPlayerStateStore || fingerprint.empty() || m_currentHostTimelineId == 0)
+    {
+        LogCoop("host inventory checkpoint unavailable store=" +
+            std::to_string(m_hostPlayerStateStore ? 1 : 0) +
+            " fingerprint=" + std::to_string(fingerprint.empty() ? 0 : 1) +
+            " timeline=" + Hex64(m_currentHostTimelineId));
+        m_currentHostTimelineId = 0;
+        return false;
+    }
+    std::string error;
+    const bool ok = m_hostPlayerStateStore->CaptureCheckpoint(
+        m_currentHostSaveStateKey, fingerprint, error);
+    m_currentHostTimelineId = m_hostPlayerStateStore->Timeline();
+    LogCoop(std::string("host inventory checkpoint ") + (ok ? "captured" : "FAILED") +
+        " saveKey=" + m_currentHostSaveStateKey + " fingerprint=" + fingerprint +
+        (error.empty() ? std::string() : " detail=" + error));
+    return ok;
+}
+
 std::string ModMain::BuildHostSaveStateKey(const std::string& savePathOrName) const
 {
     std::string normalized = savePathOrName.empty() || savePathOrName == "-" ? std::string("unknown_save") : savePathOrName;
@@ -74799,120 +75324,12 @@ bool ModMain::WriteDefaultHostPlayerStateFile(const std::string& path, const std
 
 uint32_t ModMain::SnapshotLatestHostPlayerStatesForSave(const std::string& saveKey, const char* reason)
 {
-    if (m_networkMode != CoopNetworkMode::Host)
-        return 0;
-
-    const uint64_t hostAccountToken = GetLocalAccountToken();
-    const std::filesystem::path latestBaseRoot = GetCoopServerPlayerStateRoot();
-    const std::filesystem::path saveBaseRoot = GetCoopServerSaveStateRoot();
-    if (latestBaseRoot.empty() || saveBaseRoot.empty() || hostAccountToken == 0)
-    {
-        m_lastPlayerStateTransferEvent = "host player snapshot skipped: no state roots";
-        return 0;
-    }
-    const std::filesystem::path latestRoot =
-        latestBaseRoot / ("host_" + Hex64(hostAccountToken));
-    const std::filesystem::path saveRoot =
-        saveBaseRoot / ("host_" + Hex64(hostAccountToken));
-
-    std::error_code error;
-    if (!std::filesystem::is_directory(latestRoot, error))
-    {
-        m_lastPlayerStateTransferEvent = "host player snapshot skipped: no latest states";
-        return 0;
-    }
-
-    const std::string effectiveSaveKey = !saveKey.empty()
-        ? SanitizePathComponent(saveKey)
-        : m_currentHostSaveStateKey;
-    if (effectiveSaveKey.empty() ||
-        effectiveSaveKey == "unknown_save" ||
-        effectiveSaveKey != m_currentHostSaveStateKey)
-    {
-        m_lastPlayerStateTransferEvent =
-            "host player snapshot rejected: host save scope unavailable";
-        return 0;
-    }
-    const std::filesystem::path destRoot = saveRoot / SanitizePathComponent(effectiveSaveKey);
-    std::filesystem::create_directories(destRoot, error);
-    if (error)
-    {
-        ++m_hostPlayerStateSnapshotFailures;
-        m_lastPlayerStateTransferEvent = "host player snapshot failed: mkdir";
-        return 0;
-    }
-
-    std::unordered_set<std::string> participatingStateFiles;
-    auto includeAccount = [&participatingStateFiles](uint64_t accountToken)
-    {
-        if (accountToken != 0)
-            participatingStateFiles.insert("player_account_" + Hex64(accountToken) + ".state");
-    };
-    // A remote peer's latest file belongs to whichever save last uploaded it,
-    // not necessarily the save currently being snapshotted. Remote uploads
-    // write their exact save-scoped destination themselves, so only seed the
-    // local Host account here. Copying connected peers from the global latest
-    // directory can overwrite a newly-created clean join slot with inventory
-    // from an unrelated campaign.
-    includeAccount(GetLocalAccountToken());
-
-    uint32_t copied = 0;
-    uint32_t failed = 0;
-    uint32_t scanned = 0;
-    uint32_t skippedHistorical = 0;
-    error.clear();
-    for (std::filesystem::directory_iterator it(latestRoot, error), end; it != end; it.increment(error))
-    {
-        if (error)
-        {
-            ++failed;
-            error.clear();
-            continue;
-        }
-
-        const std::filesystem::path sourcePath = it->path();
-        std::error_code fileError;
-        if (!std::filesystem::is_regular_file(sourcePath, fileError) || fileError)
-            continue;
-
-        const std::string fileName = CoopFilesystem::ToUtf8(sourcePath.filename());
-        if (fileName.rfind("player_", 0) != 0 || sourcePath.extension() != ".state")
-            continue;
-
-        ++scanned;
-        if (participatingStateFiles.find(fileName) == participatingStateFiles.end())
-        {
-            ++skippedHistorical;
-            continue;
-        }
-
-        const std::filesystem::path destPath = destRoot / sourcePath.filename();
-        fileError.clear();
-        std::filesystem::copy_file(
-            sourcePath,
-            destPath,
-            std::filesystem::copy_options::overwrite_existing,
-            fileError);
-        if (fileError)
-        {
-            ++failed;
-            continue;
-        }
-
-        ++copied;
-    }
-
-    m_hostPlayerStateSnapshotCopies += copied;
-    m_hostPlayerStateSnapshotFailures += failed;
+    (void)saveKey;
     m_lastPlayerStateTransferEvent =
-        "snapshotted latest player states for save copied=" + std::to_string(copied) +
-        " scanned=" + std::to_string(scanned) +
-        " skippedHistorical=" + std::to_string(skippedHistorical) +
-        " failed=" + std::to_string(failed) +
-        " saveKey=" + effectiveSaveKey +
-        (reason && reason[0] ? ": " + std::string(reason) : "");
+        "checkpoint snapshots are native-save driven" +
+        (reason && reason[0] ? ": " + std::string(reason) : std::string());
     LogCoop(m_lastPlayerStateTransferEvent);
-    return copied;
+    return 0;
 }
 
 uint32_t ModMain::CarryForwardHostPlayerStatesForSave(
@@ -74920,146 +75337,32 @@ uint32_t ModMain::CarryForwardHostPlayerStatesForSave(
     const std::string& nextSaveKey,
     const char* reason)
 {
-    if (m_networkMode != CoopNetworkMode::Host ||
-        previousSaveKey.empty() ||
-        previousSaveKey == "unknown_save" ||
-        nextSaveKey.empty() ||
-        nextSaveKey == "unknown_save" ||
-        previousSaveKey == nextSaveKey ||
-        previousSaveKey != m_currentHostSaveStateKey)
-    {
+    if ((m_networkMode != CoopNetworkMode::Host && !HasContinuingHostInventoryWorld()) ||
+        previousSaveKey == nextSaveKey)
         return 0;
-    }
-
-    const uint64_t hostAccountToken = GetLocalAccountToken();
-    const std::filesystem::path baseRoot = GetCoopServerSaveStateRoot();
-    if (baseRoot.empty() || hostAccountToken == 0)
-        return 0;
-
-    const std::filesystem::path hostRoot =
-        baseRoot / ("host_" + Hex64(hostAccountToken));
-    const std::filesystem::path sourceRoot =
-        hostRoot / SanitizePathComponent(previousSaveKey);
-    const std::filesystem::path destRoot =
-        hostRoot / SanitizePathComponent(nextSaveKey);
-
-    std::error_code error;
-    const std::filesystem::file_status hostRootStatus =
-        std::filesystem::symlink_status(hostRoot, error);
-    if (error || hostRootStatus.type() != std::filesystem::file_type::directory)
-        return 0;
-
-    error.clear();
-    const std::filesystem::file_status sourceRootStatus =
-        std::filesystem::symlink_status(sourceRoot, error);
-    if (error || sourceRootStatus.type() != std::filesystem::file_type::directory)
-        return 0;
-
-    error.clear();
-    std::filesystem::file_status destRootStatus =
-        std::filesystem::symlink_status(destRoot, error);
-    const bool destRootMissing =
-        error == std::errc::no_such_file_or_directory ||
-        (!error && destRootStatus.type() == std::filesystem::file_type::not_found);
-    if (destRootMissing)
-    {
-        error.clear();
-        std::filesystem::create_directory(destRoot, error);
-        if (!error)
-            destRootStatus = std::filesystem::symlink_status(destRoot, error);
-    }
-    if (error || destRootStatus.type() != std::filesystem::file_type::directory)
-    {
+    std::string error;
+    const bool ok = m_hostPlayerStateStore &&
+        previousSaveKey == m_currentHostSaveStateKey &&
+        m_hostPlayerStateStore->AdvanceLiveSave(previousSaveKey, nextSaveKey, error);
+    m_currentHostTimelineId = ok ? m_hostPlayerStateStore->Timeline() : 0;
+    if (ok)
+        ++m_hostPlayerStateSnapshotCopies;
+    else
         ++m_hostPlayerStateSnapshotFailures;
-        m_lastPlayerStateTransferEvent = "host player carry-forward failed: destination scope";
-        return 0;
-    }
-
-    uint32_t copied = 0;
-    uint32_t failed = 0;
-    uint32_t invalid = 0;
-    error.clear();
-    for (std::filesystem::directory_iterator it(sourceRoot, error), end;
-         it != end;
-         it.increment(error))
-    {
-        if (error)
-        {
-            ++failed;
-            error.clear();
-            continue;
-        }
-
-        const std::filesystem::path sourcePath = it->path();
-        std::error_code fileError;
-        const std::filesystem::file_status sourceStatus =
-            std::filesystem::symlink_status(sourcePath, fileError);
-        if (fileError || sourceStatus.type() != std::filesystem::file_type::regular)
-            continue;
-
-        const std::string fileName = CoopFilesystem::ToUtf8(sourcePath.filename());
-        if (fileName.rfind("player_account_", 0) != 0 ||
-            sourcePath.extension() != ".state")
-        {
-            continue;
-        }
-
-        uint32_t ignoredSize = 0;
-        bool hasIntegrityHash = false;
-        std::string integrityReason;
-        if (!ValidatePlayerStateIntegrityFile(
-                sourcePath,
-                &ignoredSize,
-                &hasIntegrityHash,
-                &integrityReason) ||
-            !hasIntegrityHash)
-        {
-            ++invalid;
-            continue;
-        }
-
-        const std::filesystem::path destPath = destRoot / sourcePath.filename();
-        fileError.clear();
-        const std::filesystem::file_status destStatus =
-            std::filesystem::symlink_status(destPath, fileError);
-        const bool destMissing =
-            fileError == std::errc::no_such_file_or_directory ||
-            (!fileError && destStatus.type() == std::filesystem::file_type::not_found);
-        if ((!destMissing && fileError) ||
-            (!destMissing && destStatus.type() != std::filesystem::file_type::regular))
-        {
-            ++failed;
-            continue;
-        }
-
-        fileError.clear();
-        std::filesystem::copy_file(
-            sourcePath,
-            destPath,
-            std::filesystem::copy_options::overwrite_existing,
-            fileError);
-        if (fileError)
-            ++failed;
-        else
-            ++copied;
-    }
-
-    m_hostPlayerStateSnapshotCopies += copied;
-    m_hostPlayerStateSnapshotFailures += failed + invalid;
     m_lastPlayerStateTransferEvent =
-        "carried forward host player states copied=" + std::to_string(copied) +
-        " invalid=" + std::to_string(invalid) +
-        " failed=" + std::to_string(failed) +
+        std::string("host player live scope ") + (ok ? "advanced" : "FAILED") +
         " from=" + previousSaveKey +
         " to=" + nextSaveKey +
-        (reason && reason[0] ? ": " + std::string(reason) : "");
+        (reason && reason[0] ? ": " + std::string(reason) : std::string()) +
+        (error.empty() ? std::string() : " detail=" + error);
     LogCoop(m_lastPlayerStateTransferEvent);
-    return copied;
+    return ok ? 1u : 0u;
 }
 
 bool ModMain::BeginHostPlayerStateTransfer(const char* reason, const std::string& requestedSaveKey)
 {
-    if (m_networkMode != CoopNetworkMode::Host || m_socket == kInvalidNetworkSocket || !m_hasRemoteEndpoint)
+    if (m_networkMode != CoopNetworkMode::Host || m_socket == kInvalidNetworkSocket ||
+        !m_hasRemoteEndpoint || m_currentHostTimelineId == 0)
         return false;
 
     const std::string username = GetRemoteUsernameOrFallback();
@@ -75113,7 +75416,10 @@ bool ModMain::BeginHostPlayerStateTransfer(const char* reason, const std::string
             return;
         std::filesystem::copy_file(legacyFsPath, accountFsPath, std::filesystem::copy_options::overwrite_existing, error);
     };
-    migrateLegacyState(previousFormatAccountPath, saveScopedPath);
+    // A managed timeline may have deliberately restored an empty checkpoint.
+    // Legacy live aliases are not historical checkpoint evidence.
+    if (m_currentHostTimelineId == 0)
+        migrateLegacyState(previousFormatAccountPath, saveScopedPath);
     // Username-keyed state predates persistent PlayerAccountId and cannot be
     // attributed safely during a join. In particular, "Player2" files from a
     // Host snapshot can contain the Host's full inventory. Never promote those
@@ -75216,6 +75522,12 @@ bool ModMain::BeginHostPlayerStateTransfer(const char* reason, const std::string
             return false;
         flags |= CoopProtocol::kPlayerStateTransferFlagEmptyDefault;
         sourceKind = "new_player_default";
+    }
+
+    if (!PrepareSharedDropDeliveriesForHostTransfer(sourcePath))
+    {
+        m_lastPlayerStateTransferEvent = "host player state escrow metadata invalid";
+        return false;
     }
 
     const uint32_t nextTransferId = m_playerStateTransferId == std::numeric_limits<uint32_t>::max() ? 1u : m_playerStateTransferId + 1u;
@@ -75482,6 +75794,10 @@ bool ModMain::BeginClientPlayerStateUpload(const char* reason, const std::string
 {
     if (m_networkMode != CoopNetworkMode::Client || m_socket == kInvalidNetworkSocket || !IsGameReady())
         return false;
+    // An ordinary snapshot must not replace the recovery revision watermark
+    // while that journal is still waiting for durable Host confirmation.
+    if (m_clientRecoveryJournalPending)
+        return false;
 
     const std::string effectiveSaveKey = saveKey.empty()
         ? m_currentHostSaveStateKey
@@ -75498,7 +75814,8 @@ bool ModMain::BeginClientPlayerStateUpload(const char* reason, const std::string
     const char* uploadReason = reason && reason[0] ? reason : "client player state upload";
     const bool uploadFromNativeClientSave =
         std::string_view(uploadReason).find("native client save hook") != std::string_view::npos;
-    const bool allowNativeSnapshotUpload = NativePlayerStateUploadSnapshotEnabled();
+    const bool allowNativeSnapshotUpload =
+        std::string_view(uploadReason) != "inventory mutation" && NativePlayerStateUploadSnapshotEnabled();
     bool cleanupClientSnapshotSlot = false;
 
     if (m_clientPlayerSnapshotForUploadPending)
@@ -76219,6 +76536,8 @@ void ModMain::CancelClientPlayerStateForTimelineChange(const char* reason)
     // into the checkpoint, even when the Host reloads the same save slot.
     m_clientDisconnectFlushPending = false;
     ResetPlayerStateTransferState("host timeline replacement", false);
+    m_clientAwaitingHostPlayerState = true;
+    m_clientHostTimelineRestorePending = true;
     m_localInventoryDirty = false;
     m_localInventoryDirtySaveKey.clear();
     m_localInventoryDirtyHostAccountToken = 0;
@@ -76350,7 +76669,7 @@ bool ModMain::QueueAuthoritativePlayerInventoryRestore(const PlayerSidecarState&
 {
     const char* restoreReason = reason && reason[0] ? reason : "host authoritative player inventory";
 
-    if (!ShouldUseNativePlayerStatePreloadMerge())
+    if (!ShouldUseNativePlayerStatePreloadMerge() || state.hasSharedDropDeliveries)
     {
         if (!state.hasInventory)
         {
@@ -76370,6 +76689,8 @@ bool ModMain::QueueAuthoritativePlayerInventoryRestore(const PlayerSidecarState&
             state.inventory,
             true,
             restoreReason);
+        m_localSharedDropDeliveries = state.sharedDropDeliveries;
+        m_sharedDropHostSessionId = state.sharedDropHostSessionId;
         m_lastPlayerSidecarEvent =
             "queued authoritative sidecar inventory restore items=" +
             std::to_string(state.inventory.size()) +
@@ -76413,6 +76734,10 @@ bool ModMain::QueueAuthoritativePlayerInventoryRestore(const PlayerSidecarState&
 
 bool ModMain::ShouldUseNativePlayerStatePreloadMerge() const
 {
+    // Native fragments can predate the inventory/receipt pair in the selected
+    // snapshot. Never combine their old inventory with current receipts.
+    if (m_pendingNativePlayerStateOverrideValid && m_pendingNativePlayerStateOverride.hasSharedDropDeliveries)
+        return false;
     if (EnvFlagEnabled("COOP_DISABLE_NATIVE_PLAYERSTATE_PRELOAD_MERGE"))
         return false;
 
@@ -76483,6 +76808,52 @@ bool ModMain::EnforceClientPlayerStateApplyInvariant(const char* reason)
     return false;
 }
 
+bool ModMain::ReconcileRecoveryPlayerStateSnapshot(PlayerSidecarState& state, const PlayerSidecarState& hostState)
+{
+    if (!hostState.hasSharedDropDeliveries)
+        return true;
+    if (!state.hasInventory || !hostState.hasInventory || hostState.sharedDropHostSessionId == 0 ||
+        state.sharedDropDeliveries.size() > CoopSharedDropDelivery::kMaxEntries ||
+        hostState.sharedDropDeliveries.size() > CoopSharedDropDelivery::kMaxEntries)
+        return false;
+
+    bool hostReceiptIsNewer = false;
+    for (const auto& assigned : hostState.sharedDropDeliveries)
+    {
+        if (!CoopSharedDropDelivery::IsValid(assigned) || assigned.hostSessionId != hostState.sharedDropHostSessionId)
+            return false;
+        const auto local = std::find_if(state.sharedDropDeliveries.begin(), state.sharedDropDeliveries.end(),
+            [&assigned](const auto& row) { return CoopSharedDropDelivery::SameLifetime(row, assigned); });
+        if (local != state.sharedDropDeliveries.end() && !CoopSharedDropDelivery::SameCommit(*local, assigned))
+            return false;
+        if (assigned.deliveredCount != 0 &&
+            (local == state.sharedDropDeliveries.end() || local->deliveredCount < assigned.deliveredCount))
+            hostReceiptIsNewer = true;
+    }
+
+    // Never attach a newer acquired receipt to an older inventory. Pending Host
+    // ownership, however, may safely accompany the Client's precommit baseline.
+    PlayerSidecarState selected = hostReceiptIsNewer ? hostState : state;
+    selected.sharedDropDeliveries.erase(std::remove_if(selected.sharedDropDeliveries.begin(), selected.sharedDropDeliveries.end(),
+        [&hostState](const auto& row) { return row.hostSessionId != hostState.sharedDropHostSessionId; }),
+        selected.sharedDropDeliveries.end());
+    for (const auto& assigned : hostState.sharedDropDeliveries)
+    {
+        if (std::none_of(selected.sharedDropDeliveries.begin(), selected.sharedDropDeliveries.end(),
+                [&assigned](const auto& row) { return CoopSharedDropDelivery::SameLifetime(row, assigned); }))
+        {
+            if (selected.sharedDropDeliveries.size() == CoopSharedDropDelivery::kMaxEntries)
+                return false;
+            selected.sharedDropDeliveries.push_back(assigned);
+        }
+    }
+    selected.hasSharedDropDeliveries = true;
+    selected.sharedDropHostSessionId = hostState.sharedDropHostSessionId;
+    selected.hasNativeCapture = false;
+    state = std::move(selected);
+    return true;
+}
+
 bool ModMain::PrepareReceivedPlayerStateForHostLoad(const char* reason)
 {
     if (!EnforceClientPlayerStateApplyInvariant(reason) || m_playerStateTransferReceivePath.empty())
@@ -76516,6 +76887,15 @@ bool ModMain::PrepareReceivedPlayerStateForHostLoad(const char* reason)
             ? "failed to prepare recovery journal before host load"
             : "failed to prepare host player state before load";
         return false;
+    }
+
+    if (useRecoveryJournal)
+    {
+        PlayerSidecarState hostState;
+        if (!LoadPlayerSidecarFromPath(m_playerStateTransferReceivePath, hostState))
+            return false;
+        if (!ReconcileRecoveryPlayerStateSnapshot(state, hostState))
+            return false;
     }
 
     m_pendingReceivedPlayerStateApply = true;
@@ -76772,7 +77152,7 @@ bool ModMain::TryMergeReceivedPlayerStateDuringNativeLoad(const char* reason)
 
 bool ModMain::StartPlayerStateTransferFromFile(const std::string& sourcePath, const std::string& username, uint32_t flags, uint32_t transferId, const std::string& saveKey)
 {
-    if (m_playerStateTransferSending || m_playerStateTransferReceiving)
+    if (m_playerStateTransferSending || m_playerStateTransferReceiving || m_currentHostTimelineId == 0)
         return false;
 
     uint32_t fileSize = 0;
@@ -76788,12 +77168,14 @@ bool ModMain::StartPlayerStateTransferFromFile(const std::string& sourcePath, co
         return false;
     }
 
-    uint32_t checksum = 0;
-    if (!ComputeFileChecksum(sourcePath, checksum))
+    std::ifstream source(CoopFilesystem::FromUtf8(sourcePath), std::ios::binary);
+    std::vector<uint8_t> bytes(fileSize);
+    if (!source.read(reinterpret_cast<char*>(bytes.data()), fileSize) || source.peek() != std::char_traits<char>::eof())
     {
-        m_lastPlayerStateTransferEvent = "player state checksum failed";
+        m_lastPlayerStateTransferEvent = "player state immutable capture failed";
         return false;
     }
+    const uint32_t checksum = UpdateFnv1a(kFnv1aOffsetBasis, bytes.data(), bytes.size());
 
     uint32_t address = 0;
     uint16_t port = 0;
@@ -76824,6 +77206,8 @@ bool ModMain::StartPlayerStateTransferFromFile(const std::string& sourcePath, co
 
     m_playerStateTransferId = transferId;
     m_playerStateTransferSourcePath = sourcePath;
+    m_playerStateTransferBytes = std::move(bytes);
+    m_playerStateTransferTimelineId = m_currentHostTimelineId;
     m_playerStateTransferReceivePath.clear();
     m_playerStateTransferUsername = SanitizeUsername(username.empty() ? std::string("Player") : username);
     m_playerStateTransferAccountToken =
@@ -76848,6 +77232,19 @@ bool ModMain::StartPlayerStateTransferFromFile(const std::string& sourcePath, co
     m_playerStateTransferReceiving = false;
     m_playerStateTransferStarted = true;
     m_playerStateTransferComplete = false;
+    if (m_networkMode == CoopNetworkMode::Client)
+    {
+        m_playerStateUploadAckTransferId = transferId;
+        m_playerStateUploadAckChecksum = checksum;
+        RecoveryStateMetadata captured;
+        m_playerStateUploadAckSnapshotRevision = ReadRecoveryStateMetadata(
+            CoopFilesystem::FromUtf8(sourcePath), captured) ? captured.revision : 0;
+        RecoveryStateMetadata canonical;
+        m_playerStateUploadAckRevision = ReadRecoveryStateMetadata(
+            CoopFilesystem::FromUtf8(GetPlayerSidecarPath()), canonical) &&
+            canonical.revision == m_playerStateUploadAckSnapshotRevision
+                ? m_localInventoryCapturedRevision : std::numeric_limits<uint64_t>::max();
+    }
 
     CoopProtocol::PlayerStateTransferPacket startPacket = {};
     if (!BuildPlayerStateTransferPacket(startPacket, CoopProtocol::PlayerStateTransferCommand::Start, m_playerStateTransferId))
@@ -76890,22 +77287,12 @@ bool ModMain::QueueNextPlayerStateTransferPacket()
         return true;
     }
 
-    std::ifstream stream(CoopFilesystem::FromUtf8(m_playerStateTransferSourcePath), std::ios::binary);
-    if (!stream)
-    {
-        m_playerStateTransferSending = false;
-        m_lastPlayerStateTransferEvent = "player state chunk open failed";
-        return false;
-    }
-
     const uint32_t chunkIndex = m_playerStateTransferNextChunk;
-    const std::streamoff offset = static_cast<std::streamoff>(chunkIndex) *
-        static_cast<std::streamoff>(CoopProtocol::kPlayerStateTransferDataSize);
-    stream.seekg(offset, std::ios::beg);
-    if (!stream)
+    const size_t offset = static_cast<size_t>(chunkIndex) * CoopProtocol::kPlayerStateTransferDataSize;
+    if (offset >= m_playerStateTransferBytes.size())
     {
         m_playerStateTransferSending = false;
-        m_lastPlayerStateTransferEvent = "player state chunk seek failed";
+        m_lastPlayerStateTransferEvent = "player state immutable chunk out of bounds";
         return false;
     }
 
@@ -76914,15 +77301,8 @@ bool ModMain::QueueNextPlayerStateTransferPacket()
         return false;
 
     chunkPacket.chunkIndex = chunkIndex;
-    stream.read(reinterpret_cast<char*>(chunkPacket.data), static_cast<std::streamsize>(CoopProtocol::kPlayerStateTransferDataSize));
-    const std::streamsize count = stream.gcount();
-    if (count <= 0)
-    {
-        m_playerStateTransferSending = false;
-        m_lastPlayerStateTransferEvent = "player state chunk read failed";
-        return false;
-    }
-
+    const size_t count = std::min(CoopProtocol::kPlayerStateTransferDataSize, m_playerStateTransferBytes.size() - offset);
+    std::memcpy(chunkPacket.data, m_playerStateTransferBytes.data() + offset, count);
     chunkPacket.chunkBytes = static_cast<uint16_t>(count);
     if (!SendPlayerStateTransferTo(chunkPacket, m_playerStateTransferAddress, m_playerStateTransferPort, "player state chunk send failed"))
         return false;
@@ -77004,6 +77384,7 @@ bool ModMain::TryApplyReceivedPlayerStateTransfer(const char* reason)
         m_playerStateUploadAccumulator = 0.0f;
         m_pendingPostJoinModalCleanup = true;
         m_lastPlayerStateTransferEvent = "host player state already merged during native load";
+        m_clientHostTimelineRestorePending = false;
         ClearJoinOverlayState("host player state native merged");
         LogCoop(m_lastPlayerStateTransferEvent);
         if (!m_saveLoadGuardActive && !m_pendingPostLoadResync && !m_arkLevelTransitionLoadActive)
@@ -77087,6 +77468,7 @@ bool ModMain::TryApplyReceivedPlayerStateTransfer(const char* reason)
     m_playerStateUploadAccumulator = 0.0f;
     m_pendingPostJoinModalCleanup = true;
     m_lastPlayerStateTransferEvent = "applied host player state";
+    m_clientHostTimelineRestorePending = false;
     ClearJoinOverlayState("host player state applied");
     LogCoop(m_lastPlayerStateTransferEvent);
     if (!m_saveLoadGuardActive && !m_pendingPostLoadResync && !m_arkLevelTransitionLoadActive)
@@ -77156,19 +77538,21 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
                 const uint64_t capturedRevision = m_localInventoryDirtyRevision;
                 const char* captureReason = "recovery journal: mutation after StoredAck";
                 if (SaveLocalPlayerSidecar(captureReason) &&
-                    WriteLocalPlayerRecoveryJournal(captureReason) &&
                     capturedRevision == m_localInventoryDirtyRevision)
                 {
-                    m_localInventoryDirty = false;
-                    m_localInventoryDirtySaveKey.clear();
-                    m_localInventoryDirtyHostAccountToken = 0;
+                    if (WriteLocalPlayerRecoveryJournal(captureReason))
+                    {
+                        m_localInventoryDirty = false;
+                        m_localInventoryDirtySaveKey.clear();
+                        m_localInventoryDirtyHostAccountToken = 0;
+                    }
                     capturedNewerMutation = true;
                 }
             }
             // If capture failed, leave the source empty and let the retry path
             // capture the live mutation. Reusing the just-acked journal would
             // upload stale state over the newer local mutation.
-            if (!m_localInventoryDirty && (capturedNewerMutation || newerJournal))
+            if (capturedNewerMutation || newerJournal)
                 RecoverLocalPlayerRecoveryJournal("newer local recovery journal");
         }
         else
@@ -77200,8 +77584,8 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
         const uint64_t capturedRevision = m_localInventoryDirtyRevision;
         const char* captureReason = "recovery journal: retry newer mutation capture";
         if (SaveLocalPlayerSidecar(captureReason) &&
-            WriteLocalPlayerRecoveryJournal(captureReason) &&
-            capturedRevision == m_localInventoryDirtyRevision)
+            capturedRevision == m_localInventoryDirtyRevision &&
+            WriteLocalPlayerRecoveryJournal(captureReason))
         {
             m_localInventoryDirty = false;
             m_localInventoryDirtySaveKey.clear();
@@ -77210,6 +77594,12 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
         RecoverLocalPlayerRecoveryJournal(captureReason);
     }
 
+    if (m_clientRecoveryJournalPending && !m_clientRecoveryJournalAwaitingStoredAck &&
+        IsLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey) &&
+        m_localInventoryCapturedRevision == m_localInventoryDirtyRevision &&
+        !m_playerStateTransferSending && !m_playerStateTransferReceiving)
+        RecoverLocalPlayerRecoveryJournal("captured canonical recovery fallback");
+
     if (m_networkMode == CoopNetworkMode::Client &&
         m_clientRecoveryJournalPending &&
         !m_clientRecoveryJournalAwaitingStoredAck &&
@@ -77217,7 +77607,8 @@ void ModMain::TickPlayerStateTransfer(float frameTime)
         !m_currentHostSaveStateKey.empty() &&
         m_currentHostSaveStateKey == m_clientRecoveryJournalSaveKey &&
         m_clientRecoveryJournalHostAccountToken == GetSessionHostAccountToken() &&
-        !IsLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey) &&
+        (!IsLocalInventoryDirtyForSaveKey(m_currentHostSaveStateKey) ||
+            m_localInventoryCapturedRevision == m_localInventoryDirtyRevision) &&
         !m_saveLoadGuardActive &&
         !m_playerStateTransferSending &&
         !m_playerStateTransferReceiving &&
@@ -78875,8 +79266,58 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         return;
     }
 
+    const bool incomingHostState = m_networkMode == CoopNetworkMode::Client &&
+        (command == CoopProtocol::PlayerStateTransferCommand::HostSaveIdentity ||
+            (m_currentHostTimelineId == 0 && command == CoopProtocol::PlayerStateTransferCommand::Start &&
+                hostAuthoritative && packet.totalBytes != 0 && packet.chunkCount != 0 &&
+                !saveKey.empty() && saveKey != "unknown_save" &&
+                (m_currentHostSaveStateKey.empty() || m_currentHostSaveStateKey == "unknown_save" ||
+                    m_currentHostSaveStateKey == saveKey)));
+    if (incomingHostState && packet.timelineId != 0)
+    {
+        if (m_currentHostTimelineId != 0 && m_currentHostTimelineId != packet.timelineId)
+            CancelClientPlayerStateForTimelineChange("host inventory timeline changed");
+        m_currentHostTimelineId = packet.timelineId;
+    }
+    if (packet.timelineId == 0 || packet.timelineId != m_currentHostTimelineId)
+    {
+        m_lastPlayerStateTransferEvent = "ignored player state from stale inventory timeline";
+        return;
+    }
+
     if (command == CoopProtocol::PlayerStateTransferCommand::StoredAck)
     {
+        if (packet.worldEpoch != m_localWorldEpoch)
+            return;
+        if (m_networkMode == CoopNetworkMode::Client &&
+            packet.transferId == m_playerStateUploadAckTransferId &&
+            packet.checksum == m_playerStateUploadAckChecksum &&
+            saveKey == m_currentHostSaveStateKey &&
+            m_playerStateUploadAckRevision == m_localInventoryDirtyRevision)
+        {
+            m_localInventoryDirty = false;
+            m_localInventoryDirtySaveKey.clear();
+            m_localInventoryDirtyHostAccountToken = 0;
+        }
+        if (m_networkMode == CoopNetworkMode::Client &&
+            !m_clientRecoveryJournalPending && !m_clientDisconnectFlushPending &&
+            packet.transferId == m_playerStateUploadAckTransferId &&
+            packet.checksum == m_playerStateUploadAckChecksum &&
+            packet.worldEpoch == m_localWorldEpoch &&
+            saveKey == m_currentHostSaveStateKey &&
+            m_playerStateUploadAckRevision == m_localInventoryDirtyRevision)
+        {
+            m_localInventoryDirty = false;
+            m_localInventoryDirtySaveKey.clear();
+            m_localInventoryDirtyHostAccountToken = 0;
+            // Only retire the backup whose exact bytes reached the Host.
+            if (m_playerStateUploadAckSnapshotRevision != 0)
+                ClearLocalPlayerRecoveryJournal(GetPlayerSidecarRecoveryJournalPath(),
+                    GetLocalAccountToken(), saveKey, m_playerStateUploadAckSnapshotRevision,
+                    "normal player state stored by Host");
+            m_lastPlayerStateTransferEvent = "Host committed normal player state";
+            return;
+        }
         if (m_networkMode == CoopNetworkMode::Client &&
             m_clientRecoveryJournalPending &&
             m_clientRecoveryJournalAwaitingStoredAck &&
@@ -78984,9 +79425,8 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
 
         if (command == CoopProtocol::PlayerStateTransferCommand::Start)
         {
-            if (m_saveLoadGuardActive ||
-                packet.worldEpoch == 0 ||
-                packet.worldEpoch != m_localWorldEpoch)
+            if (!CoopPlayerStateStore::MatchesTimeline(m_currentHostTimelineId, packet.timelineId,
+                    m_localWorldEpoch, packet.worldEpoch, m_saveLoadGuardActive))
             {
                 failUpload(
                     "rejected client player state from stale host timeline packetEpoch=" +
@@ -79008,6 +79448,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
             HostPlayerStateUploadReceive receive;
             receive.transferId = packet.transferId;
             receive.worldEpoch = packet.worldEpoch;
+            receive.timelineId = packet.timelineId;
             receive.totalBytes = packet.totalBytes;
             receive.chunkCount = packet.chunkCount;
             receive.checksum = packet.checksum;
@@ -79048,7 +79489,10 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         const auto receiveIt = m_hostPlayerStateUploadReceives.find(packet.accountToken);
         if (receiveIt == m_hostPlayerStateUploadReceives.end() ||
             receiveIt->second.transferId != packet.transferId ||
-            receiveIt->second.worldEpoch != packet.worldEpoch)
+            receiveIt->second.worldEpoch != packet.worldEpoch ||
+            receiveIt->second.timelineId != packet.timelineId ||
+            !CoopPlayerStateStore::MatchesTimeline(m_currentHostTimelineId, packet.timelineId,
+                m_localWorldEpoch, packet.worldEpoch, m_saveLoadGuardActive))
         {
             failUpload(
                 "client player state upload has no matching start account=" +
@@ -79176,6 +79620,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         if (incomingIsRecovery &&
             (incomingRecovery.accountToken != accountToken ||
                 incomingRecovery.hostAccountToken != GetLocalAccountToken() ||
+                incomingRecovery.timelineId != m_currentHostTimelineId ||
                 incomingRecovery.saveKey != storedSaveKey ||
                 storedSaveKey.empty()))
         {
@@ -79189,10 +79634,12 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         if (incomingIsRecovery && !scopedDest.empty())
         {
             RecoveryStateMetadata existingRecovery;
+            // Forward saves carry the accepted bytes into this current scoped
+            // path. Their older slot label must not reset the timeline watermark.
             if (ReadRecoveryStateMetadata(scopedDest, existingRecovery) &&
                 existingRecovery.accountToken == accountToken &&
                 existingRecovery.hostAccountToken == GetLocalAccountToken() &&
-                existingRecovery.saveKey == storedSaveKey &&
+                existingRecovery.timelineId == m_currentHostTimelineId &&
                 existingRecovery.revision >= incomingRecovery.revision)
             {
                 recoveryAlreadyStored = true;
@@ -79201,6 +79648,13 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
                     Hex64(accountToken) +
                     " revision=" + std::to_string(incomingRecovery.revision));
             }
+        }
+
+        if (!recoveryAlreadyStored &&
+            !MergeSharedDropDeliveriesForUpload(receive.receivePath, CoopFilesystem::ToUtf8(scopedDest)))
+        {
+            failUpload("rejected shared drop ownership/receipt regression");
+            return;
         }
 
         const auto commitStateFile = [&](const std::filesystem::path& destination, const char* label)
@@ -79393,6 +79847,7 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
         }
 
         m_playerStateTransferId = packet.transferId;
+        m_playerStateTransferTimelineId = packet.timelineId;
         m_playerStateTransferTotalBytes = packet.totalBytes;
         m_playerStateTransferChunkCount = packet.chunkCount;
         m_playerStateTransferNextChunk = 0;
@@ -79558,6 +80013,26 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
 
         if (m_networkMode == CoopNetworkMode::Client && hostAuthoritative)
         {
+            RecoveryStateMetadata hostSnapshot;
+            const bool hasHostSnapshotMetadata = ReadRecoveryStateMetadata(
+                CoopFilesystem::FromUtf8(m_playerStateTransferReceivePath), hostSnapshot) &&
+                hostSnapshot.accountToken == GetLocalAccountToken() &&
+                hostSnapshot.hostAccountToken == GetSessionHostAccountToken();
+            if (hasHostSnapshotMetadata)
+                m_localInventoryJournalRevision = std::max(m_localInventoryJournalRevision, hostSnapshot.revision);
+            if (m_clientRecoveryJournalPending &&
+                hasHostSnapshotMetadata &&
+                hostSnapshot.timelineId == m_currentHostTimelineId &&
+                hostSnapshot.revision >= m_clientRecoveryJournalRevision)
+            {
+                ClearLocalPlayerRecoveryJournal(m_clientRecoveryJournalSourcePath,
+                    GetLocalAccountToken(), m_clientRecoveryJournalSaveKey,
+                    m_clientRecoveryJournalRevision, "Host already has this snapshot or newer");
+                m_clientRecoveryJournalPending = false;
+                m_clientRecoveryJournalAwaitingStoredAck = false;
+                m_clientRecoveryJournalSourcePath.clear();
+                m_clientRecoveryJournalRevision = 0;
+            }
             if (m_clientRecoveryJournalPending &&
                 !m_clientRecoveryJournalSourcePath.empty() &&
                 m_clientRecoveryJournalSaveKey == m_currentHostSaveStateKey &&
@@ -79571,9 +80046,16 @@ void ModMain::HandlePlayerStateTransfer(const CoopProtocol::PlayerStateTransferP
                     LogCoop(m_lastPlayerStateTransferEvent);
                     return;
                 }
-                // Keep the newer local snapshot in memory while its durable
-                // journal is uploaded and deleted after StoredAck. The host's
-                // older transfer remains useful for join sequencing only.
+                PlayerSidecarState hostState;
+                if (!LoadPlayerSidecarFromPath(m_playerStateTransferReceivePath, hostState) ||
+                    !ReconcileRecoveryPlayerStateSnapshot(recoveryState, hostState))
+                {
+                    m_lastPlayerStateTransferEvent = "failed to reconcile recovery ownership with Host snapshot";
+                    LogCoop(m_lastPlayerStateTransferEvent);
+                    return;
+                }
+                // Keep the selected inventory/receipt pair through StoredAck,
+                // including ownership committed after the local baseline.
                 m_pendingNativePlayerStateOverride = std::move(recoveryState);
                 m_pendingNativePlayerStateOverrideValid = true;
             }
@@ -79827,6 +80309,7 @@ void ModMain::HandleWorldSync(const CoopProtocol::WorldSyncPacket& packet)
             // ClientWorldReady transition must not reset either direction.
             m_reliableBacklogDisconnectPending = false;
 
+            ReplaySharedDrops();
             if (alreadySentPlayerState)
             {
                 if (!remoteUsername.empty())
