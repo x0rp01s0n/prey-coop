@@ -429,17 +429,38 @@ void ModMain::OnNativeRecyclerIngredientSpawned(EntityId itemEntityId, const cha
 
 bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerId, const char* reason)
 {
+    const bool offlineHost = m_networkMode == CoopNetworkMode::Off && HasContinuingHostInventoryWorld();
     if (!item || m_sharedDropApplyDepth != 0 ||
-        (m_networkMode != CoopNetworkMode::Host && m_networkMode != CoopNetworkMode::Client) ||
+        (m_networkMode != CoopNetworkMode::Host && m_networkMode != CoopNetworkMode::Client && !offlineHost) ||
         !ArkPlayer::GetInstancePtr() || pickerId != ArkPlayer::GetInstance().GetEntityId())
     {
         return false;
     }
 
     RecoverSavedSharedDrops();
-    const auto found = m_sharedDropByEntityId.find(item->GetEntityId());
+    auto found = m_sharedDropByEntityId.find(item->GetEntityId());
+    if (found == m_sharedDropByEntityId.end() && offlineHost)
+    {
+        IEntity* entity = item->GetEntity();
+        const char* name = entity ? entity->GetName() : nullptr;
+        uint64_t stableId = 0;
+        if (name && std::strncmp(name, "CoopSharedDrop_", 15) == 0 &&
+            ParsePositiveInteger(std::string(name + 15), stableId))
+        {
+            auto assigned = m_sharedDrops.find(stableId);
+            if (assigned != m_sharedDrops.end() && assigned->second.pickupCommitted &&
+                assigned->second.pickupWinnerPeerHash == GetLocalAccountToken() &&
+                assigned->second.archetypeId == item->GetArchetype())
+            {
+                assigned->second.localEntityId = entity->GetId();
+                found = m_sharedDropByEntityId.emplace(entity->GetId(), stableId).first;
+            }
+        }
+    }
     if (found == m_sharedDropByEntityId.end())
     {
+        if (offlineHost)
+            return false;
         IEntity* entity = gEnv->pEntitySystem->GetEntity(item->GetEntityId());
         const char* name = entity ? entity->GetName() : nullptr;
         // A loaded public source must not fall through to per-player loot
@@ -451,6 +472,8 @@ bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerI
         return false;
 
     SharedDropRecord& record = recordIt->second;
+    if (offlineHost && (!record.pickupCommitted || record.pickupWinnerPeerHash != GetLocalAccountToken()))
+        return false;
     if (!IsSharedDropWorldReady())
         return true;
     if (record.pickupCommitted && record.pickupWinnerPeerHash == GetLocalAccountToken())
@@ -1523,6 +1546,19 @@ void ModMain::RecoverSavedSharedDrops()
                 known->second.localEntityId = INVALID_ENTITYID;
                 m_sharedDropByEntityId.erase(entity->GetId());
             }
+            continue;
+        }
+        const auto assigned = std::find_if(m_localSharedDropDeliveries.begin(), m_localSharedDropDeliveries.end(),
+            [this, stableId, item](const CoopSharedDropDelivery::Entry& delivery)
+            {
+                return delivery.hostSessionId == m_sharedDropHostSessionId &&
+                    delivery.stableSpawnId == stableId && delivery.archetypeId == item->GetArchetype();
+            });
+        if (assigned != m_localSharedDropDeliveries.end())
+        {
+            // Native overflow can save an uncollected private remainder. Its
+            // receipt reconstructs it; it must never become public loot again.
+            stale.push_back(entity->GetId());
             continue;
         }
         if (known != m_sharedDrops.end())

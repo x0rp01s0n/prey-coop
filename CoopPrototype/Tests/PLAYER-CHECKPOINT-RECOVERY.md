@@ -2,20 +2,21 @@
 
 Local follow-up to PR60. Current candidate protocol 258. Not pushed or merged.
 
-The [2026-11-14 native readiness audit](SHARED-DROP-AREA-READINESS.md) keeps this
-candidate on hold pending the final combined build: V32 now passes the native
-solo redrop and split-area pickup counterexamples, but later saved-source and
-continuing-rehost changes still need native verification on current main.
+The [2026-11-14 native readiness audit](SHARED-DROP-AREA-READINESS.md) records the
+V36 solo, split-area, continuing-rehost and crash/rollback passes on current main.
+The candidate is still on hold for native verification of assigned remainders
+across a cold Host restart and the later serialization-point staging changes.
 Earlier successful tests below are pinned to their stated candidate.
 
 ## Contract
 
-The Host's live account files accept normal inventory uploads. After a native
-Host save returns successfully and its final writer completes, MainUpdate freezes
-a separate generation of accepted files, bound to the native `Save.CSF` contents.
-Later uploads cannot modify that checkpoint. This is the Host-known inventory
-when completion is processed, not a distributed barrier that waits for every
-Client's unsent mutation. Deferred save acceptance alone never publishes it.
+The Host's live account files accept normal inventory uploads. At native save
+serialization, the accepted account set is frozen before the asynchronous writer
+runs. Only after SaveGame succeeds and its final writer completes does MainUpdate
+publish that frozen generation, bound to the native `Save.CSF` contents. Later
+uploads cannot change it, even while the native writer is still running. This is
+not a distributed barrier waiting for every Client's unsent mutation. Deferred
+save acceptance alone never publishes it.
 
 A Client restart against the surviving Host resumes the live inventory. A native
 Host load restores the frozen account set and rotates a durable timeline ID,
@@ -68,27 +69,29 @@ invalidates continuity until a successful native load.
 
 ## Automated Checks
 
-V28 reran 524 checks across the following suites. The separate SessionHello
-freshness-policy suite was previously tested. The delivery shell runner repeats the 15 snapshot
-selection checks; those are counted only once here.
+The current candidate passes 592 checks across the following suites. Layout,
+door evidence/range and SessionHello policy checks also pass. The delivery shell
+runner repeats the 15 snapshot selection checks; those are counted only once.
 
 | Checks | Coverage |
 | --- | --- |
-| 53 | Transaction contention, cancellation, disconnects, duplicate/reordered/lost packets, unbound public pickups and replay completion/classification |
-| 33 | Native-delivery dependency controls, overflow callbacks and optional journal failures |
+| 78 | Transaction contention, cancellation, disconnects, duplicate/reordered/lost packets, source lifetimes, split-area routing and replay completion |
+| 36 | Native-delivery dependency controls, overflow callbacks, offline assigned remainders and optional journal failures |
 | 52 | Receipt parsing, validation and upload merge |
 | 15 | Whole inventory/receipt snapshot selection |
 | 36 | Canonical/journal selection, forward-save rebinding, ACK retirement, revision floors and offline preservation |
-| 150 | Production checkpoint Store and metadata against filesystem fixtures |
-| 163 | Selected-production save completion, explicit loaded-world lifecycle, offline save/load continuity, timeline barriers and reliable world-change handling |
+| 171 | Production checkpoint Store and metadata against filesystem fixtures, including serialization-point staging |
+| 164 | Selected-production save completion, explicit loaded-world lifecycle, offline save/load continuity, timeline barriers and reliable world-change handling |
 | 22 | Native-save path resolver against filesystem fixtures |
+| 18 | Production receipt transfer/restore, batch persistence and Host checkpoint staging with IO dependencies faked |
 
 The filesystem suite executes the production Store with real temporary files:
 live versus frozen state, same-slot replacement, continuing saves, restart,
 rollback, missing/corrupt checkpoints, account-set replacement, interrupted
 staging, write failures, aliases and symlinks. Full inventory/receipt/layout bytes
 are compared, not only item counts. It also exercises the actual strict snapshot
-revision parser. 150 checks passed.
+revision parser. Later uploads cannot replace an already-staged checkpoint.
+171 checks passed.
 
 The selected-production barrier suite executes the pending-save callbacks and
 dirty/capture/reset controls with engine and network dependencies faked. It
@@ -104,7 +107,7 @@ Offline cases include pending writes across teardown, both role-entry gates,
 failure fencing, and a cold load's captured target remaining authoritative even
 if incidental save callbacks change the general last-path field. A native
 Client or pending automatic Client join cannot bootstrap a local Host Store.
-163 passed.
+164 passed.
 
 The actual native-save resolver also runs against temporary filesystem fixtures.
 22 checks cover exact final-writer user aliases, campaign identity, missing-file
@@ -268,8 +271,8 @@ the pinned DLL, native proof scope and failed intermediate candidates.
 
 - A checkpoint cannot include an inventory mutation the Host has not received.
 - Native world serialization and Client inventory capture are not one distributed
-  atomic snapshot. Uploads accepted while the final native write is pending may
-  enter the account checkpoint captured at completion.
+  atomic snapshot. Only uploads already accepted at native serialization enter
+  the frozen checkpoint; later uploads remain in live state.
 - Historical saves made before frozen account snapshots may have no recoverable
   Client checkpoint. Newer journals must not fill that gap after rollback.
 - Checkpoint-generation retention is not yet bounded by native save deletion.

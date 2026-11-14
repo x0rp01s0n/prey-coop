@@ -600,6 +600,41 @@ bool Store::AdvanceLiveSave(const std::string& previousSaveKey, const std::strin
     return true;
 }
 
+void Store::DiscardStagedCheckpoint()
+{
+    std::error_code ignored;
+    if (!m_stagedCheckpoint.empty())
+        fs::remove_all(m_stagedCheckpoint, ignored);
+    m_stagedCheckpoint.clear();
+    m_stagedTimeline = 0;
+}
+
+bool Store::StageCheckpoint(const std::string& saveKey, std::string& error)
+{
+    error.clear();
+    if (!m_ready || m_timeline == 0 || !m_validator || !SafeKey(saveKey) || !m_stagedCheckpoint.empty())
+    {
+        error = "checkpoint staging requires an initialized timeline and no pending snapshot";
+        return false;
+    }
+    const fs::path source = LiveDirectory(saveKey);
+    std::vector<std::string> files;
+    if (!Directory(source, true, error) || !AccountFiles(source, files, m_validator, false, error))
+        return false;
+    fs::path staged;
+    if (!NewDirectory(m_root, "pending_checkpoint_", staged, error))
+        return false;
+    if (!CopyAccounts(source, staged, files, m_validator, error))
+    {
+        std::error_code ignored;
+        fs::remove_all(staged, ignored);
+        return false;
+    }
+    m_stagedCheckpoint = std::move(staged);
+    m_stagedTimeline = m_timeline;
+    return true;
+}
+
 bool Store::CaptureCheckpoint(const std::string& saveKey, const std::string& fingerprint, std::string& error)
 {
     error.clear();
@@ -608,7 +643,12 @@ bool Store::CaptureCheckpoint(const std::string& saveKey, const std::string& fin
         error = "checkpoint capture requires an initialized live timeline";
         return false;
     }
-    const fs::path source = LiveDirectory(saveKey);
+    if (!m_stagedCheckpoint.empty() && m_stagedTimeline != m_timeline)
+    {
+        error = "staged checkpoint belongs to an abandoned timeline";
+        return false;
+    }
+    const fs::path source = m_stagedCheckpoint.empty() ? LiveDirectory(saveKey) : m_stagedCheckpoint;
     const fs::path checkpoint = CheckpointDirectory(fingerprint);
     if (!Directory(source, true, error) || !Directory(checkpoint, true, error))
         return false;
@@ -636,11 +676,13 @@ bool Store::CaptureCheckpoint(const std::string& saveKey, const std::string& fin
     m_saveKey = saveKey;
     m_fingerprint = fingerprint;
     m_recoveryAllowed = true;
+    DiscardStagedCheckpoint();
     return true;
 }
 
 bool Store::Rebase(const std::string& saveKey, const std::string& fingerprint, std::string& error)
 {
+    DiscardStagedCheckpoint();
     error.clear();
     const uint64_t previousTimeline = m_timeline;
     m_timeline = 0;

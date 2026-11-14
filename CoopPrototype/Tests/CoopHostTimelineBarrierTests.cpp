@@ -50,6 +50,7 @@ struct Store
         return HostStoreFixture::result;
     }
     uint64_t Timeline() const { return HostStoreFixture::timeline; }
+    void DiscardStagedCheckpoint() {}
 };
 }
 std::string NativePlayerCheckpointFingerprint(const std::string& path)
@@ -89,6 +90,10 @@ struct ModMain
     bool m_localInventoryDirty = false;
     bool suppressFeedback = false;
     bool captureResult = true;
+    bool stageResult = true;
+    int liveSnapshot = 19;
+    int stagedSnapshot = -1;
+    int capturedSnapshot = -1;
     bool campaignGuidChanged = false;
     uint64_t hostAccount = 7;
     uint64_t m_currentHostTimelineId = 11;
@@ -164,7 +169,9 @@ struct ModMain
     void SetCurrentHostSaveStateKey(const std::string& value, bool)
     { actions.push_back("set"); m_currentHostSaveStateKey = value; }
     bool CaptureHostPlayerCheckpoint(const std::string&)
-    { actions.push_back("capture"); return captureResult; }
+    { actions.push_back("capture"); capturedSnapshot = stagedSnapshot; return captureResult; }
+    bool StageHostPlayerCheckpoint() { stagedSnapshot = liveSnapshot; return stageResult; }
+    bool RestoreHostSharedDropDeliveryReceipts() { return true; }
     void StopNetwork();
     void QueueCoopHudFeedback(const char*, float) { actions.push_back("hud"); }
     void BroadcastHostSaveIdentity(const char*, bool = false) { actions.push_back("broadcast"); }
@@ -890,6 +897,7 @@ int main()
     Check(successful.m_lastSaveLoadPath == "save_A" && successful.m_hostCheckpointSave.path == "save_B",
         "forced Host request tracks attempted B without replacing the completed A path");
     SaveResult(successful);
+    successful.liveSnapshot = 20;
     successful.TickHostCheckpointSave();
     Check(successful.actions.empty() && successful.m_currentHostSaveStateKey == "save_A",
         "native successful return alone cannot fingerprint or publish unfinished bytes");
@@ -898,6 +906,8 @@ int main()
     successful.TickHostCheckpointSave();
     Check(successful.actions == std::vector<std::string>({"advance", "set", "capture", "broadcast", "request"}),
         "successful external native save captures before identity broadcast and live upload request");
+    Check(successful.capturedSnapshot == 19 && successful.liveSnapshot == 20,
+        "uploads between serialization and final writer completion cannot change the frozen checkpoint");
     Check(successful.m_currentHostSaveStateKey == "save_b" &&
         successful.m_networkMode == CoopNetworkMode::Host,
         "successful checkpoint retains the active Host session");

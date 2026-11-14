@@ -24,6 +24,11 @@ public:
 
     bool AdvanceLiveSave(const std::string& previousSaveKey, const std::string& nextSaveKey, std::string& error);
 
+    // Freeze accepted state on the native serialization thread, before later
+    // uploads can race the asynchronous file writer's completion.
+    bool StageCheckpoint(const std::string& saveKey, std::string& error);
+    void DiscardStagedCheckpoint();
+
     // Only a successful native save may call this. Later live uploads must not.
     // A forward save advances checkpoint identity without changing lineage.
     bool CaptureCheckpoint(const std::string& saveKey, const std::string& fingerprint, std::string& error);
@@ -47,5 +52,7 @@ private:
     std::string m_fingerprint;
     bool m_recoveryAllowed = false;
     bool m_ready = false;
+    std::filesystem::path m_stagedCheckpoint;
+    uint64_t m_stagedTimeline = 0;
 };
 }

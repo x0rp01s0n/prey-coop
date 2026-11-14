@@ -524,6 +524,41 @@ void TestRecoveryMetadata()
         "unvalidated canonical bytes cannot raise the persistent revision floor");
 }
 
+void TestSerializationPointSnapshot()
+{
+    Fixture f("serialization-point");
+    f.Live(snapshotX);
+    CheckOk(f.store.StageCheckpoint("save_A", f.error), f.error, "stage serialization-point inventory");
+    f.Live(snapshotXY);
+    Check(!f.store.StageCheckpoint("save_A", f.error), "overlapping stage cannot replace the original inventory");
+    f.Capture();
+    Check(Read(CheckpointAccountFile(f.store, fingerprintA)) == snapshotX,
+        "delayed native writer pairs with the pre-serialization inventory, not a later pickup upload");
+    Check(Read(f.store.LiveDirectory("save_A") / account) == snapshotXY,
+        "staging does not roll the continuing live inventory back");
+    CheckOk(f.store.RotateTimeline("save_A", fingerprintA, f.error), f.error, "restore serialization-point snapshot");
+    Check(Read(f.store.LiveDirectory("save_A") / account) == snapshotX,
+        "explicit reload cannot combine older public world drops with newer accepted inventory");
+
+    f.Live(snapshotX);
+    CheckOk(f.store.StageCheckpoint("save_A", f.error), f.error, "stage forward save");
+    f.Live(snapshotXY);
+    CheckOk(f.store.AdvanceLiveSave("save_A", "save_B", f.error), f.error, "advance live while writer finishes");
+    f.Capture("save_B", fingerprintB);
+    Check(Read(CheckpointAccountFile(f.store, fingerprintB)) == snapshotX &&
+        Read(f.store.LiveDirectory("save_B") / account) == snapshotXY,
+        "forward checkpoint preserves frozen bytes while carrying newer live state forward");
+
+    Fixture cancelled("cancelled-staging");
+    cancelled.Live(snapshotXY);
+    CheckOk(cancelled.store.StageCheckpoint("save_A", cancelled.error), cancelled.error, "stage a cancelled request");
+    cancelled.store.DiscardStagedCheckpoint();
+    cancelled.Live(snapshotX);
+    cancelled.Capture();
+    Check(Read(CheckpointAccountFile(cancelled.store, fingerprintA)) == snapshotX,
+        "cancelled native save cannot leak its staged inventory into another save");
+}
+
 void TestTimelineFence()
 {
     using CoopPlayerStateStore::MatchesTimeline;
@@ -552,6 +587,7 @@ int main(int argc, char** argv)
     TestValidationAndSymlinks();
     TestLegacyAndInputs();
     TestRecoveryMetadata();
+    TestSerializationPointSnapshot();
     TestTimelineFence();
     std::cout << checks << " production checkpoint-store filesystem checks passed\n";
 }

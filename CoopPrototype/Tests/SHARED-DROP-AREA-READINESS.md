@@ -2,6 +2,30 @@
 
 ## Follow-up On 2026-11-14
 
+V36 reran the solo and split-area cases on current main, including native travel,
+stop/rehost, offline collection/redrop, and repeated pickup/rejoin. Four hard Host
+restart cases also passed: saved public sources from either player, a drop after
+the checkpoint, and a pickup after the checkpoint. Native inventory quantities,
+layout and visible world entities were the oracles. DLL SHA256:
+`27b12922fd840a07ca73ddcd414259177fe159ed8fb01391e257ce002b9d5b55`.
+Archive SHA256:
+`9cd4272484e0b5051a1f0eadd66f18ef2ecf6f2676fb1d97ec0a300efdf86913`.
+All 14 archived production source hashes match commit `d91f478`. The restore
+initially refused a stale Host process pin after the final intentional restart;
+the final boundary's exact pins were verified and the complete original
+profiles/mods were then restored with matching path/size/SHA256 manifests.
+
+The earlier V35 native run really lost a committed item after offline redrop:
+zero in both inventories and no public source. V36 retires the acquired lifetime
+before vanilla redrop and assigns a fresh identity. This is a shared-drop
+lifecycle fix, not an additional journal.
+
+V36 is not final proof for the later pending-remainder changes. A production
+function regression subsequently found that transfer preparation discarded an
+already-assigned, partially delivered receipt on a new transport session. That
+case and serialization-point checkpoint staging still need native verification.
+The PR remains on hold until those checks finish.
+
 V32, protocol 258, fixes both V30 counterexamples below without another journal:
 publication creates a fresh lifetime even when the Host is alone; ownership
 coordination accepts admitted peers in other areas; native travel detaches only

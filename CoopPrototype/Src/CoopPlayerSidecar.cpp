@@ -3745,9 +3745,18 @@ bool ModMain::StoreCommittedSharedDropDelivery(
     uint64_t accountToken,
     const CoopSharedDropDelivery::Entry& entry)
 {
+    return StoreCommittedSharedDropDeliveries(accountToken, {entry});
+}
+
+bool ModMain::StoreCommittedSharedDropDeliveries(
+    uint64_t accountToken,
+    const std::vector<CoopSharedDropDelivery::Entry>& entries)
+{
     EnsureSharedDropHostSessionId();
-    if (m_networkMode != CoopNetworkMode::Host || accountToken == 0 ||
-        !CoopSharedDropDelivery::IsValid(entry) || entry.hostSessionId != m_sharedDropHostSessionId ||
+    if ((m_networkMode != CoopNetworkMode::Host && !HasContinuingHostInventoryWorld()) || accountToken == 0 ||
+        entries.empty() || entries.size() > CoopSharedDropDelivery::kMaxEntries ||
+        std::any_of(entries.begin(), entries.end(), [this](const CoopSharedDropDelivery::Entry& row)
+            { return !CoopSharedDropDelivery::IsValid(row) || row.hostSessionId != m_sharedDropHostSessionId; }) ||
         m_currentHostSaveStateKey.empty() || m_currentHostSaveStateKey == "unknown_save")
     {
         return false;
@@ -3779,19 +3788,22 @@ bool ModMain::StoreCommittedSharedDropDelivery(
         return false;
     rows.erase(std::remove_if(rows.begin(), rows.end(), [this](const CoopSharedDropDelivery::Entry& row)
         { return row.hostSessionId != m_sharedDropHostSessionId; }), rows.end());
-    const auto existing = std::find_if(rows.begin(), rows.end(), [&entry](const CoopSharedDropDelivery::Entry& row)
-        { return CoopSharedDropDelivery::SameLifetime(row, entry); });
-    if (existing != rows.end())
+    for (const auto& entry : entries)
     {
-        if (!CoopSharedDropDelivery::SameCommit(*existing, entry) || entry.deliveredCount < existing->deliveredCount)
-            return false;
-        *existing = entry;
-    }
-    else
-    {
-        if (rows.size() == CoopSharedDropDelivery::kMaxEntries)
-            return false;
-        rows.push_back(entry);
+        const auto existing = std::find_if(rows.begin(), rows.end(), [&entry](const CoopSharedDropDelivery::Entry& row)
+            { return CoopSharedDropDelivery::SameLifetime(row, entry); });
+        if (existing != rows.end())
+        {
+            if (!CoopSharedDropDelivery::SameCommit(*existing, entry) || entry.deliveredCount < existing->deliveredCount)
+                return false;
+            *existing = entry;
+        }
+        else
+        {
+            if (rows.size() == CoopSharedDropDelivery::kMaxEntries)
+                return false;
+            rows.push_back(entry);
+        }
     }
     std::ostringstream output;
     output.imbue(std::locale::classic());
@@ -3863,12 +3875,36 @@ bool ModMain::PrepareSharedDropDeliveriesForHostTransfer(const std::string& path
     if (!CoopSharedDropDelivery::ParseSection(payload, rows, hasSection) || (hasSection && !hasHash))
         return false;
     rows.erase(std::remove_if(rows.begin(), rows.end(), [this](const CoopSharedDropDelivery::Entry& row)
-        { return row.hostSessionId != m_sharedDropHostSessionId; }), rows.end());
+        { return row.hostSessionId != m_sharedDropHostSessionId && row.deliveredCount == row.count; }), rows.end());
+    // This is the Host-selected inventory snapshot, not an old Client journal.
+    // An assigned remainder survives a transport restart with its exact delta.
+    for (auto& row : rows)
+        row.hostSessionId = m_sharedDropHostSessionId;
     std::ostringstream output;
     output.imbue(std::locale::classic());
     output << CoopSharedDropDelivery::WithoutSection(payload);
     CoopSharedDropDelivery::WriteSection(output, rows, m_sharedDropHostSessionId);
     return WritePlayerSidecarPayloadWithHash(CoopFilesystem::FromUtf8(path), output.str());
+}
+
+bool ModMain::RestoreHostSharedDropDeliveryReceipts()
+{
+    EnsureSharedDropHostSessionId();
+    const std::string path = GetHostPlayerStatePathForAccountAndSave(
+        GetLocalAccountToken(), m_currentHostSaveStateKey);
+    std::error_code error;
+    const bool exists = std::filesystem::exists(CoopFilesystem::FromUtf8(path), error);
+    if (error || path.empty())
+        return false;
+    if (!exists)
+        return true;
+    PlayerSidecarState state;
+    if (!PrepareSharedDropDeliveriesForHostTransfer(path) || !LoadPlayerSidecarFromPath(path, state))
+        return false;
+    // Host inventory is owned by Save.CSF. Restore only its assigned remainders,
+    // never apply a sidecar inventory over the vanilla player.
+    m_localSharedDropDeliveries = state.sharedDropDeliveries;
+    return true;
 }
 
 bool ModMain::LoadLocalPlayerSidecar(PlayerSidecarState& state)

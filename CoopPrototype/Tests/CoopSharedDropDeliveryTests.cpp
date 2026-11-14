@@ -141,6 +141,11 @@ public:
     unsigned saves = 0, journals = 0, registrations = 0, uploads = 0;
     unsigned stops = 0;
     unsigned failSaveAt = 0, failJournalAt = 0;
+    unsigned stores = 0, failStoreAt = 0;
+    bool continuingHostWorld = false;
+    bool HasContinuingHostInventoryWorld() const { return continuingHostWorld; }
+    bool StoreCommittedSharedDropDelivery(uint64_t, const CoopSharedDropDelivery::Entry&)
+    { return ++stores != failStoreAt; }
     struct Snapshot { int count = 0; std::vector<CoopSharedDropDelivery::Entry> rows; };
     Snapshot sidecar, recovery;
     uint64_t GetLocalAccountToken() const { return 2; }
@@ -241,6 +246,27 @@ struct Fixture {
 
 int main() {
     const std::vector<std::pair<const char*, std::function<void()>>> tests = {
+        {"continuing_offline_host_finishes_owned_remainder_without_client_journal", [] {
+            Fixture f;
+            f.mod.m_networkMode = CoopNetworkMode::Off;
+            f.mod.continuingHostWorld = true;
+            require(f.mod.TryDeliverCommittedSharedDrop(f.record()), "offline owned remainder did not finish");
+            require(f.inventory.count == 15 && f.receipt().deliveredCount == 5 &&
+                f.mod.stores == 2 && f.mod.saves == 0 && f.mod.journals == 0,
+                "offline Host grant used Client recovery instead of its checkpoint receipt");
+            require(f.mod.TryDeliverCommittedSharedDrop(f.record()) && f.item.nativeCalls == 1,
+                "offline receipt replay granted twice");
+        }},
+        {"offline_host_receipt_write_retry_does_not_regrant", [] {
+            Fixture f;
+            f.mod.m_networkMode = CoopNetworkMode::Off;
+            f.mod.continuingHostWorld = true;
+            f.mod.failStoreAt = 2;
+            require(!f.mod.TryDeliverCommittedSharedDrop(f.record()) && f.inventory.count == 15,
+                "failed offline progress write was not observable");
+            require(f.mod.TryDeliverCommittedSharedDrop(f.record()) && f.item.nativeCalls == 1 && f.inventory.count == 15,
+                "retry after offline storage failure repeated native pickup");
+        }},
         {"full_native_delivery_paired_snapshot", [] {
             Fixture f;
             require(f.mod.TryDeliverCommittedSharedDrop(f.record()), "full native delivery failed");

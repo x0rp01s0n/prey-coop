@@ -2295,6 +2295,8 @@ private:
     bool OpenHostPlayerStateTimeline(const std::string& savePath, bool explicitLoad);
     void FinishHostInventoryWorldLoad(bool loadFailed);
     bool CaptureHostPlayerCheckpoint(const std::string& savePath);
+    bool StageHostPlayerCheckpoint();
+    bool RestoreHostSharedDropDeliveryReceipts();
     void BeginHostCheckpointSave(const std::string& savePath);
     void ObserveHostCheckpointSaveWrite(const std::string& savePath, bool result);
     void ResetPendingHostCheckpointSave();
@@ -2954,6 +2956,7 @@ private:
     bool LoadLocalPlayerSidecar(PlayerSidecarState& state);
     bool LoadPlayerSidecarFromPath(const std::string& path, PlayerSidecarState& state);
     bool StoreCommittedSharedDropDelivery(uint64_t accountToken, const CoopSharedDropDelivery::Entry& entry);
+    bool StoreCommittedSharedDropDeliveries(uint64_t accountToken, const std::vector<CoopSharedDropDelivery::Entry>& entries);
     bool MergeSharedDropDeliveriesForUpload(const std::string& incomingPath, const std::string& storedPath);
     bool PrepareSharedDropDeliveriesForHostTransfer(const std::string& path);
     bool ReconcileRecoveryPlayerStateSnapshot(PlayerSidecarState& state, const PlayerSidecarState& hostState);

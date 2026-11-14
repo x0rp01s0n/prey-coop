@@ -202,6 +202,7 @@ public:
     bool allowMaterialize = false;
     struct Stored { uint64_t account; CoopSharedDropDelivery::Entry entry; };
     std::vector<Stored> durable;
+    std::vector<CoopSharedDropDelivery::Entry> m_localSharedDropDeliveries;
     uint64_t GetLocalAccountToken() const { return token; }
     uint64_t GetRemoteAccountToken() const { return remoteToken; }
     uint64_t GetSessionHostAccountToken() const { return m_networkMode == CoopNetworkMode::Host ? token : remoteToken; }
@@ -1163,6 +1164,36 @@ int main(int argc, char**) {
                     f.row(f.host).localEntityId == INVALID_ENTITYID && f.host.sent.empty(),
                     "offline redrop revived its old receipt, sent packets, or lost its new source");
             }
+        }},
+        {"saved_private_remainder_is_not_readopted_as_public_loot", [] {
+            Fixture f;
+            f.entities.GetEntity(103)->name = "CoopSharedDrop_77";
+            f.host.m_sharedDrops.clear();
+            f.host.m_sharedDropByEntityId.clear();
+            f.host.m_localSharedDropDeliveries.push_back({19, stable, f.hostItem.GetArchetype(), 3, 1, 31, 37});
+            f.host.m_sharedDropHostSessionId = 19;
+            f.host.m_sharedDropRecoveryRequired = true;
+            f.host.RecoverSavedSharedDrops();
+            require(!f.entities.GetEntity(103) && f.host.m_sharedDrops.empty() &&
+                f.host.m_localSharedDropDeliveries.size() == 1 &&
+                f.host.m_localSharedDropDeliveries[0].deliveredCount == 1,
+                "saved overflow source became public or lost its paired remainder receipt");
+        }},
+        {"continuing_offline_host_rebinds_only_its_assigned_remainder", [] {
+            Fixture f;
+            f.hostItem.accept = false;
+            f.host.ShouldDeferNativeSharedItemPickup(&f.hostItem, 1, "prepare owned remainder");
+            f.entities.GetEntity(103)->name = "CoopSharedDrop_77";
+            f.host.DetachSharedDropEntities();
+            f.host.m_networkMode = CoopNetworkMode::Off;
+            f.host.continuingHostWorld = true;
+            f.hostItem.accept = true;
+            require(f.host.ShouldDeferNativeSharedItemPickup(&f.hostItem, 1, "offline remainder") &&
+                f.hostItem.inventoryCount == 1 && f.row(f.host).localEntityId == 103,
+                "offline native pickup bypassed its assigned remainder receipt");
+            require(f.host.ShouldDeferNativeSharedItemPickup(&f.hostItem, 1, "offline repeat") &&
+                f.hostItem.inventoryCount == 1,
+                "offline assigned remainder granted twice");
         }},
         {"ordinary_offline_world_does_not_publish_personal_drops", [] {
             Fixture f;

@@ -58,6 +58,13 @@ bool FinishDeliveryPresentation(EntityId entityId)
 
 bool ModMain::PersistLocalSharedDropDelivery(SharedDropRecord& record)
 {
+    if (m_networkMode == CoopNetworkMode::Off && HasContinuingHostInventoryWorld())
+    {
+        const auto delivery = FindDelivery(m_localSharedDropDeliveries, m_sharedDropHostSessionId, record.stableSpawnId);
+        record.pickupDeliveryStored = delivery != m_localSharedDropDeliveries.end() &&
+            StoreCommittedSharedDropDelivery(GetLocalAccountToken(), *delivery);
+        return record.pickupDeliveryStored;
+    }
     // Receipt and inventory are serialized together. A failed capture leaves the
     // committed entitlement assigned, never released back into the shared world.
     MarkLocalInventoryDirty("shared drop delivery receipt");

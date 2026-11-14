@@ -27094,7 +27094,11 @@ void ModMain::BeginHostCheckpointSave(const std::string& savePath)
     if (!m_hostCheckpointSave.path.empty() || m_hostCheckpointSave.conflict)
         m_hostCheckpointSave.conflict = true;
     else
+    {
+        if (!StageHostPlayerCheckpoint())
+            pending.conflict = true;
         m_hostCheckpointSave = std::move(pending);
+    }
 }
 
 void ModMain::ObserveHostCheckpointSaveWrite(const std::string& savePath, bool result)
@@ -27117,6 +27121,8 @@ void ModMain::ResetPendingHostCheckpointSave()
 {
     std::lock_guard<std::mutex> lock(m_hostCheckpointSaveMutex);
     m_hostCheckpointSave = {};
+    if (m_hostPlayerStateStore)
+        m_hostPlayerStateStore->DiscardStagedCheckpoint();
 }
 
 bool ModMain::HasPendingHostCheckpointSave()
@@ -27158,7 +27164,8 @@ void ModMain::TickHostCheckpointSave()
         m_hostCheckpointSave = {};
     }
     // WriteComplete can run on the writer thread and before SaveGame returns.
-    // Hash and publish only here, after both signals, outside the writer callback.
+    // Publish the already-frozen account set after both signals. Later uploads
+    // must not be paired with the native world's earlier serialization.
     if (failure.empty() && BuildHostSaveStateKey(pending.completedPath) != pending.saveKey)
         failure = "native host save completion identity changed";
     if (failure.empty())
@@ -27171,6 +27178,8 @@ void ModMain::TickHostCheckpointSave()
     }
     if (!failure.empty())
     {
+        if (m_hostPlayerStateStore)
+            m_hostPlayerStateStore->DiscardStagedCheckpoint();
         LogCoop(failure + "; stopping session");
         m_hostInventorySession = HostInventorySession::CheckpointLoadFailed;
         StopNetwork();
@@ -27291,7 +27300,11 @@ void ModMain::OnCryActionSaveGameReturned(
         if (!m_hostCheckpointSave.conflict)
         {
             if (!result)
+            {
                 m_hostCheckpointSave = {};
+                if (m_hostPlayerStateStore)
+                    m_hostPlayerStateStore->DiscardStagedCheckpoint();
+            }
             else if (m_hostCheckpointSave.path.empty())
                 m_hostCheckpointSave.conflict = true;
             else
@@ -44908,6 +44921,27 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
             "_requested_" + std::to_string(requestedId) +
             (reason.empty() ? std::string() : "_reason_" + StatusToken(reason));
         m_networkStatus = m_lastRuntimeInteropEvent;
+    }
+    else if (command == "coop_escrow_native_save_fixture")
+    {
+        ArkPlayer* player = IsGameReady() ? ArkPlayer::GetInstancePtr() : nullptr;
+        ArkInventory* inventory = player ? player->m_pInventory : nullptr;
+        unsigned count = 0;
+        ok = m_networkMode == CoopNetworkMode::Host && inventory && gEnv && gEnv->pEntitySystem &&
+            TryGuardedVoidCall("escrow test savable native inventory fixture", [&]()
+            {
+                for (const auto& cell : inventory->m_storedItems)
+                {
+                    IEntity* entity = gEnv->pEntitySystem->GetEntity(cell.m_entityId);
+                    if (entity && inventory->Contains(cell.m_entityId))
+                    {
+                        entity->SetFlags(entity->GetFlags() & ~static_cast<uint32_t>(ENTITY_FLAG_NO_SAVE));
+                        ++count;
+                    }
+                }
+            }, nullptr);
+        action = "escrow_save_fixture";
+        m_networkStatus = "escrow_save_fixture_items_" + std::to_string(count);
     }
 #endif
     else if (command == "coop_world_ready")
@@ -75597,6 +75631,13 @@ bool ModMain::OpenHostPlayerStateTimeline(const std::string& savePath, bool expl
         ? m_hostPlayerStateStore->RotateTimeline(m_currentHostSaveStateKey, fingerprint, error)
         : m_hostPlayerStateStore->Open(m_currentHostSaveStateKey, fingerprint, error);
     m_currentHostTimelineId = m_hostPlayerStateStore->Timeline();
+    if (m_currentHostTimelineId != 0 && m_networkMode == CoopNetworkMode::Host &&
+        m_sharedDropHostSessionId == 0 && !RestoreHostSharedDropDeliveryReceipts())
+    {
+        LogCoop("host shared-drop checkpoint receipts could not be restored");
+        m_currentHostTimelineId = 0;
+        return false;
+    }
     // A missing historical checkpoint establishes a safe empty scope. Actual
     // I/O failures keep Timeline zero and must not establish continuity.
     if (m_currentHostTimelineId != 0 &&
@@ -75640,6 +75681,22 @@ void ModMain::FinishHostInventoryWorldLoad(bool loadFailed)
     }
     else
         m_hostInventorySession = HostInventorySession::NeedsCheckpointRestore;
+}
+
+bool ModMain::StageHostPlayerCheckpoint()
+{
+    if (!m_hostPlayerStateStore || m_currentHostTimelineId == 0 || m_sharedDropDeliveryRecoveryRequired)
+        return false;
+    // Host inventory remains native-owned, but its pending-delivery progress
+    // must describe that same serialization point before the writer runs.
+    if (!m_localSharedDropDeliveries.empty() &&
+        !StoreCommittedSharedDropDeliveries(GetLocalAccountToken(), m_localSharedDropDeliveries))
+        return false;
+    std::string error;
+    const bool ok = m_hostPlayerStateStore->StageCheckpoint(m_currentHostSaveStateKey, error);
+    if (!ok)
+        LogCoop("host inventory checkpoint staging failed: " + error);
+    return ok;
 }
 
 bool ModMain::CaptureHostPlayerCheckpoint(const std::string& savePath)
