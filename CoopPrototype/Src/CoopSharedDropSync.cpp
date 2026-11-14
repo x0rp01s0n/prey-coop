@@ -17,6 +17,8 @@
 
 namespace
 {
+constexpr auto kSharedDropReservationTimeout = std::chrono::seconds(30);
+
 bool IsFiniteTransform(const CoopProtocol::SharedDropPacket& packet)
 {
     const float values[] = {
@@ -74,6 +76,56 @@ bool SetSharedDropWorldPresentation(IEntity& entity, bool visible, std::string& 
 
 }
 
+uint64_t ModMain::EnsureSharedDropHostSessionId()
+{
+    if ((m_networkMode == CoopNetworkMode::Host || HasContinuingHostInventoryWorld()) &&
+        m_sharedDropHostSessionId == 0)
+    {
+        const auto ticks = std::chrono::high_resolution_clock::now().time_since_epoch().count();
+        m_sharedDropHostSessionId = static_cast<uint64_t>(ticks) ^ GetLocalAccountToken();
+        if (m_sharedDropHostSessionId == 0)
+            m_sharedDropHostSessionId = 1;
+    }
+    return m_sharedDropHostSessionId;
+}
+
+bool ModMain::IsSharedDropWorldReady() const
+{
+    return !m_saveLoadGuardActive && !m_pendingPostLoadResync &&
+        !m_arkLevelTransitionLoadActive && !m_runtimeTransitionCleanupPrepared &&
+        gEnv && gEnv->pEntitySystem && ArkPlayer::GetInstancePtr() &&
+        ArkPlayer::GetInstance().GetEntity();
+}
+
+bool ModMain::IsSharedDropServiceReady() const
+{
+    return (IsSharedDropWorldReady() ||
+            (m_networkMode == CoopNetworkMode::Host && m_arkLevelTransitionLoadActive)) &&
+        (m_networkMode == CoopNetworkMode::Host ||
+            (m_networkMode == CoopNetworkMode::Client && m_hasRemoteEndpoint &&
+                m_sharedDropHostSessionId != 0 && GetSessionHostAccountToken() != 0));
+}
+
+void ModMain::DetachSharedDropEntities()
+{
+    // Native travel saves/removes the area entities. Keep source lifetimes,
+    // but never interpret that teardown (or a reused EntityId) as a pickup.
+    for (auto& entry : m_sharedDrops)
+    {
+        SharedDropRecord& record = entry.second;
+        IEntity* entity = gEnv && gEnv->pEntitySystem && record.areaId == m_localLevelId
+            ? gEnv->pEntitySystem->GetEntity(record.localEntityId) : nullptr;
+        if (entity)
+        {
+            record.position = entity->GetWorldPos();
+            record.rotation = entity->GetWorldRotation();
+        }
+        record.localEntityId = INVALID_ENTITYID;
+    }
+    m_sharedDropByEntityId.clear();
+    m_sharedDropRecoveryRequired = true;
+}
+
 uint64_t ModMain::BuildSharedDropStableId(uint64_t archetypeId, const Vec3& position, uint32_t sequence) const
 {
     uint64_t hash = 14695981039346656037ull;
@@ -87,6 +139,7 @@ uint64_t ModMain::BuildSharedDropStableId(uint64_t archetypeId, const Vec3& posi
     };
 
     mix(GetLocalAccountToken());
+    mix(m_sharedDropHostSessionId);
     mix(CurrentHostSaveKeyHash());
     mix(m_localWorldEpoch);
     mix(m_localLevelId);
@@ -112,16 +165,24 @@ bool ModMain::BuildSharedDropPacket(
     packet.worldEpoch = m_localWorldEpoch;
     packet.objectVersion = record.version;
     packet.hostSaveKeyHash = CurrentHostSaveKeyHash();
+    packet.hostSessionId = m_sharedDropHostSessionId;
     packet.areaId = record.areaId;
     packet.stableSpawnId = record.stableSpawnId;
     packet.sourcePeerHash = GetLocalAccountToken();
     packet.targetPeerHash = targetPeerHash;
     packet.archetypeId = record.archetypeId;
     packet.command = static_cast<uint16_t>(command);
-    packet.flags = record.live ? 1u : 0u;
+    packet.flags = record.live ? CoopProtocol::kSharedDropFlagLive : 0u;
     packet.count = record.count;
+    packet.px = record.position.x;
+    packet.py = record.position.y;
+    packet.pz = record.position.z;
+    packet.qw = record.rotation.w;
+    packet.qx = record.rotation.v.x;
+    packet.qy = record.rotation.v.y;
+    packet.qz = record.rotation.v.z;
 
-    IEntity* entity = gEnv && gEnv->pEntitySystem && record.localEntityId != INVALID_ENTITYID
+    IEntity* entity = IsSharedDropWorldReady() && record.areaId == m_localLevelId && record.localEntityId != INVALID_ENTITYID
         ? gEnv->pEntitySystem->GetEntity(record.localEntityId)
         : nullptr;
     if (entity)
@@ -145,6 +206,20 @@ bool ModMain::SendSharedDropTo(
     uint16_t port,
     const char* failurePrefix)
 {
+    if (m_networkMode == CoopNetworkMode::Host)
+    {
+        bool sent = true;
+        for (const auto& entry : m_remotePeers)
+        {
+            const RemotePeerSession& peer = entry.second;
+            const bool assignedRecipient = packet.command == static_cast<uint16_t>(CoopProtocol::SharedDropCommand::PickupCommit) &&
+                packet.targetPeerHash == entry.first;
+            if ((peer.levelId == packet.areaId || assignedRecipient) && peer.worldEpoch == packet.worldEpoch &&
+                (peer.sessionFlags & CoopProtocol::kSessionFlagWorldReady) != 0)
+                sent = SendSharedDropToPeer(packet, entry.first, failurePrefix) && sent;
+        }
+        return sent;
+    }
     if (!SendReliablePayloadTo(
             static_cast<uint16_t>(CoopProtocol::PacketType::SharedDrop),
             &packet,
@@ -159,13 +234,75 @@ bool ModMain::SendSharedDropTo(
     return true;
 }
 
+bool ModMain::SendSharedDropToPeer(
+    const CoopProtocol::SharedDropPacket& packet,
+    uint64_t peerHash,
+    const char* failurePrefix)
+{
+    if (m_networkMode != CoopNetworkMode::Host || peerHash == 0)
+        return false;
+
+    const auto peerIt = m_remotePeers.find(peerHash);
+    const bool assignedRecipient = packet.command == static_cast<uint16_t>(CoopProtocol::SharedDropCommand::PickupCommit) &&
+        packet.targetPeerHash == peerHash;
+    if (peerIt == m_remotePeers.end() || (peerIt->second.levelId != packet.areaId && !assignedRecipient) ||
+        peerIt->second.worldEpoch != packet.worldEpoch ||
+        (peerIt->second.sessionFlags & CoopProtocol::kSessionFlagWorldReady) == 0 ||
+        peerIt->second.address == 0 || peerIt->second.port == 0)
+    {
+        return false;
+    }
+
+    if (!QueueReliablePayloadToEndpoint(
+            static_cast<uint16_t>(CoopProtocol::PacketType::SharedDrop),
+            &packet,
+            sizeof(packet),
+            peerIt->second.address,
+            peerIt->second.port,
+            GetLocalAccountToken(),
+            failurePrefix))
+    {
+        return false;
+    }
+
+    ++m_sharedDropSent;
+    return true;
+}
+
+void ModMain::OnNativeSharedItemDropping(CArkItem* item)
+{
+    if (!item || m_networkMode != CoopNetworkMode::Off || !m_sharedDropHostSessionId ||
+        !HasContinuingHostInventoryWorld() || !IsSharedDropWorldReady())
+        return;
+    IEntity* entity = item->GetEntity();
+    const char* name = entity ? entity->GetName() : nullptr;
+    uint64_t stableId = 0;
+    if (!name || std::strncmp(name, "CoopSharedDrop_", 15) != 0 ||
+        !ParsePositiveInteger(std::string(name + 15), stableId))
+        return;
+    const auto found = m_sharedDrops.find(stableId);
+    if (found == m_sharedDrops.end() || found->second.areaId != m_localLevelId ||
+        found->second.archetypeId != item->GetArchetype())
+        return;
+    // The Drop hook proved native inventory membership. This public source
+    // was collected while Off; retire it before vanilla reuses/clones the item.
+    found->second.live = false;
+    found->second.pickupPending = false;
+    found->second.localEntityId = INVALID_ENTITYID;
+    m_sharedDropByEntityId.erase(entity->GetId());
+}
+
 void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const char* reason)
 {
-    if (!item || m_sharedDropApplyDepth != 0 || m_networkMode == CoopNetworkMode::Off ||
-        !m_hasRemoteEndpoint || !IsSessionGameplayReady())
+    const bool continuingOfflineHost = m_networkMode == CoopNetworkMode::Off &&
+        m_sharedDropHostSessionId != 0 && HasContinuingHostInventoryWorld();
+    if (!item || m_sharedDropApplyDepth != 0 || !IsSharedDropWorldReady() ||
+        (!IsSharedDropServiceReady() && !continuingOfflineHost))
     {
         return;
     }
+
+    EnsureSharedDropHostSessionId();
 
     IEntity* entity = nullptr;
     uint64_t archetypeId = 0;
@@ -182,23 +319,25 @@ void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const 
         CoopRuntimeGuards::TryGuardedCall("shared drop GetCount", [item]() { return item->GetCount(); }, count, nullptr);
     count = std::max(1, count);
 
+    if (m_networkMode == CoopNetworkMode::Client)
+    {
+        // Publish only after the durable local pair no longer owns the drop.
+        // A crash must not restore the pre-drop inventory beside a world copy.
+        MarkLocalInventoryDirty("shared drop publication");
+        if (!SaveLocalPlayerSidecar("shared drop publication"))
+        {
+            ++m_sharedDropDropped;
+            m_lastSharedDropEvent = "drop_publication_deferred_local_capture_failed";
+            return;
+        }
+        WriteLocalPlayerRecoveryJournal("shared drop publication");
+        QueueClientPlayerStateUpload("inventory mutation", m_currentHostSaveStateKey);
+    }
+
     // A SharedDrop picked up on this peer may keep its inventory entity hidden.
     // Vanilla Drop can reuse or clone it without clearing all presentation
     // flags, which leaves the old visible ghost beside the real new drop.
     SetSharedDropWorldPresentation(*entity, true, guardReason);
-
-    // Terminal records reject delayed reliable packets, but they do not need to
-    // grow without bound over a long session once their native entity is gone.
-    if (m_sharedDrops.size() >= 4096)
-    {
-        for (auto it = m_sharedDrops.begin(); it != m_sharedDrops.end() && m_sharedDrops.size() > 3072;)
-        {
-            if (!it->second.live && it->second.localEntityId == INVALID_ENTITYID)
-                it = m_sharedDrops.erase(it);
-            else
-                ++it;
-        }
-    }
 
     SharedDropRecord record;
     record.areaId = m_localLevelId;
@@ -208,8 +347,11 @@ void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const 
     record.version = 1;
     record.count = count;
     record.live = true;
+    record.position = entity->GetWorldPos();
+    record.rotation = entity->GetWorldRotation();
     const uint32_t sequence = CoopSerialSequence::Advance(m_sharedDropSequence);
     record.stableSpawnId = BuildSharedDropStableId(archetypeId, entity->GetWorldPos(), sequence);
+    entity->SetName(("CoopSharedDrop_" + std::to_string(record.stableSpawnId)).c_str());
 
     // A successfully acquired shared item may retain its native entity while it
     // lerps into (or lives in) the inventory. Dropping that entity starts a new
@@ -228,6 +370,11 @@ void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const 
     m_sharedDrops[record.stableSpawnId] = record;
     m_sharedDropByEntityId[record.localEntityId] = record.stableSpawnId;
     RetireLivePropTrackingForSharedDrop(record.localEntityId);
+
+    // Stopping networking does not end this native world. Retain offline
+    // redrops for the next rehost, but do not send packets while Off.
+    if (continuingOfflineHost)
+        return;
 
     CoopProtocol::SharedDropPacket packet;
     if (!BuildSharedDropPacket(packet, CoopProtocol::SharedDropCommand::Spawn, record) ||
@@ -248,7 +395,7 @@ void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const 
 void ModMain::OnNativeRecyclerIngredientSpawned(EntityId itemEntityId, const char* reason)
 {
     if (m_networkMode == CoopNetworkMode::Off || itemEntityId == INVALID_ENTITYID ||
-        m_sharedDropApplyDepth != 0 || !m_hasRemoteEndpoint || !IsSessionGameplayReady())
+        m_sharedDropApplyDepth != 0 || !IsSharedDropServiceReady())
     {
         return;
     }
@@ -283,20 +430,77 @@ void ModMain::OnNativeRecyclerIngredientSpawned(EntityId itemEntityId, const cha
 
 bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerId, const char* reason)
 {
-    if (!item || m_sharedDropApplyDepth != 0 || m_networkMode == CoopNetworkMode::Off ||
+    const bool offlineHost = m_networkMode == CoopNetworkMode::Off && HasContinuingHostInventoryWorld();
+    if (!item || m_sharedDropApplyDepth != 0 ||
+        (m_networkMode != CoopNetworkMode::Host && m_networkMode != CoopNetworkMode::Client && !offlineHost) ||
         !ArkPlayer::GetInstancePtr() || pickerId != ArkPlayer::GetInstance().GetEntityId())
     {
         return false;
     }
 
-    const auto found = m_sharedDropByEntityId.find(item->GetEntityId());
+    if (m_sharedDropRecoveryRequired || (offlineHost && !m_localSharedDropDeliveries.empty()))
+    {
+        const EntityId itemId = item->GetEntityId();
+        RecoverSavedSharedDrops();
+        if (offlineHost && !m_localSharedDropDeliveries.empty())
+            RestoreCommittedSharedDropDeliveries();
+        // Recovery may remove a stale saved source or finish its native pickup.
+        item = CArkItem::GetItemFromEntityId(itemId);
+        if (!item)
+            return true;
+    }
+    auto found = m_sharedDropByEntityId.find(item->GetEntityId());
+    if (found == m_sharedDropByEntityId.end() && offlineHost)
+    {
+        IEntity* entity = item->GetEntity();
+        const char* name = entity ? entity->GetName() : nullptr;
+        uint64_t stableId = 0;
+        if (name && std::strncmp(name, "CoopSharedDrop_", 15) == 0 &&
+            ParsePositiveInteger(std::string(name + 15), stableId))
+        {
+            auto assigned = m_sharedDrops.find(stableId);
+            if (assigned != m_sharedDrops.end() && assigned->second.pickupCommitted &&
+                assigned->second.pickupWinnerPeerHash == GetLocalAccountToken() &&
+                assigned->second.archetypeId == item->GetArchetype())
+            {
+                assigned->second.localEntityId = entity->GetId();
+                found = m_sharedDropByEntityId.emplace(entity->GetId(), stableId).first;
+            }
+            else if (std::any_of(m_localSharedDropDeliveries.begin(), m_localSharedDropDeliveries.end(),
+                [this, stableId, item](const CoopSharedDropDelivery::Entry& row)
+                { return row.hostSessionId == m_sharedDropHostSessionId && row.stableSpawnId == stableId &&
+                    row.archetypeId == item->GetArchetype(); }))
+            {
+                return true;
+            }
+        }
+    }
     if (found == m_sharedDropByEntityId.end())
-        return false;
+    {
+        if (offlineHost)
+            return false;
+        IEntity* entity = gEnv->pEntitySystem->GetEntity(item->GetEntityId());
+        const char* name = entity ? entity->GetName() : nullptr;
+        // A loaded public source must not fall through to per-player loot
+        // while the authoritative replay is still in flight.
+        return name && std::strncmp(name, "CoopSharedDrop_", 15) == 0;
+    }
     auto recordIt = m_sharedDrops.find(found->second);
     if (recordIt == m_sharedDrops.end())
         return false;
 
     SharedDropRecord& record = recordIt->second;
+    if (offlineHost && (!record.pickupCommitted || record.pickupWinnerPeerHash != GetLocalAccountToken()))
+        return false;
+    if (!IsSharedDropWorldReady())
+        return true;
+    if (record.pickupCommitted && record.pickupWinnerPeerHash == GetLocalAccountToken())
+    {
+        TryDeliverCommittedSharedDrop(record);
+        return true;
+    }
+    if (!IsSharedDropServiceReady())
+        return true;
     if (!record.live)
     {
         // Native PickUp can leave its entity interactive while the lerp/removal
@@ -308,12 +512,23 @@ bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerI
         return true;
     }
 
-    // The Host is the arbiter, but its own successful native pickup is the
-    // authoritative transaction. OnNativeSharedItemPicked commits it afterward.
     if (m_networkMode == CoopNetworkMode::Host)
     {
-        record.nativePickupInProgress = true;
-        return false;
+        if (record.pickupPending)
+        {
+            ++m_sharedDropPickupSuppressions;
+            m_lastSharedDropEvent =
+                "suppressed_host_pickup_reserved_id_" + std::to_string(record.stableSpawnId);
+            return true;
+        }
+        // The Host is implicitly ready, but ownership must still be committed
+        // before native PickUp can partially transfer a stack or open overflow.
+        CoopSerialSequence::Advance(m_sharedDropSequence);
+        record.pickupPending = true;
+        record.pickupWinnerPeerHash = GetLocalAccountToken();
+        record.pickupTransactionSequence = m_sharedDropSequence;
+        CommitSharedDropPickup(record, record.pickupWinnerPeerHash, record.pickupTransactionSequence);
+        return true;
     }
 
     if (record.pickupPending)
@@ -327,13 +542,29 @@ bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerI
 
     CoopSerialSequence::Advance(m_sharedDropSequence);
     CoopProtocol::SharedDropPacket packet;
-    if (!BuildSharedDropPacket(packet, CoopProtocol::SharedDropCommand::PickupRequest, record) ||
-        !SendSharedDropTo(packet, m_remoteAddress, m_remotePort, "shared drop pickup request failed"))
+    if (!BuildSharedDropPacket(packet, CoopProtocol::SharedDropCommand::PickupRequest, record))
     {
         ++m_sharedDropDropped;
         return true;
     }
     record.pickupPending = true;
+    record.pickupGrantReceived = false;
+    record.pickupResultSent = false;
+    record.pickupResultSucceeded = false;
+    record.pickupRetrySecondsRemaining = 0.0f;
+    record.pickupCommitted = false;
+    record.pickupDeliveryStored = false;
+    record.localPickupGranted = false;
+    record.pickupWinnerPeerHash = 0;
+    record.pickupTransactionSequence = packet.sequence;
+    if (!SendSharedDropTo(packet, m_remoteAddress, m_remotePort, "shared drop pickup request failed"))
+    {
+        record.pickupPending = false;
+        record.pickupTransactionSequence = 0;
+        ++m_sharedDropDropped;
+        return true;
+    }
+    record.pickupRetrySecondsRemaining = 0.25f;
     ++m_sharedDropPickupRequests;
     m_lastSharedDropEvent =
         "sent_pickup_request_id_" + std::to_string(record.stableSpawnId) +
@@ -341,77 +572,75 @@ bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerI
     return true;
 }
 
-void ModMain::OnNativeSharedItemPicked(EntityId itemEntityId, EntityId pickerId, bool success, const char* reason)
+bool ModMain::CommitSharedDropPickup(
+    SharedDropRecord& record,
+    uint64_t winnerPeerHash,
+    uint32_t transactionSequence)
 {
-    if (m_sharedDropApplyDepth != 0)
-        return;
-    const auto byEntity = m_sharedDropByEntityId.find(itemEntityId);
-    if (byEntity == m_sharedDropByEntityId.end())
-        return;
-    auto recordIt = m_sharedDrops.find(byEntity->second);
-    if (recordIt == m_sharedDrops.end())
-        return;
+    if (m_networkMode != CoopNetworkMode::Host || !record.live || record.pickupCommitted ||
+        !record.pickupPending || winnerPeerHash == 0 || transactionSequence == 0 ||
+        record.pickupWinnerPeerHash != winnerPeerHash || record.pickupTransactionSequence != transactionSequence)
+        return false;
 
-    SharedDropRecord& record = recordIt->second;
-    record.nativePickupInProgress = false;
-    if (!success || !record.live)
+    CoopSharedDropDelivery::Entry delivery;
+    delivery.hostSessionId = EnsureSharedDropHostSessionId();
+    delivery.stableSpawnId = record.stableSpawnId;
+    delivery.archetypeId = record.archetypeId;
+    delivery.count = static_cast<uint32_t>(record.count);
+    delivery.transactionSequence = transactionSequence;
+    delivery.objectVersion = record.version + 1;
+    if (!StoreCommittedSharedDropDelivery(winnerPeerHash, delivery))
     {
-        if (!gEnv || !gEnv->pEntitySystem || !gEnv->pEntitySystem->GetEntity(itemEntityId))
-        {
-            m_sharedDropByEntityId.erase(byEntity);
-            record.localEntityId = INVALID_ENTITYID;
-        }
-        return;
+        ReleaseSharedDropReservation(record, winnerPeerHash, transactionSequence, "ownership_store_failed");
+        ++m_sharedDropDropped;
+        return false;
     }
+
+    record.version = delivery.objectVersion;
+    record.pickupCommitted = true;
     record.live = false;
     record.pickupPending = false;
-    record.localPickupGranted = true;
-    record.pickupWinnerPeerHash = GetLocalAccountToken();
-    record.version += 1;
+    record.pickupGrantReceived = false;
+    record.pickupResultSent = false;
+    record.pickupResultSucceeded = false;
+    record.pickupRetrySecondsRemaining = 0.0f;
+    record.pickupReservationDeadline = {};
+    record.localPickupGranted = false;
+    record.pickupWinnerPeerHash = winnerPeerHash;
+    record.pickupTransactionSequence = transactionSequence;
+    const bool localWinner = winnerPeerHash == GetLocalAccountToken();
+    std::string detail;
+    if (!localWinner)
+        RemoveSharedDropLocal(record, detail);
 
-    IEntity* grantedEntity = gEnv && gEnv->pEntitySystem
-        ? gEnv->pEntitySystem->GetEntity(itemEntityId)
-        : nullptr;
-    CArkItem* grantedItem = grantedEntity
-        ? CArkItem::GetItemFromEntityId(itemEntityId)
-        : nullptr;
-    std::string presentationReason;
-    const bool isWeapon = CoopItemClassification::IsRealWeaponInventoryItem(grantedItem, presentationReason);
-    if (grantedEntity && !isWeapon)
-        SetSharedDropWorldPresentation(*grantedEntity, false, presentationReason);
-
-    // Do not erase the entity binding here. CArkItem::PickUp may keep the world
-    // entity alive during its native lerp, and that exact interval previously
-    // allowed the same shared stack to be picked up repeatedly. OnRemove retires
-    // the binding, or a later Drop replaces it with a fresh shared lifetime.
-    // The tombstone blocks another pickup; do not overwrite the presentation
-    // chosen by native PickUp. In particular, forcing an inventory-owned weapon
-    // invisible/non-physical prevents a later weapon-wheel selection from
-    // completing until the next level load rebuilds the weapon entity.
-    if (!gEnv || !gEnv->pEntitySystem || !gEnv->pEntitySystem->GetEntity(itemEntityId))
+    if (m_hasRemoteEndpoint)
     {
-        m_sharedDropByEntityId.erase(byEntity);
-        record.localEntityId = INVALID_ENTITYID;
-    }
-
-    if (m_networkMode == CoopNetworkMode::Host && m_hasRemoteEndpoint && IsSessionGameplayReady())
-    {
-        CoopSerialSequence::Advance(m_sharedDropSequence);
-        CoopProtocol::SharedDropPacket packet;
+        CoopProtocol::SharedDropPacket commit;
         if (BuildSharedDropPacket(
-                packet,
+                commit,
                 CoopProtocol::SharedDropCommand::PickupCommit,
                 record,
-                GetLocalAccountToken()) &&
-            SendSharedDropTo(packet, m_remoteAddress, m_remotePort, "shared drop pickup commit failed"))
+                winnerPeerHash))
         {
-            ++m_sharedDropPickupCommits;
+            commit.sequence = transactionSequence;
+            if (SendSharedDropTo(commit, m_remoteAddress, m_remotePort, "shared drop pickup commit failed"))
+            {
+                ++m_sharedDropPickupCommits;
+                ++m_sharedDropApplied;
+            }
+            else
+                ++m_sharedDropDropped;
         }
     }
+
+    // Publish the terminal world decision before any local native transfer.
+    // Failed delivery stays assigned and can be retried without restoring loot.
+    if (localWinner)
+        TryDeliverCommittedSharedDrop(record);
     m_lastSharedDropEvent =
-        "local_pickup_id_" + std::to_string(record.stableSpawnId) +
-        "_picker_" + std::to_string(pickerId) +
-        "_reason_" + (reason ? reason : "-");
+        "committed_pickup_id_" + std::to_string(record.stableSpawnId) +
+        "_transaction_" + std::to_string(transactionSequence);
+    return true;
 }
 
 bool ModMain::MaterializeSharedDrop(
@@ -446,9 +675,20 @@ bool ModMain::MaterializeSharedDrop(
     params.qRotation = Quat(packet.qw, packet.qx, packet.qy, packet.qz).GetNormalized();
     params.vScale = Vec3(1.0f);
 
-    IEntity* entity = nullptr;
+    IEntity* entity = gEnv->pEntitySystem->FindEntityByName(name.c_str());
+    if (entity)
+    {
+        CArkItem* existing = CArkItem::GetItemFromEntityId(entity->GetId());
+        ArkInventory* inventory = ArkPlayer::GetInstancePtr() ? ArkPlayer::GetInstance().m_pInventory : nullptr;
+        if (!existing || entity->IsHidden() || (inventory && inventory->Contains(entity->GetId())) ||
+            existing->GetArchetype() != packet.archetypeId || existing->GetCount() != packet.count)
+        {
+            detail = "saved_source_conflict";
+            return false;
+        }
+    }
     ++m_sharedDropApplyDepth;
-    const bool spawned = CoopRuntimeGuards::TryGuardedCall(
+    const bool spawned = entity || CoopRuntimeGuards::TryGuardedCall(
         "shared drop SpawnEntityFromArchetype",
         [&params, archetype]() { return gEnv->pEntitySystem->SpawnEntityFromArchetype(archetype, params, true); },
         entity,
@@ -482,6 +722,8 @@ bool ModMain::MaterializeSharedDrop(
     record.localEntityId = entity->GetId();
     record.version = packet.objectVersion;
     record.count = std::max(1, packet.count);
+    record.position = params.vPosition;
+    record.rotation = params.qRotation;
     record.live = true;
     record.pickupPending = false;
     record.localPickupGranted = false;
@@ -493,9 +735,9 @@ bool ModMain::MaterializeSharedDrop(
     return true;
 }
 
-bool ModMain::RemoveSharedDropLocal(SharedDropRecord& record, bool grantToLocalPlayer, std::string& detail)
+bool ModMain::RemoveSharedDropLocal(SharedDropRecord& record, std::string& detail)
 {
-    IEntity* entity = gEnv && gEnv->pEntitySystem && record.localEntityId != INVALID_ENTITYID
+    IEntity* entity = IsSharedDropWorldReady() && record.areaId == m_localLevelId && record.localEntityId != INVALID_ENTITYID
         ? gEnv->pEntitySystem->GetEntity(record.localEntityId)
         : nullptr;
     if (!entity)
@@ -503,8 +745,8 @@ bool ModMain::RemoveSharedDropLocal(SharedDropRecord& record, bool grantToLocalP
         record.live = false;
         record.pickupPending = false;
         record.localEntityId = INVALID_ENTITYID;
-        detail = grantToLocalPlayer ? "grant_entity_missing" : "already_missing";
-        return !grantToLocalPlayer;
+        detail = "already_missing";
+        return true;
     }
 
     const EntityId entityId = entity->GetId();
@@ -512,19 +754,11 @@ bool ModMain::RemoveSharedDropLocal(SharedDropRecord& record, bool grantToLocalP
     bool ok = false;
     std::string reason;
     ++m_sharedDropApplyDepth;
-    if (grantToLocalPlayer && item && ArkPlayer::GetInstancePtr())
-    {
-        ok = CoopRuntimeGuards::TryGuardedCall(
-            "shared drop committed PickUp",
-            [item]() { return item->PickUp(ArkPlayer::GetInstance().GetEntityId(), false); },
-            ok,
-            &reason) && ok;
-    }
-    else if (!grantToLocalPlayer && item)
+    if (item)
     {
         ok = CoopRuntimeGuards::TryGuardedVoidCall("shared drop RemoveEntity", [item]() { item->RemoveEntity(); }, &reason);
     }
-    if (!grantToLocalPlayer && !ok && gEnv && gEnv->pEntitySystem)
+    if (!ok && gEnv && gEnv->pEntitySystem)
     {
         ok = CoopRuntimeGuards::TryGuardedVoidCall(
             "shared drop entity remove fallback",
@@ -536,47 +770,246 @@ bool ModMain::RemoveSharedDropLocal(SharedDropRecord& record, bool grantToLocalP
     record.live = false;
     record.pickupPending = false;
     record.nativePickupInProgress = false;
-    if (grantToLocalPlayer && ok)
-    {
-        record.localPickupGranted = true;
-        record.pickupWinnerPeerHash = GetLocalAccountToken();
-        IEntity* grantedEntity = gEnv && gEnv->pEntitySystem
-            ? gEnv->pEntitySystem->GetEntity(entityId)
-            : nullptr;
-        const bool isWeapon = CoopItemClassification::IsRealWeaponInventoryItem(item, reason);
-        bool presentationHidden = !grantedEntity;
-        if (grantedEntity && !isWeapon)
-            presentationHidden = SetSharedDropWorldPresentation(*grantedEntity, false, reason);
-        else if (grantedEntity)
-            presentationHidden = grantedEntity->IsHidden();
-        else
-        {
-            m_sharedDropByEntityId.erase(entityId);
-            record.localEntityId = INVALID_ENTITYID;
-        }
-        // The native PickUp stores the item in the player inventory, but the
-        // weapon-component registration (weapon wheel list, quickselect slot,
-        // acquired types) rides on inventory notifications that this grant path
-        // does not reliably produce. Repair idempotently, exactly like the
-        // sidecar inventory path does; no-op for non-weapon items.
-        EnsureLocalPlayerWeaponRegistered(entityId, "shared drop grant");
-        detail =
-            "granted_entity_" + std::to_string(entityId) +
-            "_nativeImmediate_1" +
-            "_entityRetained_" + std::to_string(grantedEntity ? 1 : 0) +
-            "_worldHidden_" + std::to_string(presentationHidden ? 1 : 0);
-        return true;
-    }
-
-    if (!grantToLocalPlayer)
-    {
-        m_sharedDropByEntityId.erase(entityId);
-        record.localEntityId = INVALID_ENTITYID;
-    }
+    m_sharedDropByEntityId.erase(entityId);
+    record.localEntityId = INVALID_ENTITYID;
     detail = ok
         ? "removed_entity_" + std::to_string(entityId)
-        : std::string(grantToLocalPlayer ? "grant_failed_" : "remove_failed_") + reason;
+        : "remove_failed_" + reason;
     return ok;
+}
+
+bool ModMain::SendSharedDropPickupResult(SharedDropRecord& record, bool success)
+{
+    if (record.pickupTransactionSequence == 0 || m_networkMode != CoopNetworkMode::Client ||
+        !IsSharedDropServiceReady())
+    {
+        return false;
+    }
+
+    CoopProtocol::SharedDropPacket packet;
+    if (!BuildSharedDropPacket(packet, CoopProtocol::SharedDropCommand::PickupResult, record, GetSessionHostAccountToken()))
+        return false;
+    packet.sequence = record.pickupTransactionSequence;
+    packet.flags = success ? CoopProtocol::kSharedDropFlagPickupSucceeded : 0u;
+    const bool sent = SendSharedDropTo(
+        packet,
+        m_remoteAddress,
+        m_remotePort,
+        "shared drop pickup result failed");
+    if (sent)
+    {
+        record.pickupResultSent = true;
+        record.pickupResultSucceeded = success;
+        record.pickupRetrySecondsRemaining = 0.0f;
+        m_lastSharedDropEvent =
+            std::string(success ? "sent_pickup_success_id_" : "sent_pickup_failure_id_") +
+            std::to_string(record.stableSpawnId) +
+            "_transaction_" + std::to_string(record.pickupTransactionSequence);
+    }
+    return sent;
+}
+
+bool ModMain::SendSharedDropPickupReady(SharedDropRecord& record, bool ready)
+{
+    CoopProtocol::SharedDropPacket packet;
+    if (!BuildSharedDropPacket(packet, CoopProtocol::SharedDropCommand::PickupReady, record, GetSessionHostAccountToken()))
+        return false;
+    packet.sequence = record.pickupTransactionSequence;
+    packet.flags = ready ? CoopProtocol::kSharedDropFlagPickupSucceeded : 0u;
+    return SendSharedDropTo(packet, m_remoteAddress, m_remotePort, "shared drop pickup ready failed");
+}
+
+void ModMain::RestoreCommittedSharedDropDeliveries()
+{
+    ArkPlayer* player = ArkPlayer::GetInstancePtr();
+    if (!player || !player->GetEntity() || !gEnv || !gEnv->pEntitySystem ||
+        m_sharedDropDeliveryRecoveryRequired || m_sharedDropHostSessionId == 0 ||
+        m_pendingPlayerSidecarInventoryRestore || m_pendingPlayerSidecarChipsetRestore ||
+        m_pendingReceivedPlayerStateApply || m_clientAwaitingHostPlayerState ||
+        m_playerSidecarInventoryPending != 0 || m_playerSidecarChipsetsPending != 0)
+        return;
+
+    for (const CoopSharedDropDelivery::Entry& delivery : m_localSharedDropDeliveries)
+    {
+        if (delivery.hostSessionId != m_sharedDropHostSessionId || delivery.deliveredCount == delivery.count)
+            continue;
+        auto found = m_sharedDrops.find(delivery.stableSpawnId);
+        if (found != m_sharedDrops.end() &&
+            (!found->second.pickupCommitted || found->second.pickupWinnerPeerHash != GetLocalAccountToken() ||
+                found->second.archetypeId != delivery.archetypeId ||
+                found->second.pickupTransactionSequence != delivery.transactionSequence ||
+                found->second.version != delivery.objectVersion))
+            continue;
+        if (found == m_sharedDrops.end() ||
+            !gEnv->pEntitySystem->GetEntity(found->second.localEntityId))
+        {
+            // This is the player's assigned remainder, not a shared world drop.
+            // Rebuild it only after the snapshot containing its receipt applied.
+            CoopProtocol::SharedDropPacket packet;
+            packet.stableSpawnId = delivery.stableSpawnId;
+            packet.areaId = m_localLevelId;
+            packet.archetypeId = delivery.archetypeId;
+            packet.objectVersion = delivery.objectVersion;
+            packet.count = static_cast<int>(delivery.count - delivery.deliveredCount);
+            packet.sourcePeerHash = GetLocalAccountToken();
+            const Vec3 position = player->GetEntity()->GetWorldPos();
+            packet.px = position.x;
+            packet.py = position.y;
+            packet.pz = position.z;
+            SharedDropRecord record;
+            std::string detail;
+            if (!MaterializeSharedDrop(packet, record, detail))
+                continue;
+            record.count = static_cast<int>(delivery.count);
+            record.pickupCommitted = true;
+            record.pickupPending = true;
+            record.pickupGrantReceived = true;
+            record.pickupTransactionSequence = delivery.transactionSequence;
+            record.pickupWinnerPeerHash = GetLocalAccountToken();
+            record.live = false;
+            if (found != m_sharedDrops.end() && found->second.localEntityId != record.localEntityId)
+                m_sharedDropByEntityId.erase(found->second.localEntityId);
+            if (found != m_sharedDrops.end())
+                record.areaId = found->second.areaId;
+            found = m_sharedDrops.insert_or_assign(delivery.stableSpawnId, record).first;
+        }
+        if (found->second.pickupCommitted && !found->second.pickupDeliveryAttempted)
+            TryDeliverCommittedSharedDrop(found->second, false);
+    }
+}
+
+void ModMain::TickSharedDropPickupRetries(float frameTime)
+{
+    RecoverSavedSharedDrops();
+    if (m_networkMode == CoopNetworkMode::Off)
+    {
+        if (HasContinuingHostInventoryWorld() && IsSharedDropWorldReady() && !m_localSharedDropDeliveries.empty())
+            RestoreCommittedSharedDropDeliveries();
+        return;
+    }
+    if (!IsSharedDropServiceReady())
+        return;
+
+    const float delta = std::isfinite(frameTime) && frameTime > 0.0f
+        ? std::min(frameTime, 0.25f)
+        : 0.0f;
+    if (IsSharedDropWorldReady())
+        RestoreCommittedSharedDropDeliveries();
+    if (m_networkMode == CoopNetworkMode::Host)
+    {
+        for (auto& entry : m_sharedDrops)
+        {
+            SharedDropRecord& record = entry.second;
+            if (!record.pickupPending || record.pickupCommitted)
+                continue;
+            if (std::chrono::steady_clock::now() >= record.pickupReservationDeadline)
+                ReleaseSharedDropReservation(record, 0, record.pickupTransactionSequence, "reservation_timeout");
+        }
+        return;
+    }
+    if (m_networkMode != CoopNetworkMode::Client)
+        return;
+
+    for (auto& entry : m_sharedDrops)
+    {
+        SharedDropRecord& record = entry.second;
+        if (!record.pickupPending || record.pickupTransactionSequence == 0 ||
+            record.pickupResultSent)
+            continue;
+
+        record.pickupRetrySecondsRemaining = std::max(
+            0.0f,
+            record.pickupRetrySecondsRemaining - delta);
+        if (record.pickupRetrySecondsRemaining > 0.0f)
+            continue;
+
+        if (!record.pickupGrantReceived)
+        {
+            CoopProtocol::SharedDropPacket request;
+            if (BuildSharedDropPacket(request, CoopProtocol::SharedDropCommand::PickupRequest, record))
+            {
+                request.sequence = record.pickupTransactionSequence;
+                SendSharedDropTo(request, m_remoteAddress, m_remotePort, "shared drop pickup request retry failed");
+            }
+            record.pickupRetrySecondsRemaining = 0.25f;
+        }
+        else
+        {
+            if (record.pickupCommitted)
+            {
+                if (!record.pickupDeliveryAttempted && !record.localPickupGranted)
+                    TryDeliverCommittedSharedDrop(record, false);
+                if (record.localPickupGranted && !record.pickupDeliveryStored)
+                    PersistLocalSharedDropDelivery(record);
+                if (record.localPickupGranted && record.pickupDeliveryStored)
+                    SendSharedDropPickupResult(record, true);
+            }
+            else
+                SendSharedDropPickupReady(record, record.pickupResultSucceeded);
+            record.pickupRetrySecondsRemaining = 0.25f;
+        }
+    }
+}
+
+void ModMain::ReleaseSharedDropReservation(
+    SharedDropRecord& record,
+    uint64_t peerHash,
+    uint32_t transactionSequence,
+    const char* reason)
+{
+    // A committed entitlement is owned even while its recipient is offline.
+    // Only an uncommitted reservation may return to the shared world.
+    if (record.pickupCommitted || !record.live)
+        return;
+    ++record.version;
+    record.live = true;
+    record.pickupPending = false;
+    record.pickupGrantReceived = false;
+    record.pickupResultSent = false;
+    record.pickupResultSucceeded = false;
+    record.pickupRetrySecondsRemaining = 0.0f;
+    record.pickupReservationDeadline = {};
+    record.localPickupGranted = false;
+    record.pickupWinnerPeerHash = 0;
+    record.pickupTransactionSequence = 0;
+
+    if (IEntity* entity = IsSharedDropWorldReady() && record.areaId == m_localLevelId
+            ? gEnv->pEntitySystem->GetEntity(record.localEntityId) : nullptr)
+    {
+        std::string detail;
+        SetSharedDropWorldPresentation(*entity, true, detail);
+    }
+    if (m_networkMode != CoopNetworkMode::Host || !m_hasRemoteEndpoint)
+        return;
+
+    CoopProtocol::SharedDropPacket release;
+    if (BuildSharedDropPacket(release, CoopProtocol::SharedDropCommand::PickupRelease, record, 0))
+    {
+        release.sequence = transactionSequence;
+        const bool sent = SendSharedDropTo(release, m_remoteAddress, m_remotePort, "shared drop pickup release failed");
+        if (sent)
+            ++m_sharedDropPickupSuppressions;
+    }
+    (void)peerHash;
+    m_lastSharedDropEvent =
+        "released_pickup_reservation_id_" + std::to_string(record.stableSpawnId) +
+        "_reason_" + (reason ? reason : "-");
+}
+
+void ModMain::ReleaseSharedDropReservationsForPeer(uint64_t peerHash)
+{
+    if (m_networkMode != CoopNetworkMode::Host || peerHash == 0)
+        return;
+
+    for (auto& entry : m_sharedDrops)
+    {
+        SharedDropRecord& record = entry.second;
+        if (!record.pickupPending || record.pickupCommitted || record.pickupWinnerPeerHash != peerHash)
+            continue;
+
+        const uint32_t transactionSequence = record.pickupTransactionSequence;
+        ReleaseSharedDropReservation(record, 0, transactionSequence, "peer_removed");
+    }
 }
 
 void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
@@ -588,27 +1021,79 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
         (m_networkMode == CoopNetworkMode::Host &&
             (command == CoopProtocol::SharedDropCommand::Spawn ||
                 command == CoopProtocol::SharedDropCommand::PickupRequest ||
+                command == CoopProtocol::SharedDropCommand::PickupReady ||
+                command == CoopProtocol::SharedDropCommand::PickupResult ||
                 command == CoopProtocol::SharedDropCommand::RemoveRequest)) ||
         (m_networkMode == CoopNetworkMode::Client &&
             (command == CoopProtocol::SharedDropCommand::Spawn ||
                 command == CoopProtocol::SharedDropCommand::PickupCommit ||
-                command == CoopProtocol::SharedDropCommand::Remove));
+                command == CoopProtocol::SharedDropCommand::Remove ||
+                command == CoopProtocol::SharedDropCommand::PickupGrant ||
+                command == CoopProtocol::SharedDropCommand::PickupRelease ||
+                command == CoopProtocol::SharedDropCommand::SnapshotEnd));
+    const bool targetAllowsCommand =
+        (m_networkMode == CoopNetworkMode::Host &&
+            (command == CoopProtocol::SharedDropCommand::PickupResult ||
+                command == CoopProtocol::SharedDropCommand::PickupReady) &&
+            packet.targetPeerHash == GetLocalAccountToken()) ||
+        (m_networkMode == CoopNetworkMode::Client &&
+            (command == CoopProtocol::SharedDropCommand::PickupGrant ||
+                command == CoopProtocol::SharedDropCommand::PickupRelease) &&
+            (packet.targetPeerHash == GetLocalAccountToken() ||
+                (command == CoopProtocol::SharedDropCommand::PickupRelease && packet.targetPeerHash == 0))) ||
+        (command != CoopProtocol::SharedDropCommand::PickupResult &&
+            command != CoopProtocol::SharedDropCommand::PickupReady &&
+            command != CoopProtocol::SharedDropCommand::PickupGrant &&
+            command != CoopProtocol::SharedDropCommand::PickupRelease);
+    const auto sourcePeer = m_remotePeers.find(packet.sourcePeerHash);
+    const auto existing = m_sharedDrops.find(packet.stableSpawnId);
+    // A prepared pickup follows its recipient through native travel. Only an
+    // existing committed decision may cross areas; a new pickup may not.
+    const bool assignedDecision = existing != m_sharedDrops.end() &&
+        existing->second.pickupTransactionSequence == packet.sequence &&
+        ((m_networkMode == CoopNetworkMode::Host && existing->second.pickupCommitted &&
+            existing->second.pickupWinnerPeerHash == packet.sourcePeerHash &&
+            (command == CoopProtocol::SharedDropCommand::PickupReady || command == CoopProtocol::SharedDropCommand::PickupResult)) ||
+        (m_networkMode == CoopNetworkMode::Client && existing->second.pickupGrantReceived &&
+            packet.targetPeerHash == GetLocalAccountToken() && command == CoopProtocol::SharedDropCommand::PickupCommit));
+    const bool sourceAreaAllowed = m_networkMode == CoopNetworkMode::Host
+        ? sourcePeer != m_remotePeers.end() && (sourcePeer->second.levelId == packet.areaId || assignedDecision) &&
+            sourcePeer->second.worldEpoch == m_localWorldEpoch &&
+            (sourcePeer->second.sessionFlags & CoopProtocol::kSessionFlagWorldReady) != 0
+        : packet.sourcePeerHash == GetSessionHostAccountToken() && (packet.areaId == m_localLevelId || assignedDecision);
     if (packet.worldEpoch != m_localWorldEpoch ||
         packet.hostSaveKeyHash == 0 ||
         packet.hostSaveKeyHash != CurrentHostSaveKeyHash() ||
-        packet.areaId != m_localLevelId || packet.stableSpawnId == 0 || packet.archetypeId == 0 ||
-        packet.sourcePeerHash == 0 || packet.sourcePeerHash != remotePeerHash || !roleAllowsCommand ||
-        (command == CoopProtocol::SharedDropCommand::Spawn && !IsFiniteTransform(packet)))
+        packet.areaId == 0 || !sourceAreaAllowed ||
+        (command != CoopProtocol::SharedDropCommand::SnapshotEnd && (packet.stableSpawnId == 0 || packet.archetypeId == 0)) ||
+        packet.sourcePeerHash == 0 || packet.sourcePeerHash != remotePeerHash || !roleAllowsCommand || !targetAllowsCommand ||
+        (command == CoopProtocol::SharedDropCommand::Spawn && !IsFiniteTransform(packet)) ||
+        (command == CoopProtocol::SharedDropCommand::Spawn && packet.count <= 0) ||
+        packet.hostSessionId == 0 || packet.hostSessionId != EnsureSharedDropHostSessionId())
     {
         ++m_sharedDropDropped;
         m_lastSharedDropEvent = "rejected_context_or_source";
         return;
     }
 
+    if (command == CoopProtocol::SharedDropCommand::SnapshotEnd)
+    {
+        PruneUnboundSharedDrops();
+        return;
+    }
     auto found = m_sharedDrops.find(packet.stableSpawnId);
     if (command == CoopProtocol::SharedDropCommand::Spawn)
     {
-        if (found != m_sharedDrops.end() && found->second.version >= packet.objectVersion)
+        if (found != m_sharedDrops.end() &&
+            (found->second.areaId != packet.areaId || found->second.archetypeId != packet.archetypeId))
+        {
+            ++m_sharedDropDropped;
+            m_lastSharedDropEvent = "spawn_identity_conflict";
+            return;
+        }
+        if (found != m_sharedDrops.end() && (m_networkMode == CoopNetworkMode::Host || !found->second.live ||
+            (found->second.version >= packet.objectVersion &&
+                (found->second.localEntityId != INVALID_ENTITYID || packet.areaId != m_localLevelId))))
         {
             m_lastSharedDropEvent = "duplicate_spawn_id_" + std::to_string(packet.stableSpawnId);
             return;
@@ -616,11 +1101,27 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
 
         SharedDropRecord record;
         std::string detail;
-        if (!MaterializeSharedDrop(packet, record, detail))
+        if (packet.areaId == m_localLevelId && IsSharedDropWorldReady())
         {
-            ++m_sharedDropDropped;
-            m_lastSharedDropEvent = "spawn_apply_failed_" + detail;
-            return;
+            if (!MaterializeSharedDrop(packet, record, detail))
+            {
+                ++m_sharedDropDropped;
+                m_lastSharedDropEvent = "spawn_apply_failed_" + detail;
+                return;
+            }
+        }
+        else
+        {
+            // The coordinator owns this decision, not an entity in its loaded area.
+            record.stableSpawnId = packet.stableSpawnId;
+            record.areaId = packet.areaId;
+            record.archetypeId = packet.archetypeId;
+            record.ownerPeerHash = packet.sourcePeerHash;
+            record.version = packet.objectVersion;
+            record.count = std::max(1, packet.count);
+            record.live = true;
+            record.position = Vec3(packet.px, packet.py, packet.pz);
+            record.rotation = Quat(packet.qw, packet.qx, packet.qy, packet.qz);
         }
         m_sharedDrops[record.stableSpawnId] = record;
         ++m_sharedDropApplied;
@@ -644,15 +1145,25 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
         return;
     }
     SharedDropRecord& record = found->second;
+    if (record.areaId != packet.areaId || record.archetypeId != packet.archetypeId)
+    {
+        ++m_sharedDropDropped;
+        m_lastSharedDropEvent = "record_identity_conflict";
+        return;
+    }
 
     if (command == CoopProtocol::SharedDropCommand::PickupRequest)
     {
-        if (m_networkMode == CoopNetworkMode::Host && !record.live && record.pickupWinnerPeerHash != 0)
+        if (m_networkMode != CoopNetworkMode::Host || packet.sequence == 0)
         {
-            // A repeated request can arrive after the first reliable commit was
-            // queued. Re-broadcast the same terminal decision; peers apply it
-            // idempotently and only the original winner receives the item.
-            CoopSerialSequence::Advance(m_sharedDropSequence);
+            ++m_sharedDropDropped;
+            return;
+        }
+
+        if (!record.live && record.pickupWinnerPeerHash != 0)
+        {
+            // Requests after a terminal decision receive the existing result;
+            // never answer a terminal record with a live reservation release.
             CoopProtocol::SharedDropPacket commit;
             if (BuildSharedDropPacket(
                     commit,
@@ -660,6 +1171,7 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
                     record,
                     record.pickupWinnerPeerHash))
             {
+                commit.sequence = record.pickupTransactionSequence;
                 SendSharedDropTo(commit, m_remoteAddress, m_remotePort, "shared drop duplicate request commit failed");
             }
             ++m_sharedDropPickupSuppressions;
@@ -667,30 +1179,237 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
             return;
         }
 
-        if (m_networkMode != CoopNetworkMode::Host || !record.live || packet.objectVersion != record.version)
+        if (record.pickupPending)
         {
+            if (record.pickupWinnerPeerHash == packet.sourcePeerHash &&
+                record.pickupTransactionSequence == packet.sequence)
+            {
+                CoopProtocol::SharedDropPacket grant;
+                if (BuildSharedDropPacket(grant, CoopProtocol::SharedDropCommand::PickupGrant, record, packet.sourcePeerHash))
+                {
+                    grant.sequence = packet.sequence;
+                    SendSharedDropToPeer(grant, packet.sourcePeerHash, "shared drop duplicate grant failed");
+                }
+                m_lastSharedDropEvent = "replayed_pickup_grant_id_" + std::to_string(record.stableSpawnId);
+            }
+            else
+            {
+                CoopProtocol::SharedDropPacket release;
+                if (BuildSharedDropPacket(release, CoopProtocol::SharedDropCommand::PickupRelease, record, packet.sourcePeerHash))
+                {
+                    release.sequence = packet.sequence;
+                    SendSharedDropToPeer(release, packet.sourcePeerHash, "shared drop competing request release failed");
+                }
+                ++m_sharedDropPickupSuppressions;
+            }
+            return;
+        }
+
+        if (!record.live || packet.objectVersion != record.version)
+        {
+            if (!record.live)
+            {
+                CoopProtocol::SharedDropPacket removal;
+                if (BuildSharedDropPacket(removal, CoopProtocol::SharedDropCommand::Remove, record))
+                {
+                    removal.sequence = packet.sequence;
+                    SendSharedDropTo(removal, m_remoteAddress, m_remotePort, "shared drop terminal request removal failed");
+                }
+            }
+            else
+            {
+                CoopProtocol::SharedDropPacket release;
+                if (BuildSharedDropPacket(release, CoopProtocol::SharedDropCommand::PickupRelease, record, packet.sourcePeerHash))
+                {
+                    release.sequence = packet.sequence;
+                    SendSharedDropToPeer(release, packet.sourcePeerHash, "shared drop rejected pickup release failed");
+                }
+            }
             ++m_sharedDropDropped;
             m_lastSharedDropEvent = "pickup_request_rejected_id_" + std::to_string(record.stableSpawnId);
             return;
         }
 
         record.version += 1;
-        record.live = false;
-        record.pickupPending = false;
+        record.pickupPending = true;
+        record.pickupGrantReceived = false;
+        record.pickupResultSent = false;
+        record.pickupResultSucceeded = false;
+        record.pickupRetrySecondsRemaining = 0.0f;
+        record.pickupReservationDeadline = std::chrono::steady_clock::now() + kSharedDropReservationTimeout;
+        record.pickupCommitted = false;
         record.pickupWinnerPeerHash = packet.sourcePeerHash;
-        std::string detail;
-        RemoveSharedDropLocal(record, false, detail);
-        CoopSerialSequence::Advance(m_sharedDropSequence);
-        CoopProtocol::SharedDropPacket commit;
-        if (!BuildSharedDropPacket(commit, CoopProtocol::SharedDropCommand::PickupCommit, record, packet.sourcePeerHash) ||
-            !SendSharedDropTo(commit, m_remoteAddress, m_remotePort, "shared drop pickup commit failed"))
+        record.pickupTransactionSequence = packet.sequence;
+
+        CoopProtocol::SharedDropPacket grant;
+        if (!BuildSharedDropPacket(grant, CoopProtocol::SharedDropCommand::PickupGrant, record, packet.sourcePeerHash))
+        {
+            ReleaseSharedDropReservation(record, packet.sourcePeerHash, packet.sequence, "grant_build_failed");
+            ++m_sharedDropDropped;
+            return;
+        }
+        grant.sequence = packet.sequence;
+        if (!SendSharedDropToPeer(grant, packet.sourcePeerHash, "shared drop pickup grant failed"))
+        {
+            ReleaseSharedDropReservation(record, packet.sourcePeerHash, packet.sequence, "grant_send_failed");
+            ++m_sharedDropDropped;
+            return;
+        }
+        if (IEntity* entity = IsSharedDropWorldReady() && record.areaId == m_localLevelId
+                ? gEnv->pEntitySystem->GetEntity(record.localEntityId) : nullptr)
+        {
+            std::string detail;
+            SetSharedDropWorldPresentation(*entity, false, detail);
+        }
+        ++m_sharedDropPickupRequests;
+        m_lastSharedDropEvent =
+            "reserved_pickup_id_" + std::to_string(record.stableSpawnId) +
+            "_transaction_" + std::to_string(packet.sequence);
+        return;
+    }
+
+    if (command == CoopProtocol::SharedDropCommand::PickupReady)
+    {
+        const bool success = (packet.flags & CoopProtocol::kSharedDropFlagPickupSucceeded) != 0;
+        const bool activeReservation =
+            record.pickupPending &&
+            record.pickupWinnerPeerHash == packet.sourcePeerHash &&
+            record.pickupTransactionSequence == packet.sequence &&
+            record.version == packet.objectVersion;
+        if (!activeReservation)
+        {
+            // Preparation is side-effect free. A delayed Ready can only replay
+            // its already committed decision, never create a new reservation.
+            if (record.pickupCommitted &&
+                record.pickupWinnerPeerHash == packet.sourcePeerHash &&
+                record.pickupTransactionSequence == packet.sequence)
+            {
+                CoopProtocol::SharedDropPacket commit;
+                if (BuildSharedDropPacket(commit, CoopProtocol::SharedDropCommand::PickupCommit, record, packet.sourcePeerHash))
+                {
+                    commit.sequence = packet.sequence;
+                    SendSharedDropTo(commit, m_remoteAddress, m_remotePort, "shared drop replayed result commit failed");
+                }
+            }
+            else
+            {
+                ++m_sharedDropDropped;
+                m_lastSharedDropEvent = "pickup_ready_rejected_id_" + std::to_string(record.stableSpawnId);
+            }
+            return;
+        }
+
+        if (!success)
+        {
+            ReleaseSharedDropReservation(record, packet.sourcePeerHash, packet.sequence, "client_not_ready");
+            ++m_sharedDropPickupSuppressions;
+            return;
+        }
+
+        CommitSharedDropPickup(record, packet.sourcePeerHash, packet.sequence);
+        return;
+    }
+
+    if (command == CoopProtocol::SharedDropCommand::PickupResult)
+    {
+        // This acknowledges delivery only. Ownership was persisted before the
+        // commit, and even a failed/absent acknowledgement cannot undo it.
+        if (!record.pickupCommitted || record.pickupWinnerPeerHash != packet.sourcePeerHash ||
+            record.pickupTransactionSequence != packet.sequence || record.version != packet.objectVersion)
         {
             ++m_sharedDropDropped;
             return;
         }
-        ++m_sharedDropPickupCommits;
-        ++m_sharedDropApplied;
-        m_lastSharedDropEvent = "committed_remote_pickup_id_" + std::to_string(record.stableSpawnId);
+        record.pickupResultSucceeded = (packet.flags & CoopProtocol::kSharedDropFlagPickupSucceeded) != 0;
+        return;
+    }
+
+    if (command == CoopProtocol::SharedDropCommand::PickupGrant)
+    {
+        if (m_networkMode != CoopNetworkMode::Client ||
+            !record.pickupPending || packet.sequence == 0 ||
+            packet.sequence != record.pickupTransactionSequence)
+        {
+            ++m_sharedDropDropped;
+            m_lastSharedDropEvent = "stale_pickup_grant_id_" + std::to_string(record.stableSpawnId);
+            return;
+        }
+
+        if (record.pickupGrantReceived)
+        {
+            if (!record.pickupCommitted)
+                SendSharedDropPickupReady(record, record.pickupResultSucceeded);
+            return;
+        }
+        if (!record.live || packet.objectVersion != record.version + 1)
+        {
+            ++m_sharedDropDropped;
+            m_lastSharedDropEvent = "invalid_pickup_grant_version_id_" + std::to_string(record.stableSpawnId);
+            return;
+        }
+
+        record.version = packet.objectVersion;
+        record.pickupGrantReceived = true;
+        record.pickupRetrySecondsRemaining = 0.0f;
+        record.pickupWinnerPeerHash = GetLocalAccountToken();
+        const bool ready = ArkPlayer::GetInstancePtr() && m_enablePlayerSidecar &&
+            CArkItem::GetItemFromEntityId(record.localEntityId) &&
+            SaveLocalPlayerSidecar("recovery journal: shared drop prepared");
+        if (ready && !WriteLocalPlayerRecoveryJournal("shared drop prepared"))
+        {
+            m_localInventoryDirty = true;
+            m_localInventoryDirtySaveKey = m_currentHostSaveStateKey;
+            m_localInventoryDirtyHostAccountToken = GetSessionHostAccountToken();
+        }
+        record.pickupResultSucceeded = ready;
+        if (IEntity* entity = gEnv && gEnv->pEntitySystem ? gEnv->pEntitySystem->GetEntity(record.localEntityId) : nullptr)
+        {
+            std::string detail;
+            SetSharedDropWorldPresentation(*entity, false, detail);
+        }
+        SendSharedDropPickupReady(record, ready);
+        return;
+    }
+
+    if (command == CoopProtocol::SharedDropCommand::PickupRelease)
+    {
+        const bool peerRemovalRelease = packet.targetPeerHash == 0;
+        if (m_networkMode != CoopNetworkMode::Client || packet.sequence == 0 ||
+            (!peerRemovalRelease && packet.sequence != record.pickupTransactionSequence) ||
+            packet.objectVersion < record.version ||
+            (peerRemovalRelease && packet.objectVersion == record.version) ||
+            (packet.flags & CoopProtocol::kSharedDropFlagLive) == 0)
+        {
+            ++m_sharedDropDropped;
+            m_lastSharedDropEvent = "stale_pickup_release_id_" + std::to_string(record.stableSpawnId);
+            return;
+        }
+
+        if (record.pickupCommitted || record.localPickupGranted)
+        {
+            // Preserve a successful local native pickup if its matching
+            // reservation release is replayed by the reliable transport.
+            SendSharedDropPickupResult(record, true);
+            m_lastSharedDropEvent = "pickup_release_after_success_id_" + std::to_string(record.stableSpawnId);
+            return;
+        }
+
+        record.version = packet.objectVersion;
+        record.live = true;
+        record.pickupPending = false;
+        record.pickupGrantReceived = false;
+        record.pickupResultSent = false;
+        record.pickupResultSucceeded = false;
+        record.pickupRetrySecondsRemaining = 0.0f;
+        record.localPickupGranted = false;
+        record.pickupWinnerPeerHash = 0;
+        record.pickupTransactionSequence = 0;
+        if (IEntity* entity = gEnv && gEnv->pEntitySystem ? gEnv->pEntitySystem->GetEntity(record.localEntityId) : nullptr)
+        {
+            std::string detail;
+            SetSharedDropWorldPresentation(*entity, true, detail);
+        }
+        m_lastSharedDropEvent = "pickup_released_id_" + std::to_string(record.stableSpawnId);
         return;
     }
 
@@ -731,7 +1450,7 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
         record.nativePickupInProgress = false;
         record.pickupWinnerPeerHash = 0;
         std::string detail;
-        RemoveSharedDropLocal(record, false, detail);
+        RemoveSharedDropLocal(record, detail);
         CoopSerialSequence::Advance(m_sharedDropSequence);
         CoopProtocol::SharedDropPacket commit;
         if (!BuildSharedDropPacket(commit, CoopProtocol::SharedDropCommand::Remove, record) ||
@@ -752,15 +1471,47 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
             ++m_sharedDropDuplicateCommits;
             return;
         }
-        record.version = packet.objectVersion;
-        record.pickupPending = false;
-        record.pickupWinnerPeerHash = packet.targetPeerHash;
         const bool grant =
             command == CoopProtocol::SharedDropCommand::PickupCommit &&
             packet.targetPeerHash == GetLocalAccountToken();
+
+        if (grant)
+        {
+            if (!record.pickupGrantReceived ||
+                packet.sequence == 0 || packet.sequence != record.pickupTransactionSequence)
+            {
+                ++m_sharedDropDropped;
+                m_lastSharedDropEvent = "pickup_commit_without_prepare_id_" +
+                    std::to_string(record.stableSpawnId);
+                return;
+            }
+            record.version = packet.objectVersion;
+            record.live = false;
+            record.pickupCommitted = true;
+            record.pickupPending = true;
+            record.pickupResultSent = false;
+            record.pickupResultSucceeded = false;
+            record.pickupWinnerPeerHash = packet.targetPeerHash;
+            TryDeliverCommittedSharedDrop(record);
+            if (record.localPickupGranted && record.pickupDeliveryStored)
+                SendSharedDropPickupResult(record, true);
+            ++m_sharedDropApplied;
+            m_lastSharedDropEvent = "finalized_local_pickup_id_" +
+                std::to_string(record.stableSpawnId) +
+                "_transaction_" + std::to_string(packet.sequence);
+            return;
+        }
+
+        record.version = packet.objectVersion;
+        record.pickupPending = false;
+        record.pickupGrantReceived = false;
+        record.pickupResultSent = false;
+        record.pickupResultSucceeded = false;
+        record.pickupWinnerPeerHash = packet.targetPeerHash;
+        record.pickupTransactionSequence = packet.sequence;
         std::string detail;
         record.nativePickupInProgress = true;
-        const bool removed = RemoveSharedDropLocal(record, grant, detail);
+        const bool removed = RemoveSharedDropLocal(record, detail);
         record.nativePickupInProgress = false;
         if (!removed)
         {
@@ -779,12 +1530,213 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
     m_lastSharedDropEvent = "unknown_command_" + std::to_string(packet.command);
 }
 
-void ModMain::ResetSharedDropState(const char* reason)
+void ModMain::RecoverSavedSharedDrops()
 {
-    // A reconnect/reset must not leave network-materialized world replicas
-    // behind as ordinary loot. Preserve inventory-owned entities and the
-    // locally originated Vanilla drop; remove remote or orphan world copies
-    // before forgetting their stable records.
+    if (!m_sharedDropRecoveryRequired || m_networkMode != CoopNetworkMode::Host ||
+        !IsSharedDropWorldReady() || !m_localLevelId || !ArkPlayer::GetInstance().m_pInventory)
+        return;
+    IEntityItPtr iterator = gEnv->pEntitySystem->GetEntityIterator();
+    if (!iterator)
+        return;
+    ArkInventory* inventory = ArkPlayer::GetInstance().m_pInventory;
+    std::vector<EntityId> stale;
+    iterator->MoveFirst();
+    while (!iterator->IsEnd())
+    {
+        IEntity* entity = iterator->Next();
+        const char* name = entity ? entity->GetName() : nullptr;
+        if (!name || std::strncmp(name, "CoopSharedDrop_", 15) != 0)
+            continue;
+        const std::string idText(name + 15);
+        if (idText.empty() || idText.find_first_not_of("0123456789") != std::string::npos)
+            continue;
+        uint64_t stableId = 0;
+        if (!ParsePositiveInteger(idText, stableId))
+            continue;
+        CArkItem* item = CArkItem::GetItemFromEntityId(entity->GetId());
+        if (!item || item->GetCount() <= 0)
+            continue;
+        auto known = m_sharedDrops.find(stableId);
+        if (inventory->Contains(entity->GetId()))
+        {
+            // During a same-world stop/rehost, vanilla may have collected the
+            // source offline. Its native inventory membership wins; do not
+            // replay the old live catalog entry as another public copy.
+            if (known != m_sharedDrops.end() && known->second.areaId == m_localLevelId &&
+                known->second.archetypeId == item->GetArchetype())
+            {
+                known->second.live = false;
+                known->second.pickupPending = false;
+                known->second.localEntityId = INVALID_ENTITYID;
+                m_sharedDropByEntityId.erase(entity->GetId());
+            }
+            continue;
+        }
+        const auto assigned = std::find_if(m_localSharedDropDeliveries.begin(), m_localSharedDropDeliveries.end(),
+            [this, stableId, item](const CoopSharedDropDelivery::Entry& delivery)
+            {
+                return delivery.hostSessionId == m_sharedDropHostSessionId &&
+                    delivery.stableSpawnId == stableId && delivery.archetypeId == item->GetArchetype();
+            });
+        if (assigned != m_localSharedDropDeliveries.end())
+        {
+            // Native overflow can save an uncollected private remainder. Its
+            // receipt reconstructs it; it must never become public loot again.
+            stale.push_back(entity->GetId());
+            continue;
+        }
+        if (known != m_sharedDrops.end())
+        {
+            SharedDropRecord& record = known->second;
+            if (record.areaId != m_localLevelId || record.archetypeId != item->GetArchetype() ||
+                (record.live && record.count != item->GetCount()))
+                continue;
+            if (!record.live || (record.localEntityId != INVALID_ENTITYID &&
+                record.localEntityId != entity->GetId() && gEnv->pEntitySystem->GetEntity(record.localEntityId)))
+            {
+                stale.push_back(entity->GetId());
+                continue;
+            }
+            record.localEntityId = entity->GetId();
+            record.position = entity->GetWorldPos();
+            record.rotation = entity->GetWorldRotation();
+            m_sharedDropByEntityId[entity->GetId()] = stableId;
+            RetireLivePropTrackingForSharedDrop(entity->GetId());
+            std::string detail;
+            SetSharedDropWorldPresentation(*entity, !record.pickupPending, detail);
+            continue;
+        }
+        if (entity->IsHidden())
+            continue;
+        SharedDropRecord record;
+        record.stableSpawnId = stableId;
+        record.areaId = m_localLevelId;
+        record.archetypeId = item->GetArchetype();
+        record.ownerPeerHash = GetLocalAccountToken();
+        record.localEntityId = entity->GetId();
+        record.version = 1;
+        record.count = item->GetCount();
+        record.live = true;
+        record.position = entity->GetWorldPos();
+        record.rotation = entity->GetWorldRotation();
+        m_sharedDrops.emplace(stableId, record);
+        m_sharedDropByEntityId[entity->GetId()] = stableId;
+        RetireLivePropTrackingForSharedDrop(entity->GetId());
+    }
+    // Do not invalidate the native iterator while examining saved sources.
+    ++m_sharedDropApplyDepth;
+    for (EntityId id : stale)
+    {
+        const auto binding = m_sharedDropByEntityId.find(id);
+        if (binding != m_sharedDropByEntityId.end())
+        {
+            auto record = m_sharedDrops.find(binding->second);
+            if (record != m_sharedDrops.end() && record->second.localEntityId == id)
+                record->second.localEntityId = INVALID_ENTITYID;
+            m_sharedDropByEntityId.erase(binding);
+        }
+        gEnv->pEntitySystem->RemoveEntity(id, true);
+    }
+    --m_sharedDropApplyDepth;
+    // A peer can publish a new source while the coordinator is in another
+    // area. On returning, that source has metadata but no native save entity.
+    for (auto& entry : m_sharedDrops)
+    {
+        SharedDropRecord& record = entry.second;
+        if (record.areaId != m_localLevelId || !record.live ||
+            record.localEntityId != INVALID_ENTITYID)
+            continue;
+        CoopProtocol::SharedDropPacket packet;
+        SharedDropRecord materialized;
+        std::string detail;
+        if (BuildSharedDropPacket(packet, CoopProtocol::SharedDropCommand::Spawn, record) &&
+            MaterializeSharedDrop(packet, materialized, detail))
+            record.localEntityId = materialized.localEntityId;
+    }
+    m_sharedDropRecoveryRequired = false;
+}
+
+void ModMain::PruneUnboundSharedDrops()
+{
+    if (!gEnv || !gEnv->pEntitySystem || !ArkPlayer::GetInstancePtr())
+        return;
+    ArkInventory* inventory = ArkPlayer::GetInstance().m_pInventory;
+    if (!inventory)
+        return;
+    std::vector<EntityId> stale;
+    IEntityItPtr iterator = gEnv->pEntitySystem->GetEntityIterator();
+    if (!iterator)
+        return;
+    iterator->MoveFirst();
+    while (!iterator->IsEnd())
+    {
+        IEntity* entity = iterator->Next();
+        const char* name = entity ? entity->GetName() : nullptr;
+        if (name && std::strncmp(name, "CoopSharedDrop_", 15) == 0 &&
+            !inventory->Contains(entity->GetId()) && !m_sharedDropByEntityId.count(entity->GetId()))
+            stale.push_back(entity->GetId());
+    }
+    ++m_sharedDropApplyDepth;
+    for (EntityId id : stale)
+        gEnv->pEntitySystem->RemoveEntity(id, true);
+    --m_sharedDropApplyDepth;
+}
+
+void ModMain::ReplaySharedDrops()
+{
+    RecoverSavedSharedDrops();
+    EnsureSharedDropHostSessionId();
+    const auto peer = m_remotePeers.find(GetRemoteAccountToken());
+    if (peer == m_remotePeers.end() || peer->second.levelId == 0)
+        return;
+    const uint64_t replayArea = peer->second.levelId;
+    auto queue = [this](const CoopProtocol::SharedDropPacket& packet)
+    {
+        // This peer just reported WorldReady. The aggregate session gate is
+        // updated later; do not broadcast or gate this targeted initial replay.
+        if (QueueReliablePayloadToEndpoint(static_cast<uint16_t>(CoopProtocol::PacketType::SharedDrop),
+                &packet, sizeof(packet), m_remoteAddress, m_remotePort,
+                GetLocalAccountToken(), "shared drop replay failed"))
+            ++m_sharedDropSent;
+    };
+    for (const auto& entry : m_sharedDrops)
+    {
+        const SharedDropRecord& record = entry.second;
+        const bool assignedRecipient = record.pickupCommitted &&
+            record.pickupWinnerPeerHash == peer->first && !record.pickupResultSucceeded;
+        if (!assignedRecipient && (!record.live || record.pickupCommitted || record.areaId != replayArea))
+            continue;
+        CoopProtocol::SharedDropPacket packet;
+        if (BuildSharedDropPacket(packet, assignedRecipient ? CoopProtocol::SharedDropCommand::PickupCommit :
+                CoopProtocol::SharedDropCommand::Spawn, record, assignedRecipient ? peer->first : 0))
+        {
+            if (assignedRecipient)
+                packet.sequence = record.pickupTransactionSequence;
+            queue(packet);
+        }
+    }
+    // Same reliable stream: prune stale snapshot copies only after all live
+    // sources have been adopted. Inventory-owned objects are never pruned.
+    CoopProtocol::SharedDropPacket end = {};
+    end.command = static_cast<uint16_t>(CoopProtocol::SharedDropCommand::SnapshotEnd);
+    end.worldEpoch = m_localWorldEpoch;
+    end.areaId = replayArea;
+    end.hostSaveKeyHash = CurrentHostSaveKeyHash();
+    end.hostSessionId = m_sharedDropHostSessionId;
+    end.sourcePeerHash = GetLocalAccountToken();
+    queue(end);
+}
+
+void ModMain::ResetSharedDropState(const char* reason, bool preserveAreaDrops)
+{
+    if (preserveAreaDrops)
+    {
+        DetachSharedDropEntities();
+        return;
+    }
+    // Visible marked sources belong to the native world, including loaded
+    // checkpoints. Keep them for adoption/replay; only hidden orphan objects
+    // are disposable. Marker-aware pickup blocks the unbound interval.
     std::unordered_set<EntityId> preservedEntityIds;
     const uint64_t localAccountToken = GetLocalAccountToken();
     for (const auto& entry : m_sharedDrops)
@@ -800,7 +1752,12 @@ void ModMain::ResetSharedDropState(const char* reason)
         unsigned ownerId = 0;
         if (item)
             CoopRuntimeGuards::TryGuardedCall("shared drop reset owner", [item]() { return item->GetOwnerId(); }, ownerId, nullptr);
-        if (ownerId != 0 || (record.live && record.ownerPeerHash == localAccountToken))
+        bool inInventory = false;
+        ArkInventory* inventory = ArkPlayer::GetInstancePtr() ? ArkPlayer::GetInstance().m_pInventory : nullptr;
+        if (inventory)
+            CoopRuntimeGuards::TryGuardedCall("shared drop reset membership", [inventory, &record]()
+                { return inventory->Contains(record.localEntityId); }, inInventory, nullptr);
+        if (inInventory || (record.live && record.ownerPeerHash == localAccountToken))
             preservedEntityIds.insert(record.localEntityId);
     }
 
@@ -825,7 +1782,12 @@ void ModMain::ResetSharedDropState(const char* reason)
                 unsigned ownerId = 0;
                 if (item)
                     CoopRuntimeGuards::TryGuardedCall("shared drop orphan owner", [item]() { return item->GetOwnerId(); }, ownerId, nullptr);
-                if (ownerId == 0)
+                bool inInventory = false;
+                ArkInventory* inventory = ArkPlayer::GetInstancePtr() ? ArkPlayer::GetInstance().m_pInventory : nullptr;
+                if (inventory)
+                    CoopRuntimeGuards::TryGuardedCall("shared drop orphan membership", [inventory, entity]()
+                        { return inventory->Contains(entity->GetId()); }, inInventory, nullptr);
+                if (!inInventory && entity->IsHidden())
                     staleWorldEntities.push_back(entity->GetId());
             }
         }
@@ -833,6 +1795,7 @@ void ModMain::ResetSharedDropState(const char* reason)
 
     m_sharedDrops.clear();
     m_sharedDropByEntityId.clear();
+    m_sharedDropRecoveryRequired = true;
     m_sharedDropApplyDepth = 1;
     for (const EntityId entityId : staleWorldEntities)
     {
@@ -998,6 +1961,11 @@ bool ModMain::DebugSharedDropCommand(
         }
         if (entity)
             CoopRuntimeGuards::TryGuardedCall("shared drop debug hidden", [entity]() { return entity->IsHidden(); }, hidden, nullptr);
+        const auto delivery = std::find_if(m_localSharedDropDeliveries.begin(), m_localSharedDropDeliveries.end(),
+            [this, &record](const CoopSharedDropDelivery::Entry& entry)
+            {
+                return entry.hostSessionId == m_sharedDropHostSessionId && entry.stableSpawnId == record.stableSpawnId;
+            });
         return
             "stable_" + std::to_string(record.stableSpawnId) +
             "_entity_" + std::to_string(record.localEntityId) +
@@ -1006,6 +1974,10 @@ bool ModMain::DebugSharedDropCommand(
             "_live_" + std::to_string(record.live ? 1 : 0) +
             "_pending_" + std::to_string(record.pickupPending ? 1 : 0) +
             "_granted_" + std::to_string(record.localPickupGranted ? 1 : 0) +
+            "_committed_" + std::to_string(record.pickupCommitted ? 1 : 0) +
+            "_stored_" + std::to_string(record.pickupDeliveryStored ? 1 : 0) +
+            "_attempted_" + std::to_string(record.pickupDeliveryAttempted ? 1 : 0) +
+            "_received_" + std::to_string(delivery == m_localSharedDropDeliveries.end() ? 0 : delivery->deliveredCount) +
             "_version_" + std::to_string(record.version) +
             "_arch_" + std::to_string(record.archetypeId) +
             "_count_" + std::to_string(record.count) +
@@ -1070,6 +2042,11 @@ void ModMain::OnSharedDropEntityRemoved(EntityId entityId)
 
     if (record == m_sharedDrops.end() || !record->second.live)
         return;
+    if (m_arkLevelTransitionLoadActive || m_saveLoadGuardActive || m_runtimeTransitionCleanupPrepared)
+    {
+        m_sharedDropRecoveryRequired = true;
+        return;
+    }
 
     // Unexpected native retirement is terminal rather than permission to
     // materialize a replacement. The Host publishes that fail-closed decision
@@ -1080,9 +2057,7 @@ void ModMain::OnSharedDropEntityRemoved(EntityId entityId)
     removedRecord.localPickupGranted = false;
     removedRecord.nativePickupInProgress = false;
     removedRecord.pickupWinnerPeerHash = 0;
-    if (m_networkMode == CoopNetworkMode::Host &&
-        m_hasRemoteEndpoint &&
-        IsSessionGameplayReady())
+    if (m_networkMode == CoopNetworkMode::Host && IsSharedDropServiceReady())
     {
         removedRecord.version += 1;
         CoopSerialSequence::Advance(m_sharedDropSequence);
@@ -1095,8 +2070,7 @@ void ModMain::OnSharedDropEntityRemoved(EntityId entityId)
     }
     else if (locallyRecycled &&
         m_networkMode == CoopNetworkMode::Client &&
-        m_hasRemoteEndpoint &&
-        IsSessionGameplayReady())
+        IsSharedDropServiceReady())
     {
         CoopSerialSequence::Advance(m_sharedDropSequence);
         CoopProtocol::SharedDropPacket packet;
@@ -1153,15 +2127,21 @@ void ModMain::OnRemoteRecyclerGrenadeDestroyedForHook(CArkProjectileRecyclerGren
     }
 }
 
-bool ModMain::ShouldSuppressRemoteRecyclerForSharedDrop(
+bool ModMain::ShouldSuppressRecyclerForSharedDrop(
     const CArkProjectileRecyclerGrenade* grenade,
     EntityId targetEntityId) const
 {
     // Recycler processing continues for several frames after Detonate returns,
     // and its entity can retire before those callbacks. Track the native
     // recycler object until Destroy rather than relying on either short lifetime.
-    return grenade &&
-        m_remoteRecyclerGrenades.find(grenade) != m_remoteRecyclerGrenades.end() &&
-        targetEntityId != INVALID_ENTITYID &&
-        m_sharedDropByEntityId.find(targetEntityId) != m_sharedDropByEntityId.end();
+    if (!grenade || targetEntityId == INVALID_ENTITYID)
+        return false;
+    const auto binding = m_sharedDropByEntityId.find(targetEntityId);
+    if (binding == m_sharedDropByEntityId.end())
+        return false;
+    const auto record = m_sharedDrops.find(binding->second);
+    if (record != m_sharedDrops.end() &&
+        (record->second.pickupPending || record->second.pickupCommitted))
+        return true;
+    return m_remoteRecyclerGrenades.find(grenade) != m_remoteRecyclerGrenades.end();
 }

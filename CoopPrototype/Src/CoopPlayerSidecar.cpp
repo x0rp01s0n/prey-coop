@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <charconv>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -356,12 +357,25 @@ struct RecoveryJournalMetadata
 {
     uint64_t accountToken = 0;
     uint64_t hostAccountToken = 0;
+    uint64_t timelineId = 0;
     uint64_t revision = 0;
     std::string saveKey;
 };
 
 bool StartsWith(std::string_view value, std::string_view prefix);
 std::string AfterPrefix(std::string_view value, std::string_view prefix);
+
+bool IsRecoverySaveKey(std::string_view key)
+{
+    if (key.empty() || key.size() >= CoopProtocol::kSaveKeySize ||
+        key == "." || key == ".." || key == "-" || key == "0" || key == "unknown_save")
+        return false;
+    return std::all_of(key.begin(), key.end(), [](unsigned char ch)
+    {
+        return (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' || ch == '.';
+    });
+}
 
 bool ParseRecoveryJournalUint64(std::string_view text, uint64_t& value)
 {
@@ -405,34 +419,99 @@ bool ParseRecoveryJournalMetadata(
 
     bool hasAccount = false;
     bool hasHostAccount = false;
+    bool hasTimeline = false;
     bool hasSaveKey = false;
     bool hasRevision = false;
+    unsigned seenFields = 0;
     std::istringstream input(payload);
     input.imbue(std::locale::classic());
     std::string line;
     while (std::getline(input, line))
     {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        unsigned field = 0;
+        if (StartsWith(line, "recoveryAccount=")) field = 1;
+        else if (StartsWith(line, "recoveryHost=")) field = 2;
+        else if (StartsWith(line, "recoveryTimeline=")) field = 4;
+        else if (StartsWith(line, "recoverySaveKey=")) field = 8;
+        else if (StartsWith(line, "recoveryRevision=")) field = 16;
+        if ((seenFields & field) != 0)
+            return false;
+        seenFields |= field;
         if (StartsWith(line, "recoveryAccount="))
             hasAccount = ParseRecoveryJournalUint64(AfterPrefix(line, "recoveryAccount="), metadata.accountToken);
         else if (StartsWith(line, "recoveryHost="))
             hasHostAccount = ParseRecoveryJournalUint64(AfterPrefix(line, "recoveryHost="), metadata.hostAccountToken);
+        else if (StartsWith(line, "recoveryTimeline="))
+            hasTimeline = ParseRecoveryJournalUint64(AfterPrefix(line, "recoveryTimeline="), metadata.timelineId);
         else if (StartsWith(line, "recoverySaveKey="))
         {
             metadata.saveKey = AfterPrefix(line, "recoverySaveKey=");
-            hasSaveKey = !metadata.saveKey.empty();
+            hasSaveKey = IsRecoverySaveKey(metadata.saveKey);
         }
         else if (StartsWith(line, "recoveryRevision="))
         {
-            std::istringstream revisionStream(AfterPrefix(line, "recoveryRevision="));
-            revisionStream.imbue(std::locale::classic());
-            revisionStream >> metadata.revision;
-            hasRevision = !revisionStream.fail() && metadata.revision != 0;
+            const std::string value = AfterPrefix(line, "recoveryRevision=");
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), metadata.revision);
+            hasRevision = parsed.ec == std::errc() && parsed.ptr == value.data() + value.size() && metadata.revision != 0;
         }
     }
 
     if (outPayload)
         *outPayload = std::move(payload);
-    return hasAccount && hasHostAccount && hasSaveKey && hasRevision;
+    return hasAccount && hasHostAccount && hasTimeline && hasSaveKey && hasRevision;
+}
+
+std::string RebindRecoveryJournalSaveKey(const std::string& payload, const std::string& saveKey)
+{
+    std::istringstream input(payload);
+    std::ostringstream output;
+    input.imbue(std::locale::classic());
+    output.imbue(std::locale::classic());
+    std::string line;
+    unsigned replacements = 0;
+    while (std::getline(input, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (StartsWith(line, "recoverySaveKey="))
+        {
+            output << "recoverySaveKey=" << saveKey << '\n';
+            ++replacements;
+        }
+        else
+            output << line << '\n';
+    }
+    return replacements == 1 ? output.str() : std::string();
+}
+
+uint64_t ReadPlayerSidecarSnapshotRevision(const std::string& path)
+{
+    std::string payload, reason;
+    bool hasHash = false;
+    if (!ReadAndValidatePlayerSidecarFile(path, payload, hasHash, reason) || !hasHash)
+        return 0;
+    std::istringstream input(payload);
+    input.imbue(std::locale::classic());
+    std::string line;
+    uint64_t revision = 0;
+    bool seenRevision = false;
+    while (std::getline(input, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back();
+        if (!StartsWith(line, "recoveryRevision="))
+            continue;
+        if (seenRevision)
+            return 0;
+        seenRevision = true;
+        const std::string value = AfterPrefix(line, "recoveryRevision=");
+        const auto parsed = std::from_chars(value.data(), value.data() + value.size(), revision);
+        if (parsed.ec != std::errc() || parsed.ptr != value.data() + value.size() || revision == 0)
+            return 0;
+    }
+    return revision;
 }
 
 uint64_t GetRecoveryJournalDiskMaxRevision(
@@ -781,7 +860,8 @@ ModMain::PlayerInventoryItemState BuildInventoryStateFromNativeItem(const Native
 
 void NormalizePlayerSidecarInventoryFromNativeCapture(ModMain::PlayerSidecarState& state)
 {
-    if (!state.hasNativeCapture ||
+    if (state.hasSharedDropDeliveries ||
+        !state.hasNativeCapture ||
         !state.nativeCapture.sawInventoryWrite ||
         state.nativeCapture.items.empty())
     {
@@ -2872,6 +2952,8 @@ bool ModMain::HasValidPlayerSidecarRecoveryJournal() const
     const std::string& expectedSaveKey = m_currentHostSaveStateKey;
     return metadata.accountToken == GetLocalAccountToken() &&
         metadata.hostAccountToken == GetSessionHostAccountToken() &&
+        metadata.timelineId == m_currentHostTimelineId &&
+        m_currentHostTimelineId != 0 &&
         metadata.saveKey == expectedSaveKey &&
         metadata.revision != 0;
 }
@@ -2883,7 +2965,11 @@ uint64_t ModMain::GetPlayerSidecarRecoveryJournalRevision() const
         return 0;
 
     RecoveryJournalMetadata metadata;
-    return ParseRecoveryJournalMetadata(pathString, metadata) ? metadata.revision : 0;
+    return ParseRecoveryJournalMetadata(pathString, metadata) &&
+        metadata.accountToken == GetLocalAccountToken() &&
+        metadata.hostAccountToken == GetSessionHostAccountToken() &&
+        metadata.timelineId == m_currentHostTimelineId && m_currentHostTimelineId != 0 &&
+        metadata.saveKey == m_currentHostSaveStateKey ? metadata.revision : 0;
 }
 
 bool ModMain::WriteLocalPlayerRecoveryJournal(const char* reason)
@@ -2893,26 +2979,10 @@ bool ModMain::WriteLocalPlayerRecoveryJournal(const char* reason)
     if (journalPathString.empty() || sourcePathString.empty())
         return false;
 
-    std::string payload;
-    bool hasIntegrityHash = false;
-    std::string integrityReason;
-    if (!ReadAndValidatePlayerSidecarFile(
-            sourcePathString,
-            payload,
-            hasIntegrityHash,
-            integrityReason) ||
-        !hasIntegrityHash)
-    {
-        LogCoop(
-            "player recovery journal skipped: sidecar unreadable reason=" +
-            (integrityReason.empty() ? std::string("invalid") : integrityReason));
-        return false;
-    }
-
     const uint64_t accountToken = GetLocalAccountToken();
     const uint64_t hostAccountToken = GetSessionHostAccountToken();
     const std::string& saveKey = m_currentHostSaveStateKey;
-    if (hostAccountToken == 0 || saveKey.empty() || saveKey == "unknown_save")
+    if (hostAccountToken == 0 || m_currentHostTimelineId == 0 || saveKey.empty() || saveKey == "unknown_save")
         return false;
     if (m_networkMode == CoopNetworkMode::Client &&
         m_localInventoryDirty &&
@@ -2922,25 +2992,17 @@ bool ModMain::WriteLocalPlayerRecoveryJournal(const char* reason)
         return false;
     }
 
-    // The dirty counter is process-local. Use the highest valid durable
-    // revision for this account (including other save-key files) so a fresh
-    // process cannot reuse an older revision after restart.
-    uint64_t durableRevision = GetRecoveryJournalDiskMaxRevision(
-        GetCoopPlayerStateRoot(), accountToken);
-    durableRevision = std::max(durableRevision, m_localInventoryJournalRevision);
-    if (durableRevision == std::numeric_limits<uint64_t>::max())
+    // The canonical capture owns the revision. A backup copies that exact
+    // inventory/receipt pair; it must never relabel an old unscoped sidecar.
+    RecoveryJournalMetadata metadata;
+    std::string payload;
+    if (!ParseRecoveryJournalMetadata(sourcePathString, metadata, &payload) ||
+        metadata.accountToken != accountToken || metadata.hostAccountToken != hostAccountToken ||
+        metadata.timelineId != m_currentHostTimelineId || metadata.saveKey != saveKey)
     {
-        LogCoop("player recovery journal write failed: revision exhausted");
+        LogCoop("player recovery journal skipped: canonical snapshot scope unavailable");
         return false;
     }
-    const uint64_t revision = durableRevision + 1;
-
-    if (!payload.empty() && payload.back() != '\n')
-        payload.push_back('\n');
-    payload += "recoveryAccount=" + HexPlayerAccountToken(accountToken) + "\n";
-    payload += "recoveryHost=" + HexPlayerAccountToken(hostAccountToken) + "\n";
-    payload += "recoverySaveKey=" + saveKey + "\n";
-    payload += "recoveryRevision=" + std::to_string(revision) + "\n";
 
     const std::filesystem::path journalPath = CoopFilesystem::FromUtf8(journalPathString);
     std::error_code error;
@@ -2951,9 +3013,9 @@ bool ModMain::WriteLocalPlayerRecoveryJournal(const char* reason)
         return false;
     }
 
-    m_localInventoryJournalRevision = revision;
+    m_localInventoryJournalRevision = std::max(m_localInventoryJournalRevision, metadata.revision);
     m_lastPlayerSidecarEvent =
-        "wrote player recovery journal revision=" + std::to_string(revision) +
+        "wrote player recovery journal revision=" + std::to_string(metadata.revision) +
         (reason && reason[0] ? ": " + std::string(reason) : "");
     LogCoop("player recovery journal " + m_lastPlayerSidecarEvent);
     return true;
@@ -2973,6 +3035,7 @@ bool ModMain::ClearLocalPlayerRecoveryJournal(
     if (!ParseRecoveryJournalMetadata(sourcePath, metadata) ||
         metadata.accountToken != accountToken ||
         metadata.hostAccountToken != GetSessionHostAccountToken() ||
+        metadata.timelineId != m_currentHostTimelineId || m_currentHostTimelineId == 0 ||
         metadata.saveKey != saveKey ||
         metadata.revision != revision)
         return false;
@@ -2982,8 +3045,28 @@ bool ModMain::ClearLocalPlayerRecoveryJournal(
     if (IsLocalInventoryDirtyForSaveKey(saveKey))
         return false;
 
+    // Canonical snapshots also carry the verified recovery scope. Retire their
+    // acknowledged backup, never the canonical inventory itself.
+    const bool canonicalSource = CoopFilesystem::FromUtf8(sourcePath).lexically_normal() ==
+        CoopFilesystem::FromUtf8(GetPlayerSidecarPath()).lexically_normal();
+    const std::string removalPath = canonicalSource ? GetPlayerSidecarRecoveryJournalPath() : sourcePath;
+    if (canonicalSource)
+    {
+        RecoveryJournalMetadata backup;
+        if (removalPath.empty() || !ParseRecoveryJournalMetadata(removalPath, backup) ||
+            backup.accountToken != accountToken || backup.hostAccountToken != metadata.hostAccountToken ||
+            backup.timelineId != metadata.timelineId || backup.saveKey != saveKey || backup.revision > revision)
+        {
+            m_localInventoryJournalRevision = std::max(m_localInventoryJournalRevision, revision);
+            return true;
+        }
+    }
+    else if (CoopFilesystem::FromUtf8(removalPath).lexically_normal() !=
+        CoopFilesystem::FromUtf8(GetPlayerSidecarRecoveryJournalPath()).lexically_normal())
+        return false;
+
     std::error_code error;
-    std::filesystem::remove(CoopFilesystem::FromUtf8(sourcePath), error);
+    std::filesystem::remove(CoopFilesystem::FromUtf8(removalPath), error);
     if (!error || error == std::errc::no_such_file_or_directory)
     {
         // Retain the last acknowledged revision in memory. The next dirty
@@ -3009,10 +3092,15 @@ bool ModMain::RecoverLocalPlayerRecoveryJournal(const char* reason)
     // A host save handover invalidates the previous in-flight upload. Keep
     // that save's journal on disk, but never let its transport state block
     // recovery for the newly advertised host key.
+    RecoveryJournalMetadata pendingMetadata;
+    const bool pendingTimelineMismatch = m_clientRecoveryJournalPending &&
+        !m_clientRecoveryJournalSourcePath.empty() &&
+        (!ParseRecoveryJournalMetadata(m_clientRecoveryJournalSourcePath, pendingMetadata) ||
+            pendingMetadata.timelineId != m_currentHostTimelineId);
     if (m_clientRecoveryJournalPending &&
         ((!m_currentHostSaveStateKey.empty() &&
              m_clientRecoveryJournalSaveKey != m_currentHostSaveStateKey) ||
-            m_clientRecoveryJournalHostAccountToken != GetSessionHostAccountToken()))
+            m_clientRecoveryJournalHostAccountToken != GetSessionHostAccountToken() || pendingTimelineMismatch))
     {
         m_clientRecoveryJournalPending = false;
         m_clientRecoveryJournalAwaitingStoredAck = false;
@@ -3025,23 +3113,87 @@ bool ModMain::RecoverLocalPlayerRecoveryJournal(const char* reason)
         m_clientRecoveryJournalHostAccountToken = 0;
     }
 
-    const std::string pathString = GetPlayerSidecarRecoveryJournalPath();
-    if (pathString.empty())
+    const std::string& expectedSaveKey = m_currentHostSaveStateKey;
+    std::string pathString = GetPlayerSidecarRecoveryJournalPath();
+    if (pathString.empty() || m_currentHostTimelineId == 0 || !IsRecoverySaveKey(expectedSaveKey))
         return false;
 
     RecoveryJournalMetadata metadata;
-    if (!ParseRecoveryJournalMetadata(pathString, metadata) ||
-        metadata.accountToken != GetLocalAccountToken() ||
-        metadata.hostAccountToken != GetSessionHostAccountToken())
+    std::string selectedPayload;
+    std::string selectedPath;
+    bool selectedRevisionConflict = false;
+    const std::string prefix = "player_recovery_account_" + HexPlayerAccountToken(GetLocalAccountToken()) +
+        "_host_" + HexPlayerAccountToken(GetSessionHostAccountToken()) + "_";
+    const auto consider = [&](const std::filesystem::path& candidate)
     {
+        std::error_code fileError;
+        if (std::filesystem::symlink_status(candidate, fileError).type() != std::filesystem::file_type::regular || fileError)
+            return;
+        RecoveryJournalMetadata incoming;
+        std::string payload;
+        if (!ParseRecoveryJournalMetadata(CoopFilesystem::ToUtf8(candidate), incoming, &payload) ||
+            incoming.accountToken != GetLocalAccountToken() || incoming.hostAccountToken != GetSessionHostAccountToken() ||
+            incoming.timelineId != m_currentHostTimelineId)
+            return;
+        payload = RebindRecoveryJournalSaveKey(payload, expectedSaveKey);
+        if (payload.empty())
+            return;
+        if (incoming.revision == metadata.revision && !selectedPayload.empty() && payload != selectedPayload)
+            selectedRevisionConflict = true;
+        if (incoming.revision > metadata.revision ||
+            (incoming.revision == metadata.revision && candidate == CoopFilesystem::FromUtf8(pathString)))
+        {
+            if (incoming.revision > metadata.revision)
+                selectedRevisionConflict = false;
+            metadata = incoming;
+            selectedPayload = std::move(payload);
+            selectedPath = CoopFilesystem::ToUtf8(candidate);
+        }
+    };
+    std::error_code scanError;
+    for (std::filesystem::directory_iterator it(GetCoopPlayerStateRoot(), scanError), end;
+         it != end; it.increment(scanError))
+    {
+        if (scanError) { scanError.clear(); continue; }
+        const std::filesystem::path candidate = it->path();
+        if (candidate.extension() != ".state" ||
+            !StartsWith(CoopFilesystem::ToUtf8(candidate.filename()), prefix))
+            continue;
+        consider(candidate);
+    }
+    const std::string canonicalPath = GetPlayerSidecarPath();
+    if (!canonicalPath.empty())
+        consider(CoopFilesystem::FromUtf8(canonicalPath));
+    if (selectedPath.empty())
+        return false;
+    if (selectedRevisionConflict)
+    {
+        LogCoop("player recovery journal rejected: conflicting payloads for one revision");
         return false;
     }
-
-    const std::string& expectedSaveKey = m_currentHostSaveStateKey;
-    if (expectedSaveKey.empty() || expectedSaveKey == "unknown_save")
-        return false;
-    if (metadata.saveKey != expectedSaveKey || metadata.revision == 0)
-        return false;
+    if (selectedPath == canonicalPath && metadata.saveKey == expectedSaveKey)
+        pathString = canonicalPath;
+    else if (selectedPath != pathString || metadata.saveKey != expectedSaveKey)
+    {
+        // The durable Host timeline proves continuity across forward saves;
+        // custom/truncated save labels need not contain a campaign GUID.
+        // Never rebind an unscoped canonical file or another Host's timeline.
+        RecoveryJournalMetadata rebound;
+        // If the optional backup cannot be written, a scoped canonical source
+        // can still be rebound atomically and uploaded through the normal path.
+        if (!WritePlayerSidecarPayloadWithHash(CoopFilesystem::FromUtf8(pathString), selectedPayload))
+        {
+            if (selectedPath != canonicalPath ||
+                !WritePlayerSidecarPayloadWithHash(CoopFilesystem::FromUtf8(canonicalPath), selectedPayload))
+                return false;
+            pathString = canonicalPath;
+        }
+        if (!ParseRecoveryJournalMetadata(pathString, rebound) || rebound.accountToken != metadata.accountToken ||
+            rebound.hostAccountToken != metadata.hostAccountToken || rebound.timelineId != metadata.timelineId ||
+            rebound.revision != metadata.revision || rebound.saveKey != expectedSaveKey)
+            return false;
+        metadata = std::move(rebound);
+    }
 
     PlayerSidecarState state;
     if (!LoadPlayerSidecarFromPath(pathString, state))
@@ -3116,6 +3268,8 @@ void ModMain::ReconcileLocalInventoryDirtyForSaveKey(const std::string& saveKey)
 
 void ModMain::MarkLocalInventoryDirty(const char* reason)
 {
+    if (m_networkMode == CoopNetworkMode::Client && m_clientHostTimelineRestorePending)
+        return;
     if (!m_enablePlayerSidecar || ShouldSuppressPlayerSidecarInventoryFeedback())
         return;
 
@@ -3150,16 +3304,15 @@ void ModMain::CaptureLocalPlayerPickupRecovery(EntityId pickerId, const char* re
 {
     if (m_networkMode != CoopNetworkMode::Client ||
         !m_enablePlayerSidecar ||
+        m_sharedDropApplyDepth != 0 ||
         !ArkPlayer::GetInstancePtr() ||
         pickerId != ArkPlayer::GetInstance().GetEntityId())
     {
         return;
     }
 
-    // PickUp can run from the shared-drop commit while m_sharedDropApplyDepth
-    // is non-zero. Capture here, after native PickUp has returned, instead of
-    // relying on the normal debounced tick which an immediate process kill can
-    // precede.
+    // Committed shared-drop delivery captures explicitly after updating its
+    // receipt, so no recovery snapshot can contain an item without its receipt.
     MarkLocalInventoryDirty("successful local-player pickup");
     const std::string saveKey = m_currentHostSaveStateKey;
     if (!IsLocalInventoryDirtyForSaveKey(saveKey))
@@ -3172,6 +3325,8 @@ void ModMain::CaptureLocalPlayerPickupRecovery(EntityId pickerId, const char* re
     const bool sidecarSaved = SaveLocalPlayerSidecar(captureReason.c_str());
     const bool journalWritten = sidecarSaved &&
         WriteLocalPlayerRecoveryJournal(captureReason.c_str());
+    if (sidecarSaved && !m_pendingClientPlayerStateUpload)
+        QueueClientPlayerStateUpload("inventory mutation", m_currentHostSaveStateKey);
     if (sidecarSaved && journalWritten && capturedRevision == m_localInventoryDirtyRevision)
     {
         m_localInventoryDirty = false;
@@ -3194,6 +3349,18 @@ bool ModMain::SaveLocalPlayerSidecar(const char* reason)
 {
     if (!m_enablePlayerSidecar)
         return false;
+    if (m_networkMode == CoopNetworkMode::Client && m_clientHostTimelineRestorePending)
+        return false;
+
+    // A native acquisition whose resulting count is not yet known must not
+    // reach any restore-eligible snapshot without its matching receipt.
+    if (m_sharedDropDeliveryRecoveryRequired ||
+        std::any_of(m_sharedDrops.begin(), m_sharedDrops.end(), [](const auto& pair)
+        { return pair.second.pickupDeliveryInProgress; }))
+    {
+        m_lastPlayerSidecarEvent = "save deferred: shared-drop delivery in progress";
+        return false;
+    }
 
     if (!IsGameReady())
     {
@@ -3225,6 +3392,17 @@ bool ModMain::SaveLocalPlayerSidecar(const char* reason)
     {
         ++m_playerSidecarFailCount;
         m_lastPlayerSidecarEvent = "save skipped: no sidecar path";
+        return false;
+    }
+
+    RecoveryJournalMetadata preservedRecovery;
+    if (m_networkMode == CoopNetworkMode::Off &&
+        ParseRecoveryJournalMetadata(pathString, preservedRecovery) &&
+        preservedRecovery.accountToken == GetLocalAccountToken())
+    {
+        // A failed optional backup can leave this as the only durable co-op
+        // snapshot. Vanilla offline saves must not erase it before reconnect.
+        m_lastPlayerSidecarEvent = "save skipped: preserving scoped co-op recovery snapshot";
         return false;
     }
 
@@ -3415,11 +3593,13 @@ bool ModMain::SaveLocalPlayerSidecar(const char* reason)
     std::vector<PlayerInventoryItemState> items;
     ArkInventory* inventory = GetLocalArkInventory();
     ArkItemSystem* itemSystem = GetArkItemSystemPtr();
+    bool inventoryCaptured = false;
     if (inventory && itemSystem)
     {
         std::string inventoryReason;
         std::vector<PassiveInventoryItemState> passiveItems;
-        if (!BuildPassiveInventorySnapshot(*inventory, *itemSystem, passiveItems, inventoryReason) && !inventoryReason.empty())
+        inventoryCaptured = BuildPassiveInventorySnapshot(*inventory, *itemSystem, passiveItems, inventoryReason);
+        if (!inventoryCaptured && !inventoryReason.empty())
         {
             LogCoop("sidecar passive inventory snapshot failed: " + inventoryReason);
         }
@@ -3455,6 +3635,13 @@ bool ModMain::SaveLocalPlayerSidecar(const char* reason)
         }
     }
 
+    if (m_sharedDropHostSessionId != 0 && !inventoryCaptured)
+    {
+        ++m_playerSidecarFailCount;
+        m_lastPlayerSidecarEvent = "save deferred: incomplete inventory capture for delivery receipts";
+        return false;
+    }
+
     output << "inventoryCount=" << items.size() << "\n";
     for (const PlayerInventoryItemState& item : items)
     {
@@ -3481,11 +3668,48 @@ bool ModMain::SaveLocalPlayerSidecar(const char* reason)
         }
     }
 
+    if (m_sharedDropHostSessionId != 0)
+        CoopSharedDropDelivery::WriteSection(output, m_localSharedDropDeliveries, m_sharedDropHostSessionId);
+
     const bool nativeCaptureMatchesLevel =
         HasUsableNativeCaptureForSidecar(m_lastNativePlayerSaveCapture) &&
         NormalizeLevelName(m_lastNativePlayerSaveCapture.levelName) == NormalizeLevelName(GetCurrentLevelName());
     if (nativeCaptureMatchesLevel)
         WriteNativeCaptureSidecarSection(output, m_lastNativePlayerSaveCapture);
+
+    uint64_t snapshotRevision = 0;
+    const uint64_t hostAccountToken = GetSessionHostAccountToken();
+    const bool hasSnapshotScope = hostAccountToken != 0 && m_currentHostTimelineId != 0 &&
+        !m_currentHostSaveStateKey.empty() && m_currentHostSaveStateKey != "unknown_save";
+    if (m_networkMode == CoopNetworkMode::Client && !hasSnapshotScope)
+    {
+        m_lastPlayerSidecarEvent = "save deferred: host timeline unavailable";
+        return false;
+    }
+    uint64_t previousRevision = std::max(m_localInventoryJournalRevision,
+        GetRecoveryJournalDiskMaxRevision(GetCoopPlayerStateRoot(), GetLocalAccountToken()));
+    previousRevision = std::max(previousRevision, ReadPlayerSidecarSnapshotRevision(pathString));
+    if (hasSnapshotScope)
+    {
+        if (previousRevision == std::numeric_limits<uint64_t>::max())
+        {
+            m_lastPlayerSidecarEvent = "save failed: snapshot revision exhausted";
+            return false;
+        }
+        snapshotRevision = previousRevision + 1;
+        output << "recoveryAccount=" << HexPlayerAccountToken(GetLocalAccountToken()) << '\n'
+            << "recoveryHost=" << HexPlayerAccountToken(hostAccountToken) << '\n'
+            << "recoveryTimeline=" << HexPlayerAccountToken(m_currentHostTimelineId) << '\n'
+            << "recoverySaveKey=" << m_currentHostSaveStateKey << '\n'
+            << "recoveryRevision=" << snapshotRevision << '\n';
+    }
+    else if (previousRevision != 0)
+    {
+        // Preserve only the sequence floor during offline play. Without the
+        // Host/timeline scope this inventory is never a recovery candidate.
+        snapshotRevision = previousRevision;
+        output << "recoveryRevision=" << snapshotRevision << '\n';
+    }
 
     const std::string payload = output.str();
     if (payload.empty() || !WritePlayerSidecarPayloadWithHash(path, payload))
@@ -3495,6 +3719,8 @@ bool ModMain::SaveLocalPlayerSidecar(const char* reason)
         m_lastPlayerSidecarPath = pathString;
         return false;
     }
+    m_localInventoryJournalRevision = std::max(m_localInventoryJournalRevision, snapshotRevision);
+    m_localInventoryCapturedRevision = m_localInventoryDirtyRevision;
 
     itemCount = static_cast<uint32_t>(std::min<size_t>(items.size(), UINT32_MAX));
     ++m_playerSidecarSaveCount;
@@ -3512,6 +3738,183 @@ bool ModMain::SaveLocalPlayerSidecar(const char* reason)
             ? " nativeSnapshot=1/" + std::to_string(m_lastNativePlayerSaveCapture.nativeSnapshotSaveBytes)
             : " nativeSnapshot=0") +
         (reason && reason[0] ? ": " + std::string(reason) : "");
+    return true;
+}
+
+bool ModMain::StoreCommittedSharedDropDelivery(
+    uint64_t accountToken,
+    const CoopSharedDropDelivery::Entry& entry)
+{
+    return StoreCommittedSharedDropDeliveries(accountToken, {entry});
+}
+
+bool ModMain::StoreCommittedSharedDropDeliveries(
+    uint64_t accountToken,
+    const std::vector<CoopSharedDropDelivery::Entry>& entries)
+{
+    EnsureSharedDropHostSessionId();
+    if ((m_networkMode != CoopNetworkMode::Host && !HasContinuingHostInventoryWorld()) || accountToken == 0 ||
+        entries.empty() || entries.size() > CoopSharedDropDelivery::kMaxEntries ||
+        std::any_of(entries.begin(), entries.end(), [this](const CoopSharedDropDelivery::Entry& row)
+            { return !CoopSharedDropDelivery::IsValid(row) || row.hostSessionId != m_sharedDropHostSessionId; }) ||
+        m_currentHostSaveStateKey.empty() || m_currentHostSaveStateKey == "unknown_save")
+    {
+        return false;
+    }
+
+    const std::string path = GetHostPlayerStatePathForAccountAndSave(accountToken, m_currentHostSaveStateKey);
+    if (path.empty())
+        return false;
+    std::error_code error;
+    const bool exists = std::filesystem::exists(CoopFilesystem::FromUtf8(path), error);
+    if (error)
+        return false;
+    if (!exists)
+    {
+        const auto peer = m_remotePeers.find(accountToken);
+        const std::string username = peer != m_remotePeers.end() ? peer->second.username : "Player";
+        if (!WriteDefaultHostPlayerStateFile(path, username))
+            return false;
+    }
+
+    std::string payload;
+    bool hasHash = false;
+    std::string detail;
+    if (!ReadAndValidatePlayerSidecarFile(path, payload, hasHash, detail))
+        return false;
+    std::vector<CoopSharedDropDelivery::Entry> rows;
+    bool hasSection = false;
+    if (!CoopSharedDropDelivery::ParseSection(payload, rows, hasSection) || (hasSection && !hasHash))
+        return false;
+    rows.erase(std::remove_if(rows.begin(), rows.end(), [this](const CoopSharedDropDelivery::Entry& row)
+        { return row.hostSessionId != m_sharedDropHostSessionId; }), rows.end());
+    for (const auto& entry : entries)
+    {
+        const auto existing = std::find_if(rows.begin(), rows.end(), [&entry](const CoopSharedDropDelivery::Entry& row)
+            { return CoopSharedDropDelivery::SameLifetime(row, entry); });
+        if (existing != rows.end())
+        {
+            if (!CoopSharedDropDelivery::SameCommit(*existing, entry) || entry.deliveredCount < existing->deliveredCount)
+                return false;
+            *existing = entry;
+        }
+        else
+        {
+            if (rows.size() == CoopSharedDropDelivery::kMaxEntries)
+                return false;
+            rows.push_back(entry);
+        }
+    }
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << CoopSharedDropDelivery::WithoutSection(payload);
+    CoopSharedDropDelivery::WriteSection(output, rows, m_sharedDropHostSessionId);
+    return WritePlayerSidecarPayloadWithHash(CoopFilesystem::FromUtf8(path), output.str());
+}
+
+bool ModMain::MergeSharedDropDeliveriesForUpload(const std::string& incomingPath, const std::string& storedPath)
+{
+    EnsureSharedDropHostSessionId();
+    if (m_networkMode != CoopNetworkMode::Host || m_sharedDropHostSessionId == 0 ||
+        incomingPath.empty() || storedPath.empty() || incomingPath == storedPath)
+    {
+        return false;
+    }
+    std::string incoming;
+    bool incomingHasHash = false;
+    std::string detail;
+    if (!ReadAndValidatePlayerSidecarFile(incomingPath, incoming, incomingHasHash, detail))
+        return false;
+    std::vector<CoopSharedDropDelivery::Entry> incomingRows;
+    bool incomingHasSection = false;
+    if (!CoopSharedDropDelivery::ParseSection(incoming, incomingRows, incomingHasSection) ||
+        (incomingHasSection && !incomingHasHash))
+    {
+        return false;
+    }
+
+    std::vector<CoopSharedDropDelivery::Entry> storedRows;
+    std::error_code error;
+    const bool storedExists = std::filesystem::exists(CoopFilesystem::FromUtf8(storedPath), error);
+    if (error)
+        return false;
+    if (storedExists)
+    {
+        std::string stored;
+        bool storedHasHash = false;
+        bool storedHasSection = false;
+        if (!ReadAndValidatePlayerSidecarFile(storedPath, stored, storedHasHash, detail) ||
+            !CoopSharedDropDelivery::ParseSection(stored, storedRows, storedHasSection) ||
+            (storedHasSection && !storedHasHash))
+        {
+            return false;
+        }
+    }
+    if (!CoopSharedDropDelivery::MergeForUpload(incomingRows, storedRows, m_sharedDropHostSessionId))
+        return false;
+
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << CoopSharedDropDelivery::WithoutSection(incoming);
+    CoopSharedDropDelivery::WriteSection(output, incomingRows, m_sharedDropHostSessionId);
+    return WritePlayerSidecarPayloadWithHash(CoopFilesystem::FromUtf8(incomingPath), output.str());
+}
+
+bool ModMain::PrepareSharedDropDeliveriesForHostTransfer(const std::string& path)
+{
+    EnsureSharedDropHostSessionId();
+    if ((m_networkMode != CoopNetworkMode::Host && !HasContinuingHostInventoryWorld()) ||
+        m_sharedDropHostSessionId == 0 || path.empty())
+        return false;
+    std::string payload;
+    bool hasHash = false;
+    std::string detail;
+    if (!ReadAndValidatePlayerSidecarFile(path, payload, hasHash, detail))
+        return false;
+    std::vector<CoopSharedDropDelivery::Entry> rows;
+    bool hasSection = false;
+    if (!CoopSharedDropDelivery::ParseSection(payload, rows, hasSection) || (hasSection && !hasHash))
+        return false;
+    rows.erase(std::remove_if(rows.begin(), rows.end(), [this](const CoopSharedDropDelivery::Entry& row)
+        { return row.hostSessionId != m_sharedDropHostSessionId && row.deliveredCount == row.count; }), rows.end());
+    // This is the Host-selected inventory snapshot, not an old Client journal.
+    // An assigned remainder survives a transport restart with its exact delta.
+    for (auto& row : rows)
+        row.hostSessionId = m_sharedDropHostSessionId;
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << CoopSharedDropDelivery::WithoutSection(payload);
+    CoopSharedDropDelivery::WriteSection(output, rows, m_sharedDropHostSessionId);
+    return WritePlayerSidecarPayloadWithHash(CoopFilesystem::FromUtf8(path), output.str());
+}
+
+bool ModMain::RestoreHostSharedDropDeliveryReceipts()
+{
+    if (m_networkMode != CoopNetworkMode::Host && !HasContinuingHostInventoryWorld())
+        return false;
+    const std::string path = GetHostPlayerStatePathForAccountAndSave(
+        GetLocalAccountToken(), m_currentHostSaveStateKey);
+    std::error_code error;
+    const bool exists = std::filesystem::exists(CoopFilesystem::FromUtf8(path), error);
+    if (error || path.empty())
+        return false;
+    if (!exists)
+        return true;
+    PlayerSidecarState state;
+    if (!LoadPlayerSidecarFromPath(path, state))
+        return false;
+    // An ordinary offline load has no shared ownership to resume. A saved
+    // remainder must be tracked before vanilla can collect it and rehost later.
+    if (m_networkMode == CoopNetworkMode::Off &&
+        std::none_of(state.sharedDropDeliveries.begin(), state.sharedDropDeliveries.end(),
+            [](const CoopSharedDropDelivery::Entry& row) { return row.deliveredCount < row.count; }))
+        return true;
+    EnsureSharedDropHostSessionId();
+    if (!PrepareSharedDropDeliveriesForHostTransfer(path) || !LoadPlayerSidecarFromPath(path, state))
+        return false;
+    // Host inventory is owned by Save.CSF. Restore only its assigned remainders,
+    // never apply a sidecar inventory over the vanilla player.
+    m_localSharedDropDeliveries = state.sharedDropDeliveries;
     return true;
 }
 
@@ -3580,11 +3983,22 @@ bool ModMain::LoadPlayerSidecarFromPath(const std::string& pathString, PlayerSid
         return false;
     }
 
+    if (!CoopSharedDropDelivery::ParseSection(
+            payload, state.sharedDropDeliveries, state.hasSharedDropDeliveries, &state.sharedDropHostSessionId))
+    {
+        ++m_playerSidecarFailCount;
+        m_lastPlayerSidecarEvent = "load failed: invalid shared-drop delivery section";
+        return false;
+    }
+
     std::istringstream input(payload);
     input.imbue(std::locale::classic());
     std::string line;
     bool nativeFragmentPayloadHexInvalid = false;
     bool nativeSnapshotSaveHexInvalid = false;
+    uint64_t declaredInventoryCount = 0;
+    bool hasDeclaredInventoryCount = false;
+    bool invalidInventoryCount = false;
     while (std::getline(input, line))
     {
         if (StartsWith(line, "username="))
@@ -3778,6 +4192,14 @@ bool ModMain::LoadPlayerSidecarFromPath(const std::string& pathString, PlayerSid
         }
         else if (StartsWith(line, "inventoryCount="))
         {
+            std::string_view countText(line);
+            countText.remove_prefix(std::string_view("inventoryCount=").size());
+            if (!countText.empty() && countText.back() == '\r')
+                countText.remove_suffix(1);
+            invalidInventoryCount = invalidInventoryCount || hasDeclaredInventoryCount ||
+                !CoopSharedDropDelivery::ReadUnsigned(countText, declaredInventoryCount) ||
+                countText.find_first_not_of(" \t") != std::string_view::npos;
+            hasDeclaredInventoryCount = true;
             state.hasInventory = true;
         }
         else if (StartsWith(line, "item="))
@@ -4126,6 +4548,17 @@ bool ModMain::LoadPlayerSidecarFromPath(const std::string& pathString, PlayerSid
     }
 
     const size_t passiveInventoryItems = state.inventory.size();
+    if (state.hasSharedDropDeliveries)
+    {
+        if (!state.hasInventory || !hasDeclaredInventoryCount || invalidInventoryCount ||
+            declaredInventoryCount != state.inventory.size())
+        {
+            ++m_playerSidecarFailCount;
+            m_lastPlayerSidecarEvent = "load failed: delivery receipts without complete inventory snapshot";
+            return false;
+        }
+        state.hasNativeCapture = false;
+    }
     NormalizePlayerSidecarInventoryFromNativeCapture(state);
 
     ++m_playerSidecarLoadCount;
@@ -4386,6 +4819,10 @@ bool ModMain::ApplyLocalPlayerSidecar(const PlayerSidecarState& state, const cha
     uint32_t queuedChipsets = 0;
     if (applyInventory && state.hasInventory)
     {
+        // Receipt state belongs to this exact inventory snapshot, never a union
+        // with the profile that happened to be loaded before the Host restore.
+        m_localSharedDropDeliveries = state.sharedDropDeliveries;
+        m_sharedDropHostSessionId = state.sharedDropHostSessionId;
         m_pendingPlayerSidecarEquippedWeaponArchetypeId = state.equippedWeaponArchetypeId;
         m_pendingPlayerSidecarQuickSelect = state.quickSelect;
         m_pendingPlayerSidecarHasQuickSelect = state.hasQuickSelect;
@@ -5483,9 +5920,17 @@ void ModMain::TickPlayerSidecar(float frameTime)
             const char* reason = m_clientRecoveryJournalPending
                 ? "recovery journal: debounced local inventory mutation"
                 : "debounced local inventory mutation";
-            if (SaveLocalPlayerSidecar(reason) &&
-                WriteLocalPlayerRecoveryJournal(reason) &&
-                capturedRevision == m_localInventoryDirtyRevision)
+            RecoveryJournalMetadata captured;
+            const bool captureCurrent = m_localInventoryCapturedRevision == capturedRevision && capturedRevision != 0 &&
+                ParseRecoveryJournalMetadata(GetPlayerSidecarPath(), captured) &&
+                captured.accountToken == GetLocalAccountToken() && captured.hostAccountToken == GetSessionHostAccountToken() &&
+                captured.timelineId == m_currentHostTimelineId && captured.saveKey == m_currentHostSaveStateKey &&
+                captured.revision == m_localInventoryJournalRevision;
+            const bool sidecarSaved = captureCurrent || SaveLocalPlayerSidecar(reason);
+            const bool journalWritten = sidecarSaved && WriteLocalPlayerRecoveryJournal(reason);
+            if (sidecarSaved && !m_pendingClientPlayerStateUpload)
+                QueueClientPlayerStateUpload("inventory mutation", m_currentHostSaveStateKey);
+            if (journalWritten && capturedRevision == m_localInventoryDirtyRevision)
             {
                 m_localInventoryDirty = false;
                 m_localInventoryDirtySaveKey.clear();
