@@ -171,7 +171,9 @@ struct ModMain
     bool CaptureHostPlayerCheckpoint(const std::string&)
     { actions.push_back("capture"); capturedSnapshot = stagedSnapshot; return captureResult; }
     bool StageHostPlayerCheckpoint() { stagedSnapshot = liveSnapshot; return stageResult; }
-    bool RestoreHostSharedDropDeliveryReceipts() { return true; }
+    unsigned receiptRestores = 0;
+    bool receiptRestoreResult = true;
+    bool RestoreHostSharedDropDeliveryReceipts() { ++receiptRestores; return receiptRestoreResult; }
     void StopNetwork();
     void QueueCoopHudFeedback(const char*, float) { actions.push_back("hud"); }
     void BroadcastHostSaveIdentity(const char*, bool = false) { actions.push_back("broadcast"); }
@@ -335,6 +337,8 @@ int main()
     Check(offLoad.m_hostInventorySession == HostSession::LoadingCheckpoint &&
         offLoad.m_pendingHostInventoryLoadPath == "save_A" && HostStoreFixture::calls.empty(),
         "native load while network Off invalidates Host continuity without opening a store early");
+    Check(offLoad.m_sharedDropHostSessionId == 0 && offLoad.m_localSharedDropDeliveries.empty(),
+        "offline explicit rollback discards later in-memory deliveries before restoring its selected checkpoint");
     offLoad.FinishHostInventoryWorldLoad(false);
     Check(offLoad.m_hostInventorySession == HostSession::Continuing &&
         offLoad.m_pendingHostInventoryLoadPath.empty() &&
@@ -413,6 +417,21 @@ int main()
     Check(failedColdLoad.m_hostInventorySession == HostSession::CheckpointLoadFailed &&
         HostStoreFixture::calls.empty(),
         "late unrelated success cannot revive an already failed cold native load");
+
+    for (const bool receiptsValid : {false, true})
+    {
+        ResetHostStore();
+        ModMain offlineReceipts;
+        offlineReceipts.m_networkMode = CoopNetworkMode::Off;
+        offlineReceipts.m_sharedDropHostSessionId = 0;
+        offlineReceipts.receiptRestoreResult = receiptsValid;
+        offlineReceipts.OnCryActionLoadGameRequested("save_A", false, false);
+        offlineReceipts.FinishHostInventoryWorldLoad(false);
+        Check(offlineReceipts.receiptRestores == 1 &&
+            offlineReceipts.m_hostInventorySession == (receiptsValid ? HostSession::Continuing : HostSession::CheckpointLoadFailed) &&
+            (offlineReceipts.m_currentHostTimelineId != 0) == receiptsValid,
+            "cold offline load resolves assigned ownership before vanilla pickup or rehost");
+    }
 
     for (const bool missingFingerprint : {false, true})
     {

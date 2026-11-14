@@ -3863,7 +3863,8 @@ bool ModMain::MergeSharedDropDeliveriesForUpload(const std::string& incomingPath
 bool ModMain::PrepareSharedDropDeliveriesForHostTransfer(const std::string& path)
 {
     EnsureSharedDropHostSessionId();
-    if (m_networkMode != CoopNetworkMode::Host || m_sharedDropHostSessionId == 0 || path.empty())
+    if ((m_networkMode != CoopNetworkMode::Host && !HasContinuingHostInventoryWorld()) ||
+        m_sharedDropHostSessionId == 0 || path.empty())
         return false;
     std::string payload;
     bool hasHash = false;
@@ -3889,7 +3890,8 @@ bool ModMain::PrepareSharedDropDeliveriesForHostTransfer(const std::string& path
 
 bool ModMain::RestoreHostSharedDropDeliveryReceipts()
 {
-    EnsureSharedDropHostSessionId();
+    if (m_networkMode != CoopNetworkMode::Host && !HasContinuingHostInventoryWorld())
+        return false;
     const std::string path = GetHostPlayerStatePathForAccountAndSave(
         GetLocalAccountToken(), m_currentHostSaveStateKey);
     std::error_code error;
@@ -3899,6 +3901,15 @@ bool ModMain::RestoreHostSharedDropDeliveryReceipts()
     if (!exists)
         return true;
     PlayerSidecarState state;
+    if (!LoadPlayerSidecarFromPath(path, state))
+        return false;
+    // An ordinary offline load has no shared ownership to resume. A saved
+    // remainder must be tracked before vanilla can collect it and rehost later.
+    if (m_networkMode == CoopNetworkMode::Off &&
+        std::none_of(state.sharedDropDeliveries.begin(), state.sharedDropDeliveries.end(),
+            [](const CoopSharedDropDelivery::Entry& row) { return row.deliveredCount < row.count; }))
+        return true;
+    EnsureSharedDropHostSessionId();
     if (!PrepareSharedDropDeliveriesForHostTransfer(path) || !LoadPlayerSidecarFromPath(path, state))
         return false;
     // Host inventory is owned by Save.CSF. Restore only its assigned remainders,

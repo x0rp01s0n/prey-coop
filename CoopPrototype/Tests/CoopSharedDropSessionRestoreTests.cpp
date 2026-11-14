@@ -42,7 +42,7 @@ struct ModMain
     std::string ownPath;
     std::vector<CoopSharedDropDelivery::Entry> m_localSharedDropDeliveries;
     struct PlayerSidecarState { std::vector<CoopSharedDropDelivery::Entry> sharedDropDeliveries; };
-    void EnsureSharedDropHostSessionId() {}
+    uint64_t EnsureSharedDropHostSessionId();
     bool ReadAndValidatePlayerSidecarFile(const std::string&, std::string& out, bool& hash, std::string&)
     { out = payload; hash = hashed; return valid; }
     bool WritePlayerSidecarPayloadWithHash(const std::filesystem::path&, const std::string& value)
@@ -62,7 +62,8 @@ struct ModMain
     bool StageHostPlayerCheckpoint();
     bool StoreCommittedSharedDropDelivery(uint64_t, const CoopSharedDropDelivery::Entry&);
     bool StoreCommittedSharedDropDeliveries(uint64_t, const std::vector<CoopSharedDropDelivery::Entry>&);
-    bool HasContinuingHostInventoryWorld() const { return m_networkMode == CoopNetworkMode::Off; }
+    bool continuing = true;
+    bool HasContinuingHostInventoryWorld() const { return m_networkMode == CoopNetworkMode::Off && continuing; }
     bool WriteDefaultHostPlayerStateFile(const std::string&, const std::string&) { return false; }
     void LogCoop(const std::string&) {}
 };
@@ -70,6 +71,7 @@ struct ModMain
 #include "SharedDropSessionRestoreActual.inc"
 #include "HostCheckpointStageActual.inc"
 #include "SharedDropCommitStoreActual.inc"
+#include "SharedDropSessionIdentityActual.inc"
 
 unsigned checks = 0;
 void Check(bool condition, const char* name)
@@ -124,6 +126,12 @@ int main()
         mod.m_localSharedDropDeliveries[0].deliveredCount == 1 && mod.m_localSharedDropDeliveries[0].hostSessionId == 29,
         "Host restores receipts only while native inventory remains independently owned");
     mod.m_networkMode = CoopNetworkMode::Off;
+    mod.m_localSharedDropDeliveries.clear(); mod.payload = saved.str(); mod.m_sharedDropHostSessionId = 0;
+    Check(mod.RestoreHostSharedDropDeliveryReceipts() && mod.m_localSharedDropDeliveries.size() == 1 &&
+        mod.m_localSharedDropDeliveries[0].deliveredCount == 1 && mod.m_sharedDropHostSessionId != 0 &&
+        mod.m_sharedDropHostSessionId != 19 &&
+        mod.m_localSharedDropDeliveries[0].hostSessionId == mod.m_sharedDropHostSessionId,
+        "cold offline Host restores its assigned remainder before network rehosting");
     Check(mod.StageHostPlayerCheckpoint() && mod.stored.size() == 1 && mod.stored[0].deliveredCount == 1 &&
         mod.m_hostPlayerStateStore->calls == 1, "offline continuing Host freezes its actual local delivery progress");
     mod.commitWritable = false;
@@ -146,6 +154,14 @@ int main()
     mod.m_networkMode = CoopNetworkMode::Client;
     Check(!mod.StoreCommittedSharedDropDelivery(7, newer) && mod.payload == batch,
         "Client cannot commit ownership through Host checkpoint storage");
+    mod.m_networkMode = CoopNetworkMode::Off; mod.m_sharedDropHostSessionId = 0;
+    mod.payload = completed.str(); mod.m_localSharedDropDeliveries.clear();
+    Check(mod.RestoreHostSharedDropDeliveryReceipts() && mod.m_sharedDropHostSessionId == 0 &&
+        mod.m_localSharedDropDeliveries.empty() && mod.payload == completed.str(),
+        "ordinary offline load with no remainder does not create shared ownership");
+    mod.continuing = false; mod.payload = saved.str();
+    Check(!mod.RestoreHostSharedDropDeliveryReceipts() && mod.EnsureSharedDropHostSessionId() == 0,
+        "unestablished offline world cannot resume checkpoint ownership");
     std::filesystem::remove(path);
     std::cout << checks << " selected-production session/checkpoint receipt checks passed\n";
 }

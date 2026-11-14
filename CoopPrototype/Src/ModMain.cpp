@@ -30535,16 +30535,16 @@ void ModMain::OnCryActionLoadGameRequested(const char* path, bool quick, bool ig
         m_pendingHostInventoryLoadPath = m_lastSaveLoadPath;
         ResetPendingHostCheckpointSave();
         m_hostInventorySession = HostInventorySession::LoadingCheckpoint;
-    }
-    if (m_networkMode == CoopNetworkMode::Host || m_pendingAutoStartMode == "host")
-    {
-        if (!m_arkLevelTransitionLoadActive)
+        if (m_networkMode != CoopNetworkMode::Client && m_pendingAutoStartMode != "client")
         {
-            // An explicit checkpoint load replaces the timeline. Old pending
-            // entitlements must not be delivered into that rolled-back world.
+            // An explicit checkpoint replaces this world's assigned deliveries,
+            // even when its Host has temporarily stopped networking.
             m_sharedDropHostSessionId = 0;
             m_localSharedDropDeliveries.clear();
         }
+    }
+    if (m_networkMode == CoopNetworkMode::Host || m_pendingAutoStartMode == "host")
+    {
         if (m_networkMode == CoopNetworkMode::Host)
             CancelHostPlayerStateUploadsForTimelineChange("manual host load");
         SetCurrentHostSaveStateKey(BuildHostSaveStateKey(m_lastSaveLoadPath), false);
@@ -75676,6 +75676,12 @@ void ModMain::FinishHostInventoryWorldLoad(bool loadFailed)
         m_hostInventorySession = m_currentHostTimelineId != 0
             ? HostInventorySession::Continuing
             : HostInventorySession::CheckpointLoadFailed;
+        if (m_hostInventorySession == HostInventorySession::Continuing && m_sharedDropHostSessionId == 0 &&
+            !RestoreHostSharedDropDeliveryReceipts())
+        {
+            m_currentHostTimelineId = 0;
+            m_hostInventorySession = HostInventorySession::CheckpointLoadFailed;
+        }
         if (m_currentHostTimelineId != 0)
             m_lastSaveLoadPath = loadPath;
     }

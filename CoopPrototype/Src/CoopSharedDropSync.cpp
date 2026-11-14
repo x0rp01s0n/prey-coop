@@ -78,7 +78,8 @@ bool SetSharedDropWorldPresentation(IEntity& entity, bool visible, std::string& 
 
 uint64_t ModMain::EnsureSharedDropHostSessionId()
 {
-    if (m_networkMode == CoopNetworkMode::Host && m_sharedDropHostSessionId == 0)
+    if ((m_networkMode == CoopNetworkMode::Host || HasContinuingHostInventoryWorld()) &&
+        m_sharedDropHostSessionId == 0)
     {
         const auto ticks = std::chrono::high_resolution_clock::now().time_since_epoch().count();
         m_sharedDropHostSessionId = static_cast<uint64_t>(ticks) ^ GetLocalAccountToken();
@@ -437,7 +438,17 @@ bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerI
         return false;
     }
 
-    RecoverSavedSharedDrops();
+    if (m_sharedDropRecoveryRequired || (offlineHost && !m_localSharedDropDeliveries.empty()))
+    {
+        const EntityId itemId = item->GetEntityId();
+        RecoverSavedSharedDrops();
+        if (offlineHost && !m_localSharedDropDeliveries.empty())
+            RestoreCommittedSharedDropDeliveries();
+        // Recovery may remove a stale saved source or finish its native pickup.
+        item = CArkItem::GetItemFromEntityId(itemId);
+        if (!item)
+            return true;
+    }
     auto found = m_sharedDropByEntityId.find(item->GetEntityId());
     if (found == m_sharedDropByEntityId.end() && offlineHost)
     {
@@ -454,6 +465,13 @@ bool ModMain::ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerI
             {
                 assigned->second.localEntityId = entity->GetId();
                 found = m_sharedDropByEntityId.emplace(entity->GetId(), stableId).first;
+            }
+            else if (std::any_of(m_localSharedDropDeliveries.begin(), m_localSharedDropDeliveries.end(),
+                [this, stableId, item](const CoopSharedDropDelivery::Entry& row)
+                { return row.hostSessionId == m_sharedDropHostSessionId && row.stableSpawnId == stableId &&
+                    row.archetypeId == item->GetArchetype(); }))
+            {
+                return true;
             }
         }
     }
@@ -863,6 +881,12 @@ void ModMain::RestoreCommittedSharedDropDeliveries()
 void ModMain::TickSharedDropPickupRetries(float frameTime)
 {
     RecoverSavedSharedDrops();
+    if (m_networkMode == CoopNetworkMode::Off)
+    {
+        if (HasContinuingHostInventoryWorld() && IsSharedDropWorldReady() && !m_localSharedDropDeliveries.empty())
+            RestoreCommittedSharedDropDeliveries();
+        return;
+    }
     if (!IsSharedDropServiceReady())
         return;
 

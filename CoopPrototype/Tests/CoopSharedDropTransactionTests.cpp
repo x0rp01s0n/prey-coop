@@ -90,6 +90,7 @@ struct CArkItem {
     static inline std::unordered_map<EntityId, CArkItem*> items;
     static inline std::function<bool(CArkItem*)> beforePickup;
     static CArkItem* GetItemFromEntityId(EntityId id) {
+        if (!gEnv->pEntitySystem->GetEntity(id)) return nullptr;
         auto found = items.find(id);
         return found == items.end() ? nullptr : found->second;
     }
@@ -254,7 +255,8 @@ public:
         record.localPickupGranted = true;
         return PersistLocalSharedDropDelivery(record);
     }
-    void RestoreCommittedSharedDropDeliveries() {}
+    unsigned deliveryRestoreCalls = 0;
+    void RestoreCommittedSharedDropDeliveries() { ++deliveryRestoreCalls; }
     void EnsureLocalPlayerWeaponRegistered(EntityId, const char*) {}
     bool MaterializeSharedDrop(const CoopProtocol::SharedDropPacket& packet, SharedDropRecord& record, std::string&) {
         ++materializeCalls;
@@ -1194,6 +1196,35 @@ int main(int argc, char**) {
             require(f.host.ShouldDeferNativeSharedItemPickup(&f.hostItem, 1, "offline repeat") &&
                 f.hostItem.inventoryCount == 1,
                 "offline assigned remainder granted twice");
+        }},
+        {"native_input_recovery_does_not_reuse_a_removed_source", [] {
+            Fixture f;
+            f.entities.GetEntity(103)->name = "CoopSharedDrop_77";
+            f.host.m_sharedDrops.clear();
+            f.host.m_sharedDropByEntityId.clear();
+            f.host.m_localSharedDropDeliveries.push_back({f.host.m_sharedDropHostSessionId,
+                stable, f.hostItem.GetArchetype(), 1, 0, 31, 37});
+            f.host.m_sharedDropRecoveryRequired = true;
+            require(f.host.ShouldDeferNativeSharedItemPickup(&f.hostItem, 1, "saved stale input") &&
+                !f.entities.GetEntity(103) && f.hostItem.inventoryCount == 0,
+                "input used a source invalidated by native-load recovery");
+        }},
+        {"offline_owned_remainder_uses_delivery_path_before_native_input", [] {
+            Fixture f;
+            f.host.m_networkMode = CoopNetworkMode::Off;
+            f.host.continuingHostWorld = true;
+            f.host.m_localSharedDropDeliveries.push_back({f.host.m_sharedDropHostSessionId, stable, f.hostItem.GetArchetype(), 1, 0, 31, 37});
+            f.host.TickSharedDropPickupRetries(0.25f);
+            require(f.host.deliveryRestoreCalls == 1, "offline pending ownership did not reach native reconstruction");
+            f.host.ShouldDeferNativeSharedItemPickup(&f.hostItem, 1, "first offline input");
+            require(f.host.deliveryRestoreCalls == 2, "native input bypassed pending ownership before its first update");
+            f.host.m_sharedDrops.clear(); f.host.m_sharedDropByEntityId.clear();
+            f.entities.GetEntity(103)->name = "CoopSharedDrop_77";
+            require(f.host.ShouldDeferNativeSharedItemPickup(&f.hostItem, 1, "unbound offline remainder"),
+                "failed reconstruction released an assigned source to vanilla pickup");
+            f.host.continuingHostWorld = false;
+            f.host.TickSharedDropPickupRetries(0.25f);
+            require(f.host.deliveryRestoreCalls == 3, "unestablished offline world reconstructed shared inventory");
         }},
         {"ordinary_offline_world_does_not_publish_personal_drops", [] {
             Fixture f;
