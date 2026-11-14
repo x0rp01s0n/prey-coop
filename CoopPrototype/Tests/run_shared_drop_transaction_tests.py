@@ -27,6 +27,7 @@ methods = [
     ("bool ModMain::RemoveSharedDropLocal(", "void ModMain::RestoreCommittedSharedDropDeliveries("),
     ("void ModMain::TickSharedDropPickupRetries(", "void ModMain::RecoverSavedSharedDrops("),
     ("void ModMain::RecoverSavedSharedDrops()", "void ModMain::PruneUnboundSharedDrops()"),
+    ("void ModMain::ReplaySharedDrops()", "void ModMain::ResetSharedDropState("),
     ("void ModMain::ResetSharedDropState(", "bool ModMain::DebugSharedDropCommand("),
 ]
 start = cpp.index("bool IsFiniteTransform(")

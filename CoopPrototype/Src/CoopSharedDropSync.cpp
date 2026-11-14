@@ -211,7 +211,9 @@ bool ModMain::SendSharedDropTo(
         for (const auto& entry : m_remotePeers)
         {
             const RemotePeerSession& peer = entry.second;
-            if (peer.levelId == packet.areaId && peer.worldEpoch == packet.worldEpoch &&
+            const bool assignedRecipient = packet.command == static_cast<uint16_t>(CoopProtocol::SharedDropCommand::PickupCommit) &&
+                packet.targetPeerHash == entry.first;
+            if ((peer.levelId == packet.areaId || assignedRecipient) && peer.worldEpoch == packet.worldEpoch &&
                 (peer.sessionFlags & CoopProtocol::kSessionFlagWorldReady) != 0)
                 sent = SendSharedDropToPeer(packet, entry.first, failurePrefix) && sent;
         }
@@ -240,7 +242,9 @@ bool ModMain::SendSharedDropToPeer(
         return false;
 
     const auto peerIt = m_remotePeers.find(peerHash);
-    if (peerIt == m_remotePeers.end() || peerIt->second.levelId != packet.areaId ||
+    const bool assignedRecipient = packet.command == static_cast<uint16_t>(CoopProtocol::SharedDropCommand::PickupCommit) &&
+        packet.targetPeerHash == peerHash;
+    if (peerIt == m_remotePeers.end() || (peerIt->second.levelId != packet.areaId && !assignedRecipient) ||
         peerIt->second.worldEpoch != packet.worldEpoch ||
         (peerIt->second.sessionFlags & CoopProtocol::kSessionFlagWorldReady) == 0 ||
         peerIt->second.address == 0 || peerIt->second.port == 0)
@@ -793,6 +797,8 @@ void ModMain::RestoreCommittedSharedDropDeliveries()
             record.live = false;
             if (found != m_sharedDrops.end() && found->second.localEntityId != record.localEntityId)
                 m_sharedDropByEntityId.erase(found->second.localEntityId);
+            if (found != m_sharedDrops.end())
+                record.areaId = found->second.areaId;
             found = m_sharedDrops.insert_or_assign(delivery.stableSpawnId, record).first;
         }
         if (found->second.pickupCommitted && !found->second.pickupDeliveryAttempted)
@@ -853,6 +859,8 @@ void ModMain::TickSharedDropPickupRetries(float frameTime)
         {
             if (record.pickupCommitted)
             {
+                if (!record.pickupDeliveryAttempted && !record.localPickupGranted)
+                    TryDeliverCommittedSharedDrop(record, false);
                 if (record.localPickupGranted && !record.pickupDeliveryStored)
                     PersistLocalSharedDropDelivery(record);
                 if (record.localPickupGranted && record.pickupDeliveryStored)
@@ -960,11 +968,21 @@ void ModMain::HandleSharedDrop(const CoopProtocol::SharedDropPacket& packet)
             command != CoopProtocol::SharedDropCommand::PickupGrant &&
             command != CoopProtocol::SharedDropCommand::PickupRelease);
     const auto sourcePeer = m_remotePeers.find(packet.sourcePeerHash);
+    const auto existing = m_sharedDrops.find(packet.stableSpawnId);
+    // A prepared pickup follows its recipient through native travel. Only an
+    // existing committed decision may cross areas; a new pickup may not.
+    const bool assignedDecision = existing != m_sharedDrops.end() &&
+        existing->second.pickupTransactionSequence == packet.sequence &&
+        ((m_networkMode == CoopNetworkMode::Host && existing->second.pickupCommitted &&
+            existing->second.pickupWinnerPeerHash == packet.sourcePeerHash &&
+            (command == CoopProtocol::SharedDropCommand::PickupReady || command == CoopProtocol::SharedDropCommand::PickupResult)) ||
+        (m_networkMode == CoopNetworkMode::Client && existing->second.pickupGrantReceived &&
+            packet.targetPeerHash == GetLocalAccountToken() && command == CoopProtocol::SharedDropCommand::PickupCommit));
     const bool sourceAreaAllowed = m_networkMode == CoopNetworkMode::Host
-        ? sourcePeer != m_remotePeers.end() && sourcePeer->second.levelId == packet.areaId &&
+        ? sourcePeer != m_remotePeers.end() && (sourcePeer->second.levelId == packet.areaId || assignedDecision) &&
             sourcePeer->second.worldEpoch == m_localWorldEpoch &&
             (sourcePeer->second.sessionFlags & CoopProtocol::kSessionFlagWorldReady) != 0
-        : packet.sourcePeerHash == GetSessionHostAccountToken() && packet.areaId == m_localLevelId;
+        : packet.sourcePeerHash == GetSessionHostAccountToken() && (packet.areaId == m_localLevelId || assignedDecision);
     if (packet.worldEpoch != m_localWorldEpoch ||
         packet.hostSaveKeyHash == 0 ||
         packet.hostSaveKeyHash != CurrentHostSaveKeyHash() ||
@@ -1593,11 +1611,18 @@ void ModMain::ReplaySharedDrops()
     for (const auto& entry : m_sharedDrops)
     {
         const SharedDropRecord& record = entry.second;
-        if (!record.live || record.pickupCommitted || record.areaId != replayArea)
+        const bool assignedRecipient = record.pickupCommitted &&
+            record.pickupWinnerPeerHash == peer->first && !record.pickupResultSucceeded;
+        if (!assignedRecipient && (!record.live || record.pickupCommitted || record.areaId != replayArea))
             continue;
         CoopProtocol::SharedDropPacket packet;
-        if (BuildSharedDropPacket(packet, CoopProtocol::SharedDropCommand::Spawn, record))
+        if (BuildSharedDropPacket(packet, assignedRecipient ? CoopProtocol::SharedDropCommand::PickupCommit :
+                CoopProtocol::SharedDropCommand::Spawn, record, assignedRecipient ? peer->first : 0))
+        {
+            if (assignedRecipient)
+                packet.sequence = record.pickupTransactionSequence;
             queue(packet);
+        }
     }
     // Same reliable stream: prune stale snapshot copies only after all live
     // sources have been adopted. Inventory-owned objects are never pruned.

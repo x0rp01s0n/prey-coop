@@ -123,6 +123,8 @@ public:
     bool materializedCanCollect = true;
     uint64_t m_sharedDropHostSessionId = 40;
     bool m_sharedDropDeliveryRecoveryRequired = false;
+    bool worldReady = true;
+    bool IsSharedDropWorldReady() const { return worldReady; }
     CoopNetworkMode m_networkMode = CoopNetworkMode::Client;
     bool m_multiplayerRestartRequired = false;
     unsigned m_sharedDropApplyDepth = 0;
@@ -247,6 +249,27 @@ int main() {
                 "inventory and receipt were not saved together");
             require(!f.entities.entities.at(7).physics && f.entities.entities.at(7).hidden, "nonweapon world copy visible");
             require(f.mod.TryDeliverCommittedSharedDrop(f.record()) && f.item.nativeCalls == 1, "repeated grant delivered twice");
+        }},
+        {"travel_defers_native_delivery_then_rebuilds_in_current_world", [] {
+            Fixture f;
+            f.mod.worldReady = false;
+            require(!f.mod.TryDeliverCommittedSharedDrop(f.record()) && f.item.nativeCalls == 0 &&
+                f.mod.m_localSharedDropDeliveries.empty(), "loading touched inventory or persisted a false receipt");
+            f.entities.entities.erase(7); CArkItem::items.erase(7);
+            f.record().localEntityId = INVALID_ENTITYID;
+            f.mod.m_sharedDropByEntityId.erase(7);
+            const auto sourceArea = f.record().areaId;
+            f.mod.m_localLevelId = sourceArea + 1;
+            f.mod.worldReady = true;
+            require(!f.mod.TryDeliverCommittedSharedDrop(f.record(), false) && f.receipt().deliveredCount == 0,
+                "missing source lost its assigned receipt");
+            f.mod.RestoreCommittedSharedDropDeliveries();
+            require(f.inventory.count == 15 && f.receipt().deliveredCount == 5 &&
+                f.record().areaId == sourceArea && f.mod.materializeCalls == 1,
+                "travel lost delivery or changed stable source area");
+            f.mod.RestoreCommittedSharedDropDeliveries();
+            require(f.inventory.count == 15 && f.mod.materializeCalls == 1,
+                "travel replay duplicated the assigned item");
         }},
         {"partial_native_false_counts_only_real_delta", [] {
             Fixture f; f.item.acquire = 2; f.item.nativeResult = false;

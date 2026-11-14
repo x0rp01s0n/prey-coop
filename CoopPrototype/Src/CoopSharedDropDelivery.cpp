@@ -82,7 +82,7 @@ bool ModMain::TryDeliverCommittedSharedDrop(SharedDropRecord& record, bool inter
 {
     ArkPlayer* player = ArkPlayer::GetInstancePtr();
     ArkInventory* inventory = player ? player->m_pInventory : nullptr;
-    if (m_sharedDropDeliveryRecoveryRequired || !record.pickupCommitted || record.pickupWinnerPeerHash != GetLocalAccountToken() ||
+    if (!IsSharedDropWorldReady() || m_sharedDropDeliveryRecoveryRequired || !record.pickupCommitted || record.pickupWinnerPeerHash != GetLocalAccountToken() ||
         record.pickupDeliveryInProgress || m_sharedDropApplyDepth != 0 ||
         m_sharedDropHostSessionId == 0 || !m_enablePlayerSidecar || !inventory ||
         record.count <= 0 || record.pickupTransactionSequence == 0 || record.version == 0 ||

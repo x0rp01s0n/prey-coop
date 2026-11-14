@@ -146,6 +146,7 @@ enum class CoopNetworkMode { Off, Host, Client };
 class ModMain {
 public:
     void RecoverSavedSharedDrops();
+    void ReplaySharedDrops();
     void ResetSharedDropState(const char*, bool = false);
     unsigned pruneCalls = 0;
     void PruneUnboundSharedDrops() { ++pruneCalls; }
@@ -1047,6 +1048,41 @@ int main(int argc, char**) {
             require(f.firstItem.inventoryCount == 1 && f.firstItem.nativeCalls == 1 &&
                 f.host.durable.size() == 1 && !f.row(f.host).live && f.entities.GetEntity(103),
                 "remote-area decision failed or mutated the coordinator's unrelated entity");
+        }},
+        {"committed_pickup_replayed_to_recipient_after_native_travel", [] {
+            Fixture f;
+            f.commit(); // The commit is lost while the recipient unloads.
+            f.first.DetachSharedDropEntities();
+            f.first.m_localLevelId = 20;
+            f.host.m_remotePeers.at(2).levelId = 20;
+            f.host.remoteToken = f.first.token;
+            f.host.sent.clear();
+            f.host.ReplaySharedDrops();
+            auto commit = Fixture::take(f.host, Command::PickupCommit);
+            require(commit.areaId == 10 && commit.targetPeerHash == 2,
+                "travel changed source identity or lost the assigned decision");
+            Fixture::deliver(f.first, commit);
+            require(f.row(f.first).pickupCommitted && !f.row(f.first).live &&
+                f.row(f.first).localEntityId == INVALID_ENTITYID && f.firstItem.nativeCalls == 0,
+                "travel commit was dropped or touched an unloaded native entity");
+            auto ready = commit;
+            ready.command = static_cast<uint16_t>(Command::PickupReady);
+            ready.sourcePeerHash = 2; ready.targetPeerHash = 1;
+            ready.flags = CoopProtocol::kSharedDropFlagPickupSucceeded;
+            Fixture::deliver(f.host, ready);
+            Fixture::take(f.host, Command::PickupCommit);
+            require(f.host.durable.size() == 1, "cross-area retry assigned the item twice");
+        }},
+        {"new_pickup_cannot_commit_after_recipient_left_source_area", [] {
+            Fixture f;
+            auto ready = f.ready();
+            f.host.m_remotePeers.at(2).levelId = 20;
+            Fixture::deliver(f.host, ready);
+            require(f.host.durable.empty() && !f.row(f.host).pickupCommitted,
+                "cross-area exception admitted a new ownership decision");
+            f.expire();
+            require(f.row(f.host).live && !f.row(f.host).pickupPending,
+                "abandoned preparation did not return its source to the world");
         }},
         {"remote_area_spawn_is_metadata_not_foreign_materialization", [] {
             Fixture f;
