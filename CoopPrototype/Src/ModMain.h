@@ -1723,6 +1723,7 @@ public:
     void OnLocalAreaObjectKeypadStateChanged(ArkKeypad* keypad, uint16_t eventKind, bool value, bool changed, const char* reason);
     void OnLocalAreaObjectKeycardReaderStateChanged(ArkKeycardReader* reader, uint16_t eventKind, bool value, bool changed, const char* reason);
     void OnLocalAreaObjectContainerStateChanged(ArkInventory* inventory, bool open, const char* reason);
+    void OnNativeSharedItemDropping(CArkItem* item);
     void OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const char* reason);
     void OnNativeRecyclerIngredientSpawned(EntityId itemEntityId, const char* reason);
     bool ShouldDeferNativeSharedItemPickup(CArkItem* item, EntityId pickerId, const char* reason);

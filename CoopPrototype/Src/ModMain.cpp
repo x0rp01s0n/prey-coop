@@ -19663,6 +19663,8 @@ static void CArkItem_Drop_Hook(CArkItem* item, int dropCount, const Vec3* altPos
     // Inventory overflow temporarily assigns the picker as owner, then calls
     // Drop to roll the failed pickup back when its menu closes. Only an item
     // that was actually in the inventory before Drop is a player-authored drop.
+    if (gMod && localPlayerDrop)
+        gMod->OnNativeSharedItemDropping(item);
 
     const CArkItem* previousSource = s_activeSharedDropSource;
     CArkItem* previousClone = s_activeSharedDropClone;

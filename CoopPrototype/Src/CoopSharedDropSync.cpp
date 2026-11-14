@@ -268,9 +268,35 @@ bool ModMain::SendSharedDropToPeer(
     return true;
 }
 
+void ModMain::OnNativeSharedItemDropping(CArkItem* item)
+{
+    if (!item || m_networkMode != CoopNetworkMode::Off || !m_sharedDropHostSessionId ||
+        !HasContinuingHostInventoryWorld() || !IsSharedDropWorldReady())
+        return;
+    IEntity* entity = item->GetEntity();
+    const char* name = entity ? entity->GetName() : nullptr;
+    uint64_t stableId = 0;
+    if (!name || std::strncmp(name, "CoopSharedDrop_", 15) != 0 ||
+        !ParsePositiveInteger(std::string(name + 15), stableId))
+        return;
+    const auto found = m_sharedDrops.find(stableId);
+    if (found == m_sharedDrops.end() || found->second.areaId != m_localLevelId ||
+        found->second.archetypeId != item->GetArchetype())
+        return;
+    // The Drop hook proved native inventory membership. This public source
+    // was collected while Off; retire it before vanilla reuses/clones the item.
+    found->second.live = false;
+    found->second.pickupPending = false;
+    found->second.localEntityId = INVALID_ENTITYID;
+    m_sharedDropByEntityId.erase(entity->GetId());
+}
+
 void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const char* reason)
 {
-    if (!item || m_sharedDropApplyDepth != 0 || !IsSharedDropWorldReady() || !IsSharedDropServiceReady())
+    const bool continuingOfflineHost = m_networkMode == CoopNetworkMode::Off &&
+        m_sharedDropHostSessionId != 0 && HasContinuingHostInventoryWorld();
+    if (!item || m_sharedDropApplyDepth != 0 || !IsSharedDropWorldReady() ||
+        (!IsSharedDropServiceReady() && !continuingOfflineHost))
     {
         return;
     }
@@ -343,6 +369,11 @@ void ModMain::OnNativeSharedItemDropped(CArkItem* item, int droppedCount, const 
     m_sharedDrops[record.stableSpawnId] = record;
     m_sharedDropByEntityId[record.localEntityId] = record.stableSpawnId;
     RetireLivePropTrackingForSharedDrop(record.localEntityId);
+
+    // Stopping networking does not end this native world. Retain offline
+    // redrops for the next rehost, but do not send packets while Off.
+    if (continuingOfflineHost)
+        return;
 
     CoopProtocol::SharedDropPacket packet;
     if (!BuildSharedDropPacket(packet, CoopProtocol::SharedDropCommand::Spawn, record) ||

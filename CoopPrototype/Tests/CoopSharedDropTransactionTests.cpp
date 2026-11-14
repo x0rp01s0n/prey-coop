@@ -180,6 +180,8 @@ public:
     std::string m_localInventoryDirtySaveKey;
     uint64_t m_localInventoryDirtyHostAccountToken = 0;
     bool gameplayReady = true;
+    bool continuingHostWorld = false;
+    bool HasContinuingHostInventoryWorld() const { return continuingHostWorld; }
     bool m_saveLoadGuardActive = false;
     bool m_pendingPostLoadResync = false;
     bool m_arkLevelTransitionLoadActive = false;
@@ -209,6 +211,7 @@ public:
     bool IsSharedDropServiceReady() const;
     void DetachSharedDropEntities();
     uint64_t BuildSharedDropStableId(uint64_t, const Vec3&, uint32_t) const;
+    void OnNativeSharedItemDropping(CArkItem*);
     void OnNativeSharedItemDropped(CArkItem*, int, const char*);
     void RetireLivePropTrackingForSharedDrop(EntityId) {}
     void MarkLocalInventoryDirty(const char*) { m_localInventoryDirty = true; }
@@ -1143,6 +1146,32 @@ int main(int argc, char**) {
             require(f.row(f.host).localEntityId == 103 && f.host.m_sharedDropByEntityId.at(103) == stable &&
                 f.host.materializeCalls == 0 && f.entities.GetEntity(103),
                 "return duplicated or lost the native saved source");
+        }},
+        {"continuing_offline_host_redrop_gets_fresh_identity_without_network", [] {
+            for (const bool committed : {false, true}) {
+                Fixture f;
+                f.entities.GetEntity(103)->name = "CoopSharedDrop_77";
+                f.row(f.host).live = !committed;
+                f.row(f.host).pickupCommitted = committed;
+                f.host.m_networkMode = CoopNetworkMode::Off;
+                f.host.continuingHostWorld = true;
+                f.host.DetachSharedDropEntities();
+                f.host.OnNativeSharedItemDropping(&f.hostItem);
+                f.host.OnNativeSharedItemDropped(&f.hostItem, 1, "offline native redrop");
+                const auto next = f.host.m_sharedDropByEntityId.at(103);
+                require(next != stable && !f.row(f.host).live && f.host.m_sharedDrops.at(next).live &&
+                    f.row(f.host).localEntityId == INVALID_ENTITYID && f.host.sent.empty(),
+                    "offline redrop revived its old receipt, sent packets, or lost its new source");
+            }
+        }},
+        {"ordinary_offline_world_does_not_publish_personal_drops", [] {
+            Fixture f;
+            f.host.m_networkMode = CoopNetworkMode::Off;
+            f.host.OnNativeSharedItemDropping(&f.hostItem);
+            f.host.OnNativeSharedItemDropped(&f.hostItem, 1, "single player drop");
+            require(f.host.m_sharedDrops.size() == 1 && f.host.m_sharedDropByEntityId.at(103) == stable &&
+                f.entities.GetEntity(103)->name.empty() && f.host.sent.empty(),
+                "offline capture changed ordinary vanilla loot");
         }},
         {"return_deduplicates_saved_entities_with_same_public_source", [] {
             Fixture f;
