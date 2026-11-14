@@ -276,13 +276,18 @@ constexpr uint32_t kAreaObjectDoorStateFlagLocked = 1u << 2;
 constexpr uint32_t kAreaObjectDoorStateFlagScriptState = 1u << 3;
 constexpr uint32_t kAreaObjectDoorStateFlagPowerSupplied = 1u << 4;
 constexpr uint32_t kAreaObjectDoorStateFlagDisrupted = 1u << 5;
+constexpr uint32_t kAreaObjectDoorStateFlagExplicitOpen = 1u << 6;
+// Live-event evidence only: the sender's own player was in the native area.
+constexpr uint32_t kAreaObjectDoorStateFlagSenderInside = 1u << 7;
 constexpr uint32_t kAreaObjectDoorStateFlagMask =
     kAreaObjectDoorStateFlagSnapshot |
     kAreaObjectDoorStateFlagPowered |
     kAreaObjectDoorStateFlagLocked |
     kAreaObjectDoorStateFlagScriptState |
     kAreaObjectDoorStateFlagPowerSupplied |
-    kAreaObjectDoorStateFlagDisrupted;
+    kAreaObjectDoorStateFlagDisrupted |
+    kAreaObjectDoorStateFlagExplicitOpen |
+    kAreaObjectDoorStateFlagSenderInside;
 constexpr uint16_t kAreaObjectEventWorldItemRemoved = 4;
 constexpr uint16_t kAreaObjectEventKeypadLocked = 5;
 constexpr uint16_t kAreaObjectEventKeycardReaderLocked = 6;

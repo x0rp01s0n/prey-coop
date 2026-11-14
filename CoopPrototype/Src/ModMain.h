@@ -35,7 +35,6 @@
 #include "CoopAreaObjectJournal.h"
 #include "CoopAreaStateOverlay.h"
 #include "CoopSaveStateBridge.h"
-#include "CoopSharedDropDelivery.h"
 #include "NullUi.h"
 
 #include <Chairloader/IChairRender.h>
@@ -1561,6 +1560,8 @@ public:
         uint32_t weaponModCount = 0;
         uint32_t weaponModTotalLevel = 0;
         std::vector<std::pair<uint64_t, int>> weaponMods;
+        EntityId pendingRestoreEntityId = INVALID_ENTITYID; // Runtime-only placement retry; not serialized.
+        bool pendingRestoreBlocked = false; // Runtime-only fail-closed marker for ambiguous native insertion.
     };
 
     struct PlayerAbilityState
@@ -1683,6 +1684,9 @@ public:
     void OnLocalStoryReadableCollected(void* component, uint16_t eventKind, uint64_t id, bool changed, const char* reason);
     void OnLocalStoryRosterStateChanged(ArkRosterComponent* component, uint16_t eventKind, uint64_t id, bool changed, const char* reason);
     void SetRemoteDoorTraversalPhysics(ArkDoor* door, bool open, const char* reason);
+    bool TryGetAutomaticDoorOccupancy(ArkDoor* door, bool& occupied) const;
+    bool ShouldDeferAutomaticDoorClose(ArkDoor* door) const;
+    void TraceAutomaticDoorDecision(ArkDoor* door, const char* reason) const;
     void OnLocalAreaObjectDoorStateChanged(ArkDoor* door, uint16_t eventKind, bool value, bool changed, const char* reason);
     void OnLocalAreaObjectInteractiveObjectStateChanged(IEntity* entity, uint16_t eventKind, bool value, bool changed, const char* reason);
     void OnLocalAreaObjectSwitchStateChanged(IEntity* entity, bool on, bool changed, const char* reason);
@@ -1933,7 +1937,7 @@ private:
     void HandleReliableAck(const CoopProtocol::ReliableAckPacket& packet, uint32_t fromAddress, uint16_t fromPort);
     void HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket& packet, uint32_t fromAddress, uint16_t fromPort);
     void DrainReliableReorderBuffer(uint64_t endpointKey, uint32_t fromAddress, uint16_t fromPort);
-    void HandleReliablePayload(uint16_t payloadType, const uint8_t* payload, uint16_t payloadSize);
+    void HandleReliablePayload(uint16_t payloadType, const uint8_t* payload, uint16_t payloadSize, uint64_t& doorOpenConfirmationGuid);
     bool HandleSessionHello(const CoopProtocol::SessionHelloPacket& packet, uint32_t fromAddress, uint16_t fromPort);
     void HandlePeerPresence(const CoopProtocol::PeerPresencePacket& packet);
     bool SendPeerPresenceTo(const RemotePeerSession& peer, CoopProtocol::PeerPresenceCommand command, uint32_t address, uint16_t port, const char* failurePrefix);
@@ -1992,16 +1996,19 @@ private:
     void HandleEnemyMannequinAction(const CoopProtocol::EnemyMannequinActionPacket& packet);
     void HandleClientTurretStateRequest(const CoopProtocol::EnemyAbilityFxEventPacket& packet);
     void HandleStoryEvent(const CoopProtocol::StoryEventPacket& packet);
-    void HandleAreaObjectEvent(const CoopProtocol::AreaObjectEventPacket& packet);
+    void HandleAreaObjectEvent(const CoopProtocol::AreaObjectEventPacket& packet, uint64_t& doorOpenConfirmationGuid);
     void ResetStoryEventState(const char* lastEvent);
     void ResetAreaObjectEventState(const char* lastEvent, bool preserveAreaDrops = false);
     bool QueueLocalStoryEventForHook(uint16_t eventKind, uint64_t targetId, int32_t count, uint16_t flags, const char* reason, const char* textValue = nullptr, uint64_t contextEntityGuid = 0, uint64_t contextCharacterId = 0, uint16_t contextFlags = 0, int32_t contextChannel = -1);
     bool ApplyStoryEventMutation(const CoopProtocol::StoryEventPacket& packet, std::string& detail);
     bool QueueLocalAreaObjectEventForHook(uint16_t eventKind, uint64_t targetGuid, uint16_t value, uint32_t flags, const char* reason, int32_t count = 0, const char* textValue = nullptr);
-    bool ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPacket& packet, std::string& detail);
+    bool ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPacket& packet, std::string& detail, uint64_t* doorOpenConfirmationGuid = nullptr);
+    bool QueueLocalAreaObjectDoorSnapshot(ArkDoor* door, const char* reason, bool requireLocalOverlap = false);
+    void ConfirmOccupiedDoorOpen(uint64_t guid);
     void FinalizeAppliedAreaObjectEvent(const CoopProtocol::AreaObjectEventPacket& packet, const std::string& detail);
     bool ShouldCaptureRemoteAreaObjectConsequenceForHook(uint16_t eventKind) const;
     void TickRemoteDoorPowerConvergence(float frameTime);
+    std::vector<Vec3> GetDoorPlayerPositions() const;
     void TickArkElevatorTransitScan(float frameTime);
     bool ObserveArkElevatorTransitForAuthority(IEntity* entity);
     bool IsLocalPlayerInsideMainLiftShaft() const;

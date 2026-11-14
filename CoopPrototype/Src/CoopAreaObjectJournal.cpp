@@ -152,6 +152,10 @@ bool CoopAreaObjectJournal::Record(const std::string& levelName, const CoopProto
         return true;
 
     m_entries[key] = Entry{ levelName, packet };
+    // An event-time overlap is not evidence that its sender is still present
+    // when a saved area is restored or sent to a late joiner.
+    if (packet.eventKind == CoopProtocol::kAreaObjectEventDoorOpen)
+        m_entries[key].packet.flags &= ~CoopProtocol::kAreaObjectDoorStateFlagSenderInside;
     return true;
 }
 
@@ -257,6 +261,8 @@ bool CoopAreaObjectJournal::ReplayLevelJsonl(
         std::copy(textValue.begin(), textValue.end(), packet.textValue);
         packet.textValue[textValue.size()] = '\0';
         packet.flags = static_cast<uint32_t>(flags);
+        if (packet.eventKind == CoopProtocol::kAreaObjectEventDoorOpen)
+            packet.flags &= ~CoopProtocol::kAreaObjectDoorStateFlagSenderInside;
         packet.worldEpoch = static_cast<uint32_t>(worldEpoch);
         packet.preVersion = static_cast<uint32_t>(preVersion);
         packet.postVersion = static_cast<uint32_t>(postVersion);

@@ -12,6 +12,7 @@
 #include "CoopPlayerStateStore.h"
 #include "CoopPtrHygiene.h"
 #include "CoopDamagePolicy.h"
+#include "CoopDoorRangePolicy.h"
 #include "CoopCampaignAreaFacts.generated.h"
 #include "CoopCampaignStoryFacts.generated.h"
 #include "CoopEnemyStateWire.h"
@@ -7955,6 +7956,10 @@ static auto s_hookArkRosterComponentSetCharacterWasDiscovered = ArkRosterCompone
 static auto s_hookArkRosterComponentKillCharacter = ArkRosterComponent::FKillCharacter.MakeHook();
 static auto s_hookArkDoorOpen = ArkDoor::FOpen.MakeHook();
 static auto s_hookArkDoorPostSerialize = ArkDoor::FPostSerialize.MakeHook();
+static auto s_hookArkDoorPostInit = ArkDoor::FPostInit.MakeHook();
+static auto s_hookArkDoorProcessEvent = ArkDoor::FProcessEvent.MakeHook();
+static auto s_hookArkDoorRelease = ArkDoor::FRelease.MakeHook();
+static auto s_hookArkDoorUpdate = ArkDoor::FUpdate.MakeHook();
 static auto s_hookArkDoorOnOpen = ArkDoor::FOnOpen.MakeHook();
 static auto s_hookArkDoorOnClose = ArkDoor::FOnClose.MakeHook();
 static auto s_hookArkDoorOnLock = ArkDoor::FOnLock.MakeHook();
@@ -8012,6 +8017,79 @@ static auto s_hookArkRotatorSetActive = s_funcArkRotatorSetActive.MakeHook();
 // complete object observed by those hooks so GUID-targeted replay can still
 // resolve that authored door (notably Arboretum's Loading Bay door).
 static std::unordered_map<EntityId, ArkDoor*> s_observedArkDoors;
+
+struct AutomaticDoorRange
+{
+    EntityId entityId = INVALID_ENTITYID;
+    Matrix34 worldToLocal = Matrix34(IDENTITY);
+    Vec3 dimensions = Vec3(ZERO);
+    bool explicitOpen = false;
+    uint32_t remoteRevision = 0;
+    int remoteOpened = -1;
+    bool remoteAccepted = false;
+};
+static std::unordered_map<ArkDoor*, AutomaticDoorRange> s_automaticDoorRanges;
+static thread_local ArkDoor* s_automaticOpeningDoor = nullptr;
+static ArkDoor* s_diagnosticDoor = nullptr;
+static std::deque<std::string> s_diagnosticDoorEvents;
+static uint64_t s_diagnosticDoorSequence = 0;
+static uint64_t s_diagnosticDoorUpdateEntries = 0;
+static uint64_t s_diagnosticDoorUpdateReturns = 0;
+static uint64_t s_diagnosticDoorLastUpdateMs = 0;
+static int s_diagnosticDoorLastUpdateSlot = -1;
+
+struct AutomaticDoorOpenScope
+{
+    ArkDoor* previous;
+    explicit AutomaticDoorOpenScope(ArkDoor* door) : previous(s_automaticOpeningDoor)
+    {
+        s_automaticOpeningDoor = door;
+    }
+    ~AutomaticDoorOpenScope() { s_automaticOpeningDoor = previous; }
+};
+
+static void RefreshAutomaticDoorRange(ArkDoor* door, bool resetState = false)
+{
+    if (!door)
+        return;
+    AutomaticDoorRange range;
+    uint64_t guid = 0;
+    Matrix34 world(IDENTITY);
+    const bool valid = TryGuardedVoidCall("automatic door authored range", [&]()
+    {
+        IEntity* entity = door->GetEntity();
+        if (!entity || !door->IsAreaTriggered())
+            return;
+        range.entityId = entity->GetId();
+        guid = entity->GetGuid();
+        range.dimensions = door->m_triggerDimensions;
+        world = entity->GetWorldTM();
+    }, nullptr);
+    const float determinant = world.GetColumn0().Dot(world.GetColumn1().Cross(world.GetColumn2()));
+    if (!valid || range.entityId == INVALID_ENTITYID || guid == kCoopLobbyMainLiftDoorGuid ||
+        !CoopDoorRangePolicy::Contains(range.dimensions, Vec3(0, 0, 0)) ||
+        !world.GetTranslation().IsValid() || !std::isfinite(determinant) || std::abs(determinant) < 0.000001f)
+    {
+        s_automaticDoorRanges.erase(door);
+        return;
+    }
+    range.worldToLocal = world.GetInverted();
+    const auto previous = s_automaticDoorRanges.find(door);
+    if (!resetState && previous != s_automaticDoorRanges.end())
+    {
+        range.explicitOpen = previous->second.explicitOpen;
+        range.remoteRevision = previous->second.remoteRevision;
+        range.remoteOpened = previous->second.remoteOpened;
+        range.remoteAccepted = previous->second.remoteAccepted;
+    }
+    s_automaticDoorRanges[door] = range;
+}
+
+static bool IsInAutomaticDoorRange(const AutomaticDoorRange& range, const Vec3& position)
+{
+    return position.IsValid() && CoopDoorRangePolicy::Contains(
+        range.dimensions, range.worldToLocal.TransformPoint(position));
+}
 
 static void RememberObservedArkDoor(ArkDoor* door)
 {
@@ -19970,22 +20048,46 @@ static bool TryReadArkDoorBool(ArkDoor* door, bool ArkDoor::*field, bool& value,
     return TryGuardedCall(label, [door, field]() { return door->*field; }, value, reason);
 }
 
+static bool TryReadArkDoorUpdateEnables(ArkDoor* door, int& enables)
+{
+    enables = -1;
+    return door && TryGuardedCall(
+        "door update enables",
+        [door]() -> int
+        {
+            IGameObject* gameObject = door->GetGameObject();
+            return gameObject
+                ? static_cast<int>(gameObject->GetUpdateSlotEnables(
+                    static_cast<IGameObjectExtension*>(door), 0))
+                : -1;
+        },
+        enables,
+        nullptr) && enables >= 0;
+}
+
 static void ForceArkDoorRuntimeUpdate(ArkDoor* door, const char* label)
 {
     if (!door)
         return;
-    std::string reason;
-    TryGuardedVoidCall(
-        label ? label : "door force runtime update",
-        [door]()
-        {
-            // Serialized doors can retain the marker while CryGame has already
-            // disabled their update slot. Re-arm the native slot so animation,
-            // collision, navigation, and the automatic-close timer advance.
-            door->m_bMarkedForUpdate = false;
-            door->MarkForUpdate();
-        },
-        &reason);
+    int enables = -1;
+    const bool enablesKnown = TryReadArkDoorUpdateEnables(door, enables);
+    if (!enablesKnown || enables == 0)
+    {
+        std::string reason;
+        TryGuardedVoidCall(
+            label ? label : "door force runtime update",
+            [door, enablesKnown]()
+            {
+                // EnableUpdateSlot is a reference counter, not a boolean.
+                // Only repair a stale serialized marker when the slot is off.
+                if (enablesKnown)
+                    door->m_bMarkedForUpdate = false;
+                door->MarkForUpdate();
+            },
+            &reason);
+    }
+    if (gMod && s_diagnosticDoor == door)
+        gMod->TraceAutomaticDoorDecision(door, "rearm_update_return");
 }
 
 struct ArkDoorScriptPresentationState
@@ -20658,6 +20760,7 @@ static int ScriptBindEntity_GotoState_Hook(
 
 static void ArkDoor_OnOpen_Hook(ArkDoor* door)
 {
+    if (gMod) gMod->TraceAutomaticDoorDecision(door, "OnOpen_enter");
     RememberObservedArkDoor(door);
     bool before = false;
     bool after = true;
@@ -20665,6 +20768,7 @@ static void ArkDoor_OnOpen_Hook(ArkDoor* door)
     const bool beforeOk = TryReadArkDoorBool(door, &ArkDoor::m_bOpened, before, "area object door opened before", &reason);
 
     s_hookArkDoorOnOpen.InvokeOrig(door);
+    if (gMod) gMod->TraceAutomaticDoorDecision(door, "OnOpen_native_return");
     ForceArkDoorRuntimeUpdate(door, "ArkDoor::OnOpen rearm update slot");
 
     const bool afterOk = TryReadArkDoorBool(door, &ArkDoor::m_bOpened, after, "area object door opened after", &reason);
@@ -20681,6 +20785,7 @@ static void ArkDoor_PostSerialize_Hook(ArkDoor* door)
 {
     s_hookArkDoorPostSerialize.InvokeOrig(door);
     RememberObservedArkDoor(door);
+    RefreshAutomaticDoorRange(door, true);
     if (!door)
         return;
 
@@ -20729,6 +20834,50 @@ static void ArkDoor_PostSerialize_Hook(ArkDoor* door)
         &reason);
 }
 
+static void ArkDoor_PostInit_Hook(ArkDoor* door, IGameObject* gameObject)
+{
+    s_hookArkDoorPostInit.InvokeOrig(door, gameObject);
+    RememberObservedArkDoor(door);
+    RefreshAutomaticDoorRange(door, true);
+}
+
+static void ArkDoor_ProcessEvent_Hook(ArkDoor* door, SEntityEvent& event)
+{
+    s_hookArkDoorProcessEvent.InvokeOrig(door, event);
+    if (event.event == ENTITY_EVENT_XFORM || event.event == ENTITY_EVENT_RESET ||
+        event.event == ENTITY_EVENT_START_GAME)
+        RefreshAutomaticDoorRange(door, event.event != ENTITY_EVENT_XFORM);
+}
+
+static void ArkDoor_Release_Hook(ArkDoor* door)
+{
+    if (s_diagnosticDoor == door) s_diagnosticDoor = nullptr;
+    s_automaticDoorRanges.erase(door);
+    for (auto it = s_observedArkDoors.begin(); it != s_observedArkDoors.end();)
+        if (it->second == door)
+            it = s_observedArkDoors.erase(it);
+        else
+            ++it;
+    s_hookArkDoorRelease.InvokeOrig(door);
+}
+
+static void ArkDoor_Update_Hook(ArkDoor* door, SEntityUpdateContext& context, int slot)
+{
+    if (door && s_diagnosticDoor == door)
+    {
+        ++s_diagnosticDoorUpdateEntries;
+        s_diagnosticDoorLastUpdateMs = GetTickCount64();
+        s_diagnosticDoorLastUpdateSlot = slot;
+    }
+    // Native Update's non-pry OnOpen path is the area/NPC occupancy decision.
+    // Script/button calls outside it must not inherit the spatial-open gate.
+    AutomaticDoorOpenScope scope(door && door->m_pryState == ArkDoor::EArkPryState::none
+        ? door : nullptr);
+    s_hookArkDoorUpdate.InvokeOrig(door, context, slot);
+    if (door && s_diagnosticDoor == door)
+        ++s_diagnosticDoorUpdateReturns;
+}
+
 static void ArkDoor_Open_Hook(ArkDoor* door)
 {
     // FOpen is the IArkDoor virtual target. Its native this pointer is the
@@ -20738,6 +20887,7 @@ static void ArkDoor_Open_Hook(ArkDoor* door)
     ArkDoor* completeDoor = door
         ? reinterpret_cast<ArkDoor*>(reinterpret_cast<uintptr_t>(door) - 0x48u)
         : nullptr;
+    if (gMod) gMod->TraceAutomaticDoorDecision(completeDoor, "Open_enter");
     RememberObservedArkDoor(completeDoor);
     bool before = false;
     bool after = true;
@@ -20745,6 +20895,7 @@ static void ArkDoor_Open_Hook(ArkDoor* door)
     const bool beforeOk = TryReadArkDoorBool(completeDoor, &ArkDoor::m_bOpened, before, "area object door opened before native open", &reason);
 
     s_hookArkDoorOpen.InvokeOrig(door);
+    if (gMod) gMod->TraceAutomaticDoorDecision(completeDoor, "Open_native_return");
     ForceArkDoorRuntimeUpdate(completeDoor, "ArkDoor::Open rearm update slot");
 
     const bool afterOk = TryReadArkDoorBool(completeDoor, &ArkDoor::m_bOpened, after, "area object door opened after native open", &reason);
@@ -20759,7 +20910,13 @@ static void ArkDoor_Open_Hook(ArkDoor* door)
 
 static bool ArkDoor_OnClose_Hook(ArkDoor* door)
 {
+    if (gMod) gMod->TraceAutomaticDoorDecision(door, "OnClose_enter");
     RememberObservedArkDoor(door);
+    if (gMod && gMod->ShouldDeferAutomaticDoorClose(door))
+    {
+        gMod->TraceAutomaticDoorDecision(door, "OnClose_deferred");
+        return false;
+    }
     bool before = true;
     bool after = false;
     std::string reason;
@@ -20768,6 +20925,7 @@ static bool ArkDoor_OnClose_Hook(ArkDoor* door)
     if (gMod && door)
         gMod->SetRemoteDoorTraversalPhysics(door, false, "ArkDoor::OnClose");
     const bool result = s_hookArkDoorOnClose.InvokeOrig(door);
+    if (gMod) gMod->TraceAutomaticDoorDecision(door, "OnClose_native_return");
     ForceArkDoorRuntimeUpdate(door, "ArkDoor::OnClose rearm update slot");
 
     const bool afterOk = TryReadArkDoorBool(door, &ArkDoor::m_bOpened, after, "area object door opened after close", &reason);
@@ -32058,6 +32216,10 @@ void ModMain::InitHooks()
     {
         s_hookArkDoorOpen.SetHookFunc(&ArkDoor_Open_Hook);
         s_hookArkDoorPostSerialize.SetHookFunc(&ArkDoor_PostSerialize_Hook);
+        s_hookArkDoorPostInit.SetHookFunc(&ArkDoor_PostInit_Hook);
+        s_hookArkDoorProcessEvent.SetHookFunc(&ArkDoor_ProcessEvent_Hook);
+        s_hookArkDoorRelease.SetHookFunc(&ArkDoor_Release_Hook);
+        s_hookArkDoorUpdate.SetHookFunc(&ArkDoor_Update_Hook);
         s_hookArkDoorOnOpen.SetHookFunc(&ArkDoor_OnOpen_Hook);
         s_hookArkDoorOnClose.SetHookFunc(&ArkDoor_OnClose_Hook);
         s_hookArkDoorOnLock.SetHookFunc(&ArkDoor_OnLock_Hook);
@@ -46899,10 +47061,12 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
         }
     }
     else if (command == "coop_area_door_probe" ||
+        command == "coop_area_door_trace" ||
         command == "coop_area_door_set" ||
         command == "coop_area_door_set_local")
     {
-        const bool setMode = command != "coop_area_door_probe";
+        const bool traceMode = command == "coop_area_door_trace";
+        const bool setMode = command == "coop_area_door_set" || command == "coop_area_door_set_local";
         const bool localOnlyMode = command == "coop_area_door_set_local";
         std::string target = args.empty() ? std::string("nearest") : args.front();
         if (setMode && args.size() < 3)
@@ -46940,6 +47104,8 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
             bool locked = false;
             bool powered = false;
             bool markedForUpdate = false;
+            int updateEnables = -1;
+            bool updateEnablesKnown = false;
             bool areaTriggered = false;
             bool playingAnimation = false;
             bool centerBlockedByDoor = false;
@@ -46961,6 +47127,7 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
                 TryReadArkDoorBool(door, &ArkDoor::m_bLocked, locked, "runtime area door locked", &reason);
                 TryReadArkDoorBool(door, &ArkDoor::m_bPowered, powered, "runtime area door powered", &reason);
                 TryReadArkDoorBool(door, &ArkDoor::m_bMarkedForUpdate, markedForUpdate, "runtime area door update marker", &reason);
+                updateEnablesKnown = TryReadArkDoorUpdateEnables(door, updateEnables);
                 TryGuardedCall("runtime area door IsAreaTriggered", [door]() { return door->IsAreaTriggered(); }, areaTriggered, &reason);
                 TryGuardedCall("runtime area door IsPlayingAnimation", [door]() { return door->IsPlayingAnimation(); }, playingAnimation, &reason);
                 TryGuardedCall("runtime area door area entity count", [door]() { return door->m_entitiesInArea.size(); }, areaEntities, &reason);
@@ -46978,7 +47145,42 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
                     TryReadArkDoorScriptPresentation(
                         doorEntity, scriptPresentation, &reason, true);
                 }
-                if (setMode)
+                if (traceMode)
+                {
+                    const std::string mode = args.size() > 1 ? ToLowerAscii(args[1]) : "dump";
+                    ok = true;
+                    action = "area_door_trace";
+                    if (mode == "start")
+                    {
+                        s_diagnosticDoor = door;
+                        s_diagnosticDoorEvents.clear();
+                        s_diagnosticDoorSequence = 0;
+                        s_diagnosticDoorUpdateEntries = 0;
+                        s_diagnosticDoorUpdateReturns = 0;
+                        s_diagnosticDoorLastUpdateMs = 0;
+                        s_diagnosticDoorLastUpdateSlot = -1;
+                        TraceAutomaticDoorDecision(door, "trace_start");
+                    }
+                    else if (mode == "stop")
+                    {
+                        s_diagnosticDoor = nullptr;
+                    }
+                    else if (mode == "dump")
+                    {
+                        const auto exportPath = CoopFilesystem::FromUtf8(m_runtimeExtractor.GetLatestExportPath());
+                        std::ofstream output(exportPath.parent_path() / "door_decisions.log", std::ios::trunc);
+                        for (const auto& event : s_diagnosticDoorEvents)
+                            output << event << '\n';
+                        output.flush();
+                        ok = output.good();
+                    }
+                    else
+                    {
+                        ok = false;
+                        reason = "expected_start_dump_stop";
+                    }
+                }
+                else if (setMode)
                 {
                     const std::string field = ToLowerAscii(args[1]);
                     const bool desired = std::atoi(args[2].c_str()) != 0;
@@ -46987,8 +47189,9 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
                         ok = false;
                         reason = "local_only_requires_powered_field";
                     }
-                    else if (field == "open" || field == "opened")
+                    else if (field == "open" || field == "opened" || field == "proximity_open")
                     {
+                        AutomaticDoorOpenScope scope(field == "proximity_open" ? door : nullptr);
                         ++m_localAreaObjectCommandMutationDepth;
                         if (desired)
                         {
@@ -47084,6 +47287,7 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
                 {
                     action = "area_door_probe";
                     ok = true;
+                    TraceAutomaticDoorDecision(door, "probe");
                 }
 
                 if (doorEntity)
@@ -47092,14 +47296,29 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
                         doorEntity, scriptPresentation, &reason, true);
                 }
 
+                bool rangeOccupied = false;
+                const bool rangeControlled = TryGetAutomaticDoorOccupancy(door, rangeOccupied);
+                const auto range = s_automaticDoorRanges.find(door);
                 m_networkStatus =
                     action +
                     "_id_" + std::to_string(entityId) +
                     "_guid_" + std::to_string(guid) +
                     "_open_" + std::to_string(opened ? 1 : 0) +
+                    "_range_controlled_" + std::to_string(rangeControlled ? 1 : 0) +
+                    "_range_occupied_" + std::to_string(rangeOccupied ? 1 : 0) +
+                    "_range_depth_" + std::to_string(range != s_automaticDoorRanges.end() ? range->second.dimensions.y : 0.0f) +
+                    "_explicit_open_" + std::to_string(range != s_automaticDoorRanges.end() && range->second.explicitOpen ? 1 : 0) +
+                    "_remote_revision_" + std::to_string(range != s_automaticDoorRanges.end() ? range->second.remoteRevision : 0) +
+                    "_remote_open_" + std::to_string(range != s_automaticDoorRanges.end() ? range->second.remoteOpened : -1) +
+                    "_remote_accepted_" + std::to_string(range != s_automaticDoorRanges.end() && range->second.remoteAccepted ? 1 : 0) +
                     "_locked_" + std::to_string(locked ? 1 : 0) +
                     "_powered_" + std::to_string(powered ? 1 : 0) +
                     "_update_marked_" + std::to_string(markedForUpdate ? 1 : 0) +
+                    "_update_enables_known_" + std::to_string(updateEnablesKnown ? 1 : 0) +
+                    "_update_enables_" + std::to_string(updateEnables) +
+                    "_update_entries_" + std::to_string(s_diagnosticDoor == door ? s_diagnosticDoorUpdateEntries : 0) +
+                    "_update_returns_" + std::to_string(s_diagnosticDoor == door ? s_diagnosticDoorUpdateReturns : 0) +
+                    "_last_update_ms_" + std::to_string(s_diagnosticDoor == door ? s_diagnosticDoorLastUpdateMs : 0) +
                     "_area_triggered_" + std::to_string(areaTriggered ? 1 : 0) +
                     "_area_entities_" + std::to_string(areaEntities) +
                     "_animating_" + std::to_string(playingAnimation ? 1 : 0) +
@@ -60724,6 +60943,197 @@ bool ModMain::QueueLocalStoryEventForHook(
     return true;
 }
 
+std::vector<Vec3> ModMain::GetDoorPlayerPositions() const
+{
+    std::vector<Vec3> positions;
+    ArkPlayer* player = ArkPlayer::GetInstancePtr();
+    IEntity* entity = player ? player->GetEntity() : nullptr;
+    if (entity)
+        positions.push_back(entity->GetWorldPos());
+    for (const auto& entry : m_remotePeers)
+    {
+        const RemotePeerSession& peer = entry.second;
+        if (peer.sessionReady && peer.lastPoseSequence != 0 &&
+            peer.worldEpoch == m_localWorldEpoch &&
+            (peer.sessionFlags & CoopProtocol::kSessionFlagWorldReady) != 0 &&
+            IsKnownSameLevel(peer.levelName, m_localLevelName))
+        {
+            // Use the received position, not the deliberately trailing visual proxy.
+            positions.push_back(peer.poseSmoothing.valid
+                ? peer.poseSmoothing.targetPosition : peer.location);
+        }
+    }
+    return positions;
+}
+
+bool ModMain::TryGetAutomaticDoorOccupancy(ArkDoor* door, bool& occupied) const
+{
+    occupied = false;
+    if (!door || m_networkMode == CoopNetworkMode::Off)
+        return false;
+    auto found = s_automaticDoorRanges.find(door);
+    if (found == s_automaticDoorRanges.end())
+    {
+        RefreshAutomaticDoorRange(door);
+        found = s_automaticDoorRanges.find(door);
+        if (found == s_automaticDoorRanges.end())
+            return false;
+    }
+    const AutomaticDoorRange& range = found->second;
+    if (m_saveLoadGuardActive || m_pendingPostLoadResync ||
+        m_arkLevelTransitionLoadActive || !IsGameReady())
+        return true;
+    for (const Vec3& position : GetDoorPlayerPositions())
+        if (IsInAutomaticDoorRange(range, position))
+        {
+            occupied = true;
+            return true;
+        }
+
+    // Preserve native occupants too, but never treat a trailing or stale
+    // co-op visual proxy as independent occupancy.
+    TryGuardedVoidCall("automatic door native occupants", [&]()
+    {
+        if (!gEnv || !gEnv->pEntitySystem || door->m_entitiesInArea.size() > 256)
+            return;
+        for (EntityId id : door->m_entitiesInArea)
+        {
+            bool proxy = false;
+            for (const auto& entry : m_remotePeers)
+                proxy = proxy || entry.second.proxyEntityId == id;
+            if (proxy)
+                continue;
+            IEntity* nativeEntity = gEnv->pEntitySystem->GetEntity(id);
+            IPhysicalEntity* physics = nativeEntity ? nativeEntity->GetPhysics() : nullptr;
+            if (!physics || !IsInAutomaticDoorRange(range, nativeEntity->GetWorldPos()))
+                continue;
+            pe_status_dynamics dynamics;
+            const bool moving = physics->GetStatus(&dynamics) != 0 &&
+                (std::abs(dynamics.v.x) > 0.1f || std::abs(dynamics.v.y) > 0.1f);
+            if (physics->GetType() == PE_LIVING || moving)
+            {
+                occupied = true;
+                break;
+            }
+        }
+    }, nullptr);
+    return true;
+}
+
+void ModMain::TraceAutomaticDoorDecision(ArkDoor* door, const char* reason) const
+{
+    if (!door || s_diagnosticDoor != door)
+        return;
+    const auto found = s_automaticDoorRanges.find(door);
+    if (found == s_automaticDoorRanges.end())
+        return;
+    const AutomaticDoorRange& range = found->second;
+    bool occupied = false;
+    TryGetAutomaticDoorOccupancy(door, occupied);
+    int updateEnables = -1;
+    const bool updateEnablesKnown = TryReadArkDoorUpdateEnables(door, updateEnables);
+    std::ostringstream out;
+    out << std::setprecision(9) << "seq=" << ++s_diagnosticDoorSequence
+        << " ms=" << GetTickCount64() << " reason=" << reason
+        << " remoteApply=" << m_applyingRemoteAreaObjectEvent
+        << " commandDepth=" << m_localAreaObjectCommandMutationDepth
+        << " nativeUpdateScope=" << (s_automaticOpeningDoor == door)
+        << " occupied=" << occupied
+        << " explicit=" << range.explicitOpen
+        << " updateEnablesKnown=" << updateEnablesKnown
+        << " updateEnables=" << updateEnables
+        << " updateEntries=" << s_diagnosticDoorUpdateEntries
+        << " updateReturns=" << s_diagnosticDoorUpdateReturns
+        << " lastUpdateMs=" << s_diagnosticDoorLastUpdateMs
+        << " lastUpdateSlot=" << s_diagnosticDoorLastUpdateSlot;
+    auto point = [&](const char* label, const Vec3& world)
+    {
+        const Vec3 local = range.worldToLocal.TransformPoint(world);
+        out << " " << label << "World=" << world.x << "," << world.y << "," << world.z
+            << " " << label << "Box=" << local.x << "," << local.y << "," << local.z
+            << " " << label << "Inside=" << IsInAutomaticDoorRange(range, world);
+    };
+    TryGuardedVoidCall("diagnostic door decision snapshot", [&]()
+    {
+        out << " open=" << door->m_bOpened << " locked=" << door->m_bLocked
+            << " powered=" << door->m_bPowered << " forceClosed=" << door->m_bForceClosed
+            << " nativeDisrupted=" << door->m_disruptable.m_bDisrupted
+            << " markedForUpdate=" << door->m_bMarkedForUpdate
+            << " lastCollidedId=" << door->m_lastCollidedEntityId
+            << " pry=" << static_cast<int>(door->m_pryState)
+            << " timer=" << door->m_openTimer.GetTimeRemaining()
+            << " animating=" << door->IsPlayingAnimation()
+            << " areaCount=" << door->m_entitiesInArea.size()
+            << " usingNpcCount=" << door->m_usingNpcEntityIds.size();
+        ArkPlayer* player = ArkPlayer::GetInstancePtr();
+        if (player && player->GetEntity())
+        {
+            out << " localId=" << player->GetEntity()->GetId();
+            point("local", player->GetEntity()->GetWorldPos());
+        }
+        for (const auto& entry : m_remotePeers)
+        {
+            const RemotePeerSession& peer = entry.second;
+            out << " peer=" << entry.first << " proxyId=" << peer.proxyEntityId
+                << " poseSeq=" << peer.lastPoseSequence << " ready=" << peer.sessionReady
+                << " epoch=" << peer.worldEpoch << " smoothValid=" << peer.poseSmoothing.valid;
+            point("raw", peer.location);
+            point("target", peer.poseSmoothing.targetPosition);
+            if (gEnv && gEnv->pEntitySystem)
+                if (IEntity* proxy = gEnv->pEntitySystem->GetEntity(peer.proxyEntityId))
+                    point("proxy", proxy->GetWorldPos());
+        }
+        size_t count = 0;
+        for (EntityId id : door->m_entitiesInArea)
+        {
+            if (++count > 32) break;
+            out << " areaId=" << id;
+            for (const auto& entry : m_remotePeers)
+                if (entry.second.proxyEntityId == id) out << " areaIsProxy=1";
+            IEntity* entity = gEnv && gEnv->pEntitySystem ? gEnv->pEntitySystem->GetEntity(id) : nullptr;
+            if (!entity) { out << " areaMissing=1"; continue; }
+            out << " areaName=" << StatusToken(entity->GetName());
+            point("area", entity->GetWorldPos());
+            if (IPhysicalEntity* physics = entity->GetPhysics())
+            {
+                pe_status_dynamics dynamics;
+                const int status = physics->GetStatus(&dynamics);
+                out << " physicsType=" << physics->GetType() << " dynamicsOk=" << status;
+                if (status) out << " velocity=" << dynamics.v.x << "," << dynamics.v.y << "," << dynamics.v.z;
+            }
+        }
+        count = 0;
+        for (EntityId id : door->m_usingNpcEntityIds)
+        {
+            if (++count > 32) break;
+            out << " usingNpcId=" << id;
+        }
+    }, nullptr);
+    void* frames[12] = {};
+    const USHORT count = CaptureStackBackTrace(1, static_cast<DWORD>(std::size(frames)), frames, nullptr);
+    out << " stack=";
+    for (USHORT i = 0; i < count; ++i)
+        out << (i ? "," : "") << PathFileNameOnly(GetRuntimeModulePath(frames[i]))
+            << "/" << RuntimeRvaText(frames[i]);
+    if (s_diagnosticDoorEvents.size() >= 8192)
+        s_diagnosticDoorEvents.pop_front();
+    s_diagnosticDoorEvents.push_back(out.str());
+}
+
+bool ModMain::ShouldDeferAutomaticDoorClose(ArkDoor* door) const
+{
+    bool occupied = false;
+    if (!TryGetAutomaticDoorOccupancy(door, occupied) || !occupied)
+        return false;
+    bool automatic = false;
+    TryGuardedVoidCall("automatic door close eligibility", [&]()
+    {
+        automatic = door->m_bPowered && !door->m_bForceClosed &&
+            !door->m_disruptable.m_bDisrupted && door->m_pryState == ArkDoor::EArkPryState::none;
+    }, nullptr);
+    return automatic;
+}
+
 void ModMain::SetRemoteDoorTraversalPhysics(ArkDoor* door, bool open, const char* reason)
 {
     if (!door)
@@ -60877,11 +61287,28 @@ bool ModMain::ShouldCaptureRemoteAreaObjectConsequenceForHook(uint16_t eventKind
 
 void ModMain::OnLocalAreaObjectDoorStateChanged(ArkDoor* door, uint16_t eventKind, bool value, bool changed, const char* reason)
 {
-    if (!changed || !door)
+    if (!door)
         return;
 
-    if ((m_applyingRemoteAreaObjectEvent ||
-            m_remoteAreaObjectEchoSuppressSeconds > 0.0f) &&
+    auto range = s_automaticDoorRanges.find(door);
+    if (!m_applyingRemoteAreaObjectEvent && range != s_automaticDoorRanges.end() &&
+        eventKind == CoopProtocol::kAreaObjectEventDoorOpen)
+    {
+        const bool explicitRequest = value && s_automaticOpeningDoor != door;
+        // A button may reset the native timer on an already-open door. Publish
+        // that change of cause too; repeated proximity callbacks cannot undo it.
+        if (explicitRequest && !range->second.explicitOpen)
+            changed = true;
+        if (changed)
+            range->second.explicitOpen = explicitRequest;
+    }
+    if (!changed)
+        return;
+
+    // Door callbacks describe an actual native state edge. Suppress synchronous
+    // replay, not the global post-replay window: another device can continuously
+    // refresh that window and swallow a player's unrelated automatic-door open.
+    if (m_applyingRemoteAreaObjectEvent &&
         m_localAreaObjectCommandMutationDepth == 0 &&
         !ShouldCaptureRemoteAreaObjectConsequenceForHook(eventKind))
     {
@@ -60902,15 +61329,23 @@ void ModMain::OnLocalAreaObjectDoorStateChanged(ArkDoor* door, uint16_t eventKin
         return;
     }
 
+    QueueLocalAreaObjectDoorSnapshot(door, reason);
+}
+
+bool ModMain::QueueLocalAreaObjectDoorSnapshot(ArkDoor* door, const char* reason, bool requireLocalOverlap)
+{
+    if (!door)
+        return false;
+    const auto range = s_automaticDoorRanges.find(door);
     IEntity* entity = nullptr;
     std::string guardReason;
     if (!TryGuardedCall("area object door GetEntity", [door]() { return door->GetEntity(); }, entity, &guardReason) ||
         !entity)
     {
         m_lastAreaObjectEvent =
-            "area_object_door_missing_entity_kind_" + std::to_string(eventKind) +
-            "_reason_" + StatusToken(guardReason.empty() ? std::string("-") : guardReason);
-        return;
+            "area_object_door_missing_entity_reason_" +
+            StatusToken(guardReason.empty() ? std::string("-") : guardReason);
+        return false;
     }
 
     uint64_t guid = 0;
@@ -60918,9 +61353,9 @@ void ModMain::OnLocalAreaObjectDoorStateChanged(ArkDoor* door, uint16_t eventKin
         guid == 0)
     {
         m_lastAreaObjectEvent =
-            "area_object_door_missing_guid_kind_" + std::to_string(eventKind) +
-            "_reason_" + StatusToken(guardReason.empty() ? std::string("-") : guardReason);
-        return;
+            "area_object_door_missing_guid_reason_" +
+            StatusToken(guardReason.empty() ? std::string("-") : guardReason);
+        return false;
     }
 
     if (guid == kCoopLobbyMainLiftDoorGuid &&
@@ -60935,7 +61370,7 @@ void ModMain::OnLocalAreaObjectDoorStateChanged(ArkDoor* door, uint16_t eventKin
         m_lastAreaObjectEvent =
             "kept main-lift cabin door peer-local guid=" +
             std::to_string(guid);
-        return;
+        return false;
     }
 
     bool opened = false;
@@ -60954,19 +61389,36 @@ void ModMain::OnLocalAreaObjectDoorStateChanged(ArkDoor* door, uint16_t eventKin
     if (!stateOk)
     {
         m_lastAreaObjectEvent =
-            "area_object_door_snapshot_unreadable_kind_" +
-            std::to_string(eventKind) + "_reason_" +
+            "area_object_door_snapshot_unreadable_reason_" +
             StatusToken(guardReason.empty() ? std::string("-") : guardReason);
-        return;
+        return false;
     }
+
+    bool senderInside = false;
+    if (opened && range != s_automaticDoorRanges.end() && !m_applyingRemoteAreaObjectEvent)
+    {
+        TryGuardedVoidCall("door native sender overlap", [&]()
+        {
+            ArkPlayer* player = ArkPlayer::GetInstancePtr();
+            const EntityId id = player ? player->GetEntityId() : INVALID_ENTITYID;
+            senderInside = id != INVALID_ENTITYID &&
+                std::find(door->m_entitiesInArea.begin(), door->m_entitiesInArea.end(), id) !=
+                    door->m_entitiesInArea.end();
+        }, &guardReason);
+    }
+    if (requireLocalOverlap && !senderInside)
+        return false;
 
     // Door state is one roundhouse vanilla snapshot, not three independently
     // ordered fields. Any Open/Close/Lock/Power callback republishes the full
     // tuple; reliable supersession then keeps only the latest coherent state.
     const uint32_t stateFlags =
         CoopProtocol::kAreaObjectDoorStateFlagSnapshot |
+        (senderInside ? CoopProtocol::kAreaObjectDoorStateFlagSenderInside : 0u) |
         (powered ? CoopProtocol::kAreaObjectDoorStateFlagPowered : 0u) |
-        (locked ? CoopProtocol::kAreaObjectDoorStateFlagLocked : 0u);
+        (locked ? CoopProtocol::kAreaObjectDoorStateFlagLocked : 0u) |
+        (opened && range != s_automaticDoorRanges.end() && range->second.explicitOpen
+            ? CoopProtocol::kAreaObjectDoorStateFlagExplicitOpen : 0u);
     ArkDoorScriptPresentationState scriptState;
     const bool scriptStateOk = TryReadArkDoorScriptPresentation(
         entity, scriptState, &guardReason, false);
@@ -60982,13 +61434,30 @@ void ModMain::OnLocalAreaObjectDoorStateChanged(ArkDoor* door, uint16_t eventKin
     if (!m_applyingRemoteAreaObjectEvent)
         m_pendingRemoteDoorPowerConvergence.erase(guid);
 
-    (void)value;
-    QueueLocalAreaObjectEventForHook(
+    return QueueLocalAreaObjectEventForHook(
         CoopProtocol::kAreaObjectEventDoorOpen,
         guid,
         opened ? 1u : 0u,
         stateFlags | presentationFlags,
         reason);
+}
+
+void ModMain::ConfirmOccupiedDoorOpen(uint64_t guid)
+{
+    if (!guid || !IsSessionGameplayReady() || !gEnv || !gEnv->pEntitySystem)
+        return;
+    EntityId id = INVALID_ENTITYID;
+    IEntity* entity = nullptr;
+    if (!TryGuardedCall("door confirmation FindEntityByGuid", [guid]()
+        { return gEnv->pEntitySystem->FindEntityByGuid(static_cast<EntityGUID>(guid)); }, id, nullptr) ||
+        id == INVALID_ENTITYID ||
+        !TryGuardedCall("door confirmation GetEntity", [id]()
+        { return gEnv->pEntitySystem->GetEntity(id); }, entity, nullptr) || !entity)
+        return;
+    ArkDoor* door = GetArkDoorExtensionFromEntity(entity);
+    // Publish fresh local evidence, not another Open call or a replayed overlap.
+    if (QueueLocalAreaObjectDoorSnapshot(door, "occupied_close_confirmation", true))
+        TraceAutomaticDoorDecision(door, "occupied_close_confirmation_sent");
 }
 
 void ModMain::OnLocalAreaObjectInteractiveObjectStateChanged(
@@ -63586,7 +64055,7 @@ bool ModMain::ApplyAreaObjectWorldItemRemoved(uint64_t targetGuid, std::string& 
     return false;
 }
 
-bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPacket& packet, std::string& detail)
+bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPacket& packet, std::string& detail, uint64_t* doorOpenConfirmationGuid)
 {
     if (packet.eventKind == CoopProtocol::kAreaObjectEventNpcPerformedNotice)
     {
@@ -65950,6 +66419,10 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
         }
 
         const bool desiredOpened = packet.value != 0;
+        const bool explicitOpen =
+            (packet.flags & CoopProtocol::kAreaObjectDoorStateFlagExplicitOpen) != 0;
+        const bool senderInside =
+            (packet.flags & CoopProtocol::kAreaObjectDoorStateFlagSenderInside) != 0;
         const bool desiredPowered =
             (packet.flags & CoopProtocol::kAreaObjectDoorStateFlagPowered) != 0;
         const bool desiredLocked =
@@ -66006,15 +66479,37 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
             "atomic door state opened after properties", &reason);
         if (!currentOpenOk)
             callOk = false;
-        else if (currentOpened != desiredOpened)
+        bool occupied = false;
+        const bool rangeControlled = TryGetAutomaticDoorOccupancy(door, occupied);
+        bool acceptOpenEdge = !rangeControlled || (desiredOpened
+            ? CoopDoorRangePolicy::AcceptNetworkEdge(true, occupied, explicitOpen, senderInside)
+            : !ShouldDeferAutomaticDoorClose(door));
+        if (rangeControlled && desiredOpened && !explicitOpen)
+        {
+            bool canOpen = false;
+            TryGuardedVoidCall("automatic remote door open eligibility", [&]()
+            {
+                canOpen = door->m_bPowered && !door->m_bLocked &&
+                    !door->m_bForceClosed && !door->m_disruptable.m_bDisrupted &&
+                    door->m_pryState == ArkDoor::EArkPryState::none;
+            }, nullptr);
+            acceptOpenEdge = acceptOpenEdge && canOpen;
+        }
+        TraceAutomaticDoorDecision(door, desiredOpened
+            ? (acceptOpenEdge
+                ? (senderInside ? "remote_open_accepted_sender_inside" : "remote_open_accepted")
+                : "remote_open_rejected")
+            : (acceptOpenEdge ? "remote_close_accepted" : "remote_close_rejected"));
+        if (currentOpenOk && acceptOpenEdge && currentOpened != desiredOpened)
         {
             if (desiredOpened)
             {
                 callOk = TryGuardedVoidCall(
                     "atomic door state Open",
-                    [door]()
+                    [door, rangeControlled, explicitOpen]()
                     {
-                        door->Open();
+                        if (!rangeControlled || explicitOpen)
+                            door->Open();
                         door->OnOpen();
                     },
                     &reason) && callOk;
@@ -66030,6 +66525,9 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
             }
         }
 
+        if (callOk && acceptOpenEdge && rangeControlled)
+            s_automaticDoorRanges[door].explicitOpen = desiredOpened && explicitOpen;
+
         if (callOk)
         {
             callOk = RefreshArkDoorScriptPresentation(
@@ -66039,7 +66537,7 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
                 desiredLocked,
                 &reason) && callOk;
             SetRemoteDoorTraversalPhysics(
-                door, desiredOpened,
+                door, desiredOpened && !rangeControlled,
                 desiredOpened
                     ? "atomic remote door state open"
                     : "atomic remote door state closed");
@@ -66066,13 +66564,27 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
                 door, &ArkDoor::m_bLocked, finalLocked,
                 "atomic door state locked after", &reason);
         const bool applied = callOk && afterOk &&
-            finalOpened == desiredOpened &&
+            (!acceptOpenEdge || finalOpened == desiredOpened) &&
             finalPowered == desiredPowered &&
             finalLocked == desiredLocked;
+        if (applied && rangeControlled)
+        {
+            auto& range = s_automaticDoorRanges[door];
+            range.remoteRevision = packet.postVersion;
+            range.remoteOpened = desiredOpened ? 1 : 0;
+            range.remoteAccepted = acceptOpenEdge;
+            if (doorOpenConfirmationGuid && !desiredOpened && !acceptOpenEdge && finalOpened)
+                *doorOpenConfirmationGuid = packet.targetGuid;
+        }
         detail = std::string(applied ? "applied" : "failed") +
             "_atomic_door_state_open_" + std::to_string(finalOpened ? 1 : 0) +
             "_powered_" + std::to_string(finalPowered ? 1 : 0) +
             "_locked_" + std::to_string(finalLocked ? 1 : 0) +
+            "_range_" + std::to_string(rangeControlled ? 1 : 0) +
+            "_occupied_" + std::to_string(occupied ? 1 : 0) +
+            "_explicit_open_" + std::to_string(explicitOpen ? 1 : 0) +
+            "_sender_inside_" + std::to_string(senderInside ? 1 : 0) +
+            "_edge_accepted_" + std::to_string(acceptOpenEdge ? 1 : 0) +
             "_script_supply_" +
             std::to_string(desiredPowerSupplied ? 1 : 0) +
             "_script_disrupted_" +
@@ -66112,6 +66624,14 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
     bool callOk = false;
     if (packet.eventKind == CoopProtocol::kAreaObjectEventDoorOpen)
     {
+        bool occupied = false;
+        const bool rangeControlled = TryGetAutomaticDoorOccupancy(door, occupied);
+        if (rangeControlled && ((desired && !occupied) ||
+            (!desired && ShouldDeferAutomaticDoorClose(door))))
+        {
+            detail = "ignored_door_edge_by_current_range";
+            return true;
+        }
         if (desired)
         {
             // OnOpen is the signal/timer callback. ArkDoor::Open performs the
@@ -66119,9 +66639,10 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
             // only OnOpen can leave an open state with a closed collider.
             callOk = TryGuardedVoidCall(
                 "area object apply door Open",
-                [door]()
+                [door, rangeControlled]()
                 {
-                    door->Open();
+                    if (!rangeControlled)
+                        door->Open();
                     door->OnOpen();
                 },
                 &reason);
@@ -66154,7 +66675,9 @@ bool ModMain::ApplyAreaObjectEventMutation(const CoopProtocol::AreaObjectEventPa
         if (packet.eventKind == CoopProtocol::kAreaObjectEventDoorOpen && desired &&
             m_networkMode == CoopNetworkMode::Client)
         {
-            SetRemoteDoorTraversalPhysics(door, true, "remote door open apply");
+            bool occupied = false;
+            if (!TryGetAutomaticDoorOccupancy(door, occupied))
+                SetRemoteDoorTraversalPhysics(door, true, "remote door open apply");
         }
         ForceArkDoorRuntimeUpdate(door, "area object apply door rearm update slot");
         TryGuardedVoidCall("area object apply door UpdateNavigation", [door]() { door->UpdateNavigation(); }, &reason);
@@ -67676,7 +68199,7 @@ void ModMain::FinalizeAppliedAreaObjectEvent(
     LogCoop(m_lastAreaObjectEvent);
 }
 
-void ModMain::HandleAreaObjectEvent(const CoopProtocol::AreaObjectEventPacket& packet)
+void ModMain::HandleAreaObjectEvent(const CoopProtocol::AreaObjectEventPacket& packet, uint64_t& doorOpenConfirmationGuid)
 {
     ++m_receivedAreaObjectEventPackets;
 
@@ -67758,7 +68281,7 @@ void ModMain::HandleAreaObjectEvent(const CoopProtocol::AreaObjectEventPacket& p
     m_remoteAreaObjectEchoSuppressSeconds = std::max(m_remoteAreaObjectEchoSuppressSeconds, 0.75f);
     m_applyingRemoteAreaObjectEvent = true;
     m_applyingRemoteAreaObjectAuthorityInput = authorityInteractionInput;
-    const bool applied = ApplyAreaObjectEventMutation(packet, detail);
+    const bool applied = ApplyAreaObjectEventMutation(packet, detail, &doorOpenConfirmationGuid);
     m_applyingRemoteAreaObjectAuthorityInput = false;
     m_applyingRemoteAreaObjectEvent = false;
     m_remoteAreaObjectEchoSuppressSeconds = std::max(m_remoteAreaObjectEchoSuppressSeconds, 0.75f);
@@ -68209,6 +68732,7 @@ bool ModMain::QueueReliablePayloadToEndpoint(
             std::fill(replaceable->payload.begin(), replaceable->payload.end(), 0);
             std::memcpy(replaceable->payload.data(), payload, payloadSize);
             replaceable->payloadSize = payloadSize;
+            replaceable->sourceAccountToken = sourceAccountToken != 0 ? sourceAccountToken : GetLocalAccountToken();
             replaceable->failurePrefix = failurePrefix ? failurePrefix : "reliable send failed";
             ++m_reliableSupersededPackets;
             m_networkTelemetry.RecordReliableSuperseded();
@@ -68749,10 +69273,12 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
     const uint32_t enemyDeathPresentationDropsBefore =
         m_droppedEnemyDeathPresentationPackets;
 
+    uint64_t doorOpenConfirmationGuid = 0;
     HandleReliablePayload(
         packet.payloadType,
         packet.payload,
-        packet.payloadSize);
+        packet.payloadSize,
+        doorOpenConfirmationGuid);
 
     const bool rejectedStoryEvent =
         packet.payloadType ==
@@ -68803,6 +69329,8 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
     }
     StoreActiveRemotePeerContext();
     m_activePacketSourceAccountToken = 0;
+    // Relay the original Close before its correction, including to third peers.
+    ConfirmOccupiedDoorOpen(doorOpenConfirmationGuid);
     DrainReliableReorderBuffer(endpointKey, fromAddress, fromPort);
 }
 
@@ -68822,7 +69350,7 @@ void ModMain::DrainReliableReorderBuffer(uint64_t endpointKey, uint32_t fromAddr
     }
 }
 
-void ModMain::HandleReliablePayload(uint16_t payloadType, const uint8_t* payload, uint16_t payloadSize)
+void ModMain::HandleReliablePayload(uint16_t payloadType, const uint8_t* payload, uint16_t payloadSize, uint64_t& doorOpenConfirmationGuid)
 {
     if (!payload)
         return;
@@ -69020,7 +69548,7 @@ void ModMain::HandleReliablePayload(uint16_t payloadType, const uint8_t* payload
 
         CoopProtocol::AreaObjectEventPacket packet = {};
         std::memcpy(&packet, payload, sizeof(packet));
-        HandleAreaObjectEvent(packet);
+        HandleAreaObjectEvent(packet, doorOpenConfirmationGuid);
         return;
     }
     case CoopProtocol::PacketType::EnemyRoster:

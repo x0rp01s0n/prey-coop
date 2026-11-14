@@ -6,6 +6,7 @@
 #include "CoopItemClassification.h"
 #include "CoopPtrHygiene.h"
 #include "CoopNativeFragmentPayload.h"
+#include "CoopInventoryRestoreLayout.h"
 #include "CoopRuntimeGuards.h"
 
 #include <algorithm>
@@ -1212,8 +1213,9 @@ bool TryRestoreInventoryItem(
     ArkInventory& inventory,
     ArkItemSystem& itemSystem,
     EntityId playerEntityId,
-    const ModMain::PlayerInventoryItemState& sidecarItem,
-    std::string& reason);
+    ModMain::PlayerInventoryItemState& sidecarItem,
+    std::string& reason,
+    bool requireSavedCell = false);
 
 bool TryFindCurrentChipsetItemByArchetype(
     ArkEquipmentModComponent& component,
@@ -1901,6 +1903,88 @@ bool TryGetArkItemSystemArchetype(
     return false;
 }
 
+bool TryPlaceInventoryItemAtSavedCell(
+    ArkInventory& inventory,
+    unsigned itemId,
+    int x,
+    int y,
+    std::string& reason)
+{
+    return CoopInventoryRestoreLayout::TryPlaceAtSavedCell<PassiveInventoryCell>(
+        itemId,
+        x,
+        y,
+        [&inventory](std::vector<PassiveInventoryCell>& cells, std::string& readReason)
+        {
+            return TryReadInventoryStoredCells(inventory, cells, readReason);
+        },
+        [&inventory](unsigned id, int targetX, int targetY, bool& placed, std::string& placeReason)
+        {
+            return TryGuardedCall(
+                "coop inventory TryPlaceItem saved cell",
+                [&inventory, id, targetX, targetY]() -> bool
+                {
+                    return inventory.TryPlaceItem(id, targetX, targetY);
+                },
+                placed,
+                &placeReason);
+        },
+        reason);
+}
+
+bool TryGetRestoreItemArchetype(unsigned itemId, uint64_t& archetypeId, std::string& reason)
+{
+    archetypeId = 0;
+    CArkItem* item = nullptr;
+    if (!TryGuardedCall(
+            "coop restore pending item lookup",
+            [itemId]() -> CArkItem*
+            {
+                return CArkItem::GetItemFromEntityId(itemId);
+            },
+            item,
+            &reason) ||
+        !item)
+    {
+        if (reason.empty())
+            reason = "pending restore entity is not a CArkItem";
+        return false;
+    }
+
+    return TryGuardedVoidCall(
+        "coop restore pending item archetype",
+        [&]()
+        {
+            archetypeId = item->m_selectedArchetype;
+        },
+        &reason);
+}
+
+bool TryPackInventoryItemsQuietly(
+    ArkInventory& inventory,
+    const std::vector<unsigned int>& itemIds,
+    std::string& reason)
+{
+    bool allPacked = true;
+    for (const unsigned itemId : itemIds)
+    {
+        bool packed = false;
+        if (!TryGuardedCall(
+                "coop inventory PackItem",
+                [&]() -> bool
+                {
+                    return inventory.PackItem(itemId);
+                },
+                packed,
+                &reason) ||
+            !packed)
+        {
+            allPacked = false;
+        }
+    }
+    return allPacked;
+}
+
 bool TryPlaceOrPackInventoryItems(
     ArkInventory& inventory,
     const std::vector<unsigned int>& itemIds,
@@ -1947,41 +2031,6 @@ bool TryPlaceOrPackInventoryItems(
     return allPlaced;
 }
 
-bool TryPlaceOrPackInventoryItemsQuietly(
-    ArkInventory& inventory,
-    const std::vector<unsigned int>& itemIds,
-    int,
-    int,
-    std::string& reason)
-{
-    bool allPlaced = true;
-    for (const unsigned itemId : itemIds)
-    {
-        bool placed = false;
-        // PlaceItemQuietly is not stable in the shipped Epic executable: its
-        // generated SDK entry point consistently raises an access violation.
-        // PackItem performs the same native cell insertion needed by restore;
-        // the surrounding restore scope already suppresses pickup feedback.
-        if (!TryGuardedCall(
-                "coop inventory PackItem",
-                [&]() -> bool
-                {
-                    return inventory.PackItem(itemId);
-                },
-                placed,
-                &reason))
-        {
-            allPlaced = false;
-        }
-        else if (!placed)
-        {
-            allPlaced = false;
-        }
-    }
-
-    return allPlaced;
-}
-
 bool TryAttachCreatedItemsToInventory(
     ArkInventory& inventory,
     ArkItemSystem& itemSystem,
@@ -1990,6 +2039,7 @@ bool TryAttachCreatedItemsToInventory(
     int requestedCount,
     int x,
     int y,
+    bool requireSavedCell,
     std::string& detail,
     std::string& reason)
 {
@@ -1999,7 +2049,6 @@ bool TryAttachCreatedItemsToInventory(
     bool anyAttached = false;
     std::vector<unsigned int> packCandidates;
     packCandidates.reserve(itemIds.size());
-
     for (const unsigned itemId : itemIds)
     {
         std::string itemDetail = "item=" + std::to_string(itemId);
@@ -2120,16 +2169,20 @@ bool TryAttachCreatedItemsToInventory(
             itemDetail += std::string(" containsAfterAdd=") + (contains ? "1" : "0");
         if (contains)
             packCandidates.push_back(itemId);
-
         AppendDetail(detail, itemDetail);
     }
 
-    if (!packCandidates.empty())
+    const bool hasSavedCell = x >= 0 && y >= 0;
+    if (!requireSavedCell || !hasSavedCell)
     {
-        const bool placed = TryPlaceOrPackInventoryItemsQuietly(inventory, packCandidates, x, y, reason);
-        AppendDetail(detail, std::string("quietPlaceOrPack=") + (placed ? "1" : "0") +
+        const bool packed = TryPackInventoryItemsQuietly(inventory, packCandidates, reason);
+        AppendDetail(detail, std::string("quietPack=") + (packed ? "1" : "0") +
             " requestedCount=" + std::to_string(requestedCount));
-        anyAttached = placed || anyAttached;
+        anyAttached = packed || anyAttached;
+    }
+    else
+    {
+        AppendDetail(detail, "savedCellPlacementDeferred");
     }
 
     return anyAttached;
@@ -2140,7 +2193,8 @@ bool TrySpawnAndGiveInventoryItem(
     ArkItemSystem& itemSystem,
     EntityId playerEntityId,
     IEntityArchetype& archetype,
-    const ModMain::PlayerInventoryItemState& sidecarItem,
+    ModMain::PlayerInventoryItemState& sidecarItem,
+    bool requireSavedCell,
     const std::vector<unsigned int>& beforeIds,
     int beforeCount,
     bool haveBeforeCount,
@@ -2284,18 +2338,24 @@ bool TrySpawnAndGiveInventoryItem(
             requestedCount,
             sidecarItem.x,
             sidecarItem.y,
+            requireSavedCell,
             directAttachDetail,
             reason);
         AppendDetail(detail, std::string("silentAttach=") + (directAttached ? "1" : "0") +
             (directAttachDetail.empty() ? std::string() : " " + directAttachDetail));
 
         bool containsDirect = false;
-        if (directAttached &&
-            TryInventoryContains(inventory, spawnedId, containsDirect, reason) &&
-            containsDirect)
+        if (TryInventoryContains(inventory, spawnedId, containsDirect, reason) && containsDirect)
         {
             TryApplySidecarFlagsToRestoredItem(itemSystem, spawnedId, sidecarItem, detail, reason);
             HideInventoryBackedWorldEntity(spawnedId, detail, reason);
+            if (requireSavedCell &&
+                !TryPlaceInventoryItemAtSavedCell(inventory, spawnedId, sidecarItem.x, sidecarItem.y, reason))
+            {
+                sidecarItem.pendingRestoreEntityId = spawnedId;
+                AppendDetail(detail, "saved cell pending item=" + std::to_string(spawnedId) + " " + reason);
+                return false;
+            }
             return true;
         }
     }
@@ -2347,20 +2407,68 @@ bool TrySpawnAndGiveInventoryItem(
     std::vector<unsigned int> newIds = FindNewInventoryItemIds(beforeIds, afterIds);
 
     bool containsSpawned = false;
-    if (TryInventoryContains(inventory, spawnedId, containsSpawned, reason) && containsSpawned)
+    if (TryInventoryContains(inventory, spawnedId, containsSpawned, reason) && containsSpawned &&
+        std::find(newIds.begin(), newIds.end(), spawnedId) == newIds.end())
         newIds.push_back(spawnedId);
+
+    unsigned restoredItemId = containsSpawned ? spawnedId : 0;
+    bool ambiguousRestoredItem = false;
+    if (requireSavedCell && distinctEntityRestore && !containsSpawned)
+    {
+        for (const unsigned itemId : newIds)
+        {
+            uint64_t candidateArchetypeId = 0;
+            std::string candidateReason;
+            if (TryGetRestoreItemArchetype(itemId, candidateArchetypeId, candidateReason) &&
+                candidateArchetypeId == sidecarItem.archetypeId)
+            {
+                if (restoredItemId != 0)
+                {
+                    ambiguousRestoredItem = true;
+                    break;
+                }
+                restoredItemId = itemId;
+            }
+        }
+    }
+
+    if (ambiguousRestoredItem)
+    {
+        for (const unsigned itemId : newIds)
+            HideInventoryBackedWorldEntity(itemId, detail, reason);
+        sidecarItem.pendingRestoreBlocked = true;
+        cleanupSpawnIfNotInInventory();
+        AppendDetail(detail, "ambiguous native restore IDs; row blocked without choosing an entity");
+        return false;
+    }
 
     if (!newIds.empty())
     {
         for (unsigned itemId : newIds)
         {
-            TryApplySidecarFlagsToRestoredItem(itemSystem, itemId, sidecarItem, detail, reason);
+            if (!requireSavedCell || itemId == restoredItemId)
+                TryApplySidecarFlagsToRestoredItem(itemSystem, itemId, sidecarItem, detail, reason);
             HideInventoryBackedWorldEntity(itemId, detail, reason);
         }
-        TryPlaceOrPackInventoryItems(inventory, newIds, sidecarItem.x, sidecarItem.y, reason);
+        if (requireSavedCell && restoredItemId != 0 &&
+            !TryPlaceInventoryItemAtSavedCell(inventory, restoredItemId, sidecarItem.x, sidecarItem.y, reason))
+        {
+            sidecarItem.pendingRestoreEntityId = restoredItemId;
+            AppendDetail(detail, "saved cell pending item=" + std::to_string(restoredItemId) + " " + reason);
+            cleanupSpawnIfNotInInventory();
+            return false;
+        }
+        if (!requireSavedCell)
+            TryPlaceOrPackInventoryItems(inventory, newIds, sidecarItem.x, sidecarItem.y, reason);
     }
 
     afterCount = currentCount();
+    if (requireSavedCell && distinctEntityRestore && restoredItemId == 0)
+    {
+        cleanupSpawnIfNotInInventory();
+        AppendDetail(detail, "spawned row is not in inventory id=" + std::to_string(spawnedId));
+        return false;
+    }
     if (distinctEntityRestore && !newIds.empty())
     {
         cleanupSpawnIfNotInInventory();
@@ -2411,9 +2519,74 @@ bool TryRestoreInventoryItem(
     ArkInventory& inventory,
     ArkItemSystem& itemSystem,
     EntityId playerEntityId,
-    const ModMain::PlayerInventoryItemState& sidecarItem,
-    std::string& reason)
+    ModMain::PlayerInventoryItemState& sidecarItem,
+    std::string& reason,
+    bool requireSavedCell)
 {
+    if (sidecarItem.pendingRestoreBlocked)
+    {
+        reason = "inventory restore row is blocked after ambiguous native insertion";
+        return false;
+    }
+
+    if (sidecarItem.pendingRestoreEntityId != INVALID_ENTITYID)
+    {
+        const EntityId pendingId = sidecarItem.pendingRestoreEntityId;
+        bool containsPending = false;
+        if (!TryInventoryContains(inventory, pendingId, containsPending, reason))
+            return false;
+
+        IEntity* pendingEntity = gEnv && gEnv->pEntitySystem ? gEnv->pEntitySystem->GetEntity(pendingId) : nullptr;
+        uint64_t pendingArchetypeId = 0;
+        const bool archetypeKnown = !pendingEntity || TryGetRestoreItemArchetype(pendingId, pendingArchetypeId, reason);
+        const CoopInventoryRestoreLayout::PendingAction pendingAction =
+            CoopInventoryRestoreLayout::ClassifyPendingEntity(
+                pendingEntity != nullptr,
+                containsPending,
+                archetypeKnown,
+                pendingArchetypeId == sidecarItem.archetypeId);
+
+        if (pendingAction == CoopInventoryRestoreLayout::PendingAction::Respawn)
+        {
+            sidecarItem.pendingRestoreEntityId = INVALID_ENTITYID;
+        }
+        else if (pendingAction == CoopInventoryRestoreLayout::PendingAction::PlacementOnly)
+        {
+            std::string pendingDetail;
+            TryApplySidecarFlagsToRestoredItem(itemSystem, pendingId, sidecarItem, pendingDetail, reason);
+            HideInventoryBackedWorldEntity(pendingId, pendingDetail, reason);
+            if (!TryPlaceInventoryItemAtSavedCell(
+                    inventory,
+                    pendingId,
+                    sidecarItem.x,
+                    sidecarItem.y,
+                    reason))
+            {
+                AppendDetail(reason, "placement-only retry item=" + std::to_string(pendingId));
+                return false;
+            }
+
+            sidecarItem.pendingRestoreEntityId = INVALID_ENTITYID;
+            AppendDetail(pendingDetail, "placement-only restore completed");
+            reason = pendingDetail;
+            return true;
+        }
+        else
+        {
+            if (!pendingEntity)
+                reason = containsPending
+                    ? "pending restore entity is missing but still referenced; preserving row"
+                    : "pending restore state could not be classified; preserving row";
+            else if (!archetypeKnown)
+                AppendDetail(reason, "pending restore archetype unavailable; preserving entity " + std::to_string(pendingId));
+            else if (pendingArchetypeId != sidecarItem.archetypeId)
+                reason = "pending restore ID refers to a different archetype; preserving entity " + std::to_string(pendingId);
+            else
+                reason = "pending restore item is no longer in this inventory; preserving entity " + std::to_string(pendingId);
+            return false;
+        }
+    }
+
     int beforeCount = 0;
     const bool haveBeforeCount = TryGetInventoryArchetypeCount(inventory, sidecarItem.archetypeId, beforeCount, reason);
 
@@ -2451,6 +2624,7 @@ bool TryRestoreInventoryItem(
             playerEntityId,
             *archetype,
             sidecarItem,
+            requireSavedCell,
             beforeIds,
             beforeCount,
             haveBeforeCount,
@@ -2479,6 +2653,7 @@ bool TryRestoreInventoryItem(
                 playerEntityId,
                 *itemSystemArchetype,
                 sidecarItem,
+                requireSavedCell,
                 beforeIds,
                 beforeCount,
                 haveBeforeCount,
@@ -2507,6 +2682,13 @@ bool TryRestoreInventoryItem(
         AppendDetail(detail, "no spawnable archetype");
         if (!lookupReason.empty())
             AppendDetail(detail, lookupReason);
+    }
+
+    if (sidecarItem.pendingRestoreEntityId != INVALID_ENTITYID)
+    {
+        if (!detail.empty())
+            reason = detail;
+        return false;
     }
 
     int afterCount = 0;
@@ -2671,7 +2853,8 @@ bool ModMain::ReplaceSharedStorageInventory(
         if (item.archetypeId == 0 || item.count <= 0)
             continue;
         std::string itemReason;
-        if (!TryRestoreInventoryItem(inventory, *itemSystem, ownerId, item, itemReason))
+        PlayerInventoryItemState restoreItem = item;
+        if (!TryRestoreInventoryItem(inventory, *itemSystem, ownerId, restoreItem, itemReason))
         {
             detail =
                 "restore_failed_index_" + std::to_string(restored) +
@@ -4767,6 +4950,11 @@ void ModMain::QueuePlayerSidecarInventoryRestore(
         return;
     }
     m_pendingPlayerSidecarInventoryItems = items;
+    for (PlayerInventoryItemState& item : m_pendingPlayerSidecarInventoryItems)
+    {
+        item.pendingRestoreEntityId = INVALID_ENTITYID;
+        item.pendingRestoreBlocked = false;
+    }
     m_pendingPlayerSidecarInventoryRestore = !m_pendingPlayerSidecarInventoryItems.empty() || clearInventory;
     m_pendingPlayerSidecarInventoryRestoreNeedsClear = clearInventory;
     m_playerSidecarInventoryPending = static_cast<uint32_t>(m_pendingPlayerSidecarInventoryItems.size());
@@ -4938,7 +5126,7 @@ bool ModMain::TryRestorePendingPlayerSidecarInventory(const char* reason, bool n
     remaining.reserve(m_pendingPlayerSidecarInventoryItems.size());
 
     uint32_t restoredThisPass = 0;
-    for (const PlayerInventoryItemState& item : m_pendingPlayerSidecarInventoryItems)
+    for (PlayerInventoryItemState& item : m_pendingPlayerSidecarInventoryItems)
     {
         if (item.archetypeId == 0 || item.count <= 0)
             continue;
@@ -4951,7 +5139,8 @@ bool ModMain::TryRestorePendingPlayerSidecarInventory(const char* reason, bool n
                 " cell=" + std::to_string(item.x) + "," + std::to_string(item.y) +
                 " distinct=" + std::to_string(IsSidecarDistinctEntityItem(item) ? 1 : 0));
         }
-        if (TryRestoreInventoryItem(*inventory, *itemSystem, playerEntityId, item, guardReason))
+        const bool requireSavedCell = item.x >= 0 && item.y >= 0;
+        if (TryRestoreInventoryItem(*inventory, *itemSystem, playerEntityId, item, guardReason, requireSavedCell))
         {
             ++restoredThisPass;
             ++m_playerSidecarInventoryApplied;
