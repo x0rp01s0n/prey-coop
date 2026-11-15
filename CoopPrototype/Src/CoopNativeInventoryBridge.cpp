@@ -3,6 +3,8 @@
 #include "CoopRuntimeLog.h"
 #include "CoopItemClassification.h"
 #include "CoopRuntimeGuards.h"
+#include "CoopNativeWeaponState.h"
+#include <Prey/GameDll/ark/weapons/arkweapon.h>
 
 #include <algorithm>
 #include <boost/variant/get.hpp>
@@ -368,6 +370,41 @@ void RefreshQuickSelectWeapon(ArkQuickSelectComponent* quickSelect, CArkItem* it
 }
 
 } // namespace
+
+bool ModMain::CaptureSharedDropWeaponState(CArkItem* item, CoopWeaponState::State& state, std::string& reason)
+{
+    state = {};
+    if (!item)
+        return false;
+    if (!CoopItemClassification::IsRealWeaponInventoryItem(item, reason))
+        return true;
+    return TryGuardedVoidCall("shared drop capture weapon state", [&]()
+    {
+        CArkWeapon* weapon = CArkWeapon::GetWeaponFromEntityId(item->GetEntityId());
+        if (weapon)
+            state = CoopWeaponState::CaptureNative(*weapon);
+    }, &reason) && state.present && CoopWeaponState::IsValid(state);
+}
+
+bool ModMain::ApplySharedDropWeaponState(EntityId itemId, const CoopWeaponState::State& state, std::string& reason)
+{
+    if (!CoopWeaponState::IsValid(state))
+        return false;
+    if (!state.present)
+        return true;
+    CArkItem* item = CArkItem::GetItemFromEntityId(itemId);
+    if (!item || !CoopItemClassification::IsRealWeaponInventoryItem(item, reason))
+        return false;
+    bool applied = false;
+    return TryGuardedVoidCall("shared drop apply weapon state", [&]()
+    {
+        CArkWeapon* weapon = CArkWeapon::GetWeaponFromEntityId(itemId);
+        if (weapon)
+        {
+            applied = CoopWeaponState::ApplyNative(*weapon, state);
+        }
+    }, &reason) && applied;
+}
 
 bool ModMain::EnsureLocalPlayerWeaponRegistered(unsigned itemId, const char* reason)
 {

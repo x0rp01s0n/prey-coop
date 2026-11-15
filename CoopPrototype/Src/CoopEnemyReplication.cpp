@@ -4300,6 +4300,7 @@ void ModMain::PrepareCoopRuntimeEntitiesForLevelTransition(const char* reason)
         return;
 
     m_runtimeTransitionCleanupPrepared = true;
+    DetachSharedDropEntities();
     ++m_runtimeTransitionCleanupCount;
     m_sessionGameplayReady = false;
     m_clientAreaAuthorityActive = false;

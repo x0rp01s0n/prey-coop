@@ -3,11 +3,12 @@
 #include <cstddef>
 #include <cstdint>
 #include <type_traits>
+#include "CoopWeaponState.h"
 
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 254;
+constexpr uint16_t kProtocolVersion = 259;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -444,7 +445,15 @@ enum class SharedDropCommand : uint16_t
     PickupCommit = 3,
     Remove = 4,
     RemoveRequest = 5,
+    PickupGrant = 6,
+    PickupResult = 7,
+    PickupRelease = 8,
+    PickupReady = 9,
+    SnapshotEnd = 10,
 };
+
+constexpr uint16_t kSharedDropFlagLive = 1u << 0;
+constexpr uint16_t kSharedDropFlagPickupSucceeded = 1u << 1;
 
 enum class SharedStorageCommand : uint16_t
 {
@@ -858,6 +867,7 @@ struct SharedDropPacket
     uint32_t worldEpoch = 0;
     uint32_t objectVersion = 0;
     uint64_t hostSaveKeyHash = 0;
+    uint64_t hostSessionId = 0;
     uint64_t areaId = 0;
     uint64_t stableSpawnId = 0;
     uint64_t sourcePeerHash = 0;
@@ -873,6 +883,7 @@ struct SharedDropPacket
     float qx = 0.0f;
     float qy = 0.0f;
     float qz = 0.0f;
+    CoopWeaponState::Wire weaponState;
 };
 
 struct SharedStoragePacket
@@ -1366,6 +1377,7 @@ struct PlayerStateTransferPacket
     uint32_t checksum = 0;
     uint32_t flags = 0;
     uint64_t accountToken = 0;
+    uint64_t timelineId = 0;
     char username[kUsernameSize] = {};
     char saveKey[kSaveKeySize] = {};
     uint8_t data[kPlayerStateTransferDataSize] = {};
