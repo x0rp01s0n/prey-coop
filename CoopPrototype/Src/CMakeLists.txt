@@ -28,6 +28,7 @@ set(SOURCE_FILES
 	CoopEnemyReplication.cpp
 	CoopEnemyStateWire.cpp
 	CoopEnemyStateWire.h
+	CoopInteractionPolicy.h
 	CoopDoorRangePolicy.h
 	CoopEntityLifecycle.cpp
 	CoopLivePropSync.cpp

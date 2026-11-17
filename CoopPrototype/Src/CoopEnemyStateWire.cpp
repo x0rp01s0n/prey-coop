@@ -32,7 +32,6 @@ bool CoopEnemyStateWire::Encode(
 {
     if (source.enemyNetId == 0 || source.authorityOwnerAccountToken == 0 || source.authorityEpoch == 0 ||
         source.sourceFlags > std::numeric_limits<uint16_t>::max() ||
-        source.locomotionFlags > std::numeric_limits<uint16_t>::max() ||
         source.flags > std::numeric_limits<uint16_t>::max() ||
         source.locomotionLevel > std::numeric_limits<uint8_t>::max() ||
         source.authorityAttentionLevel > CoopEnemyAuthorityPolicy::kKnownAttention ||
@@ -106,7 +105,7 @@ bool CoopEnemyStateWire::Encode(
     target.lastDamage = source.lastDamage;
     target.commitSequence = source.commitSequence;
     target.sourceFlags = static_cast<uint16_t>(source.sourceFlags);
-    target.locomotionFlags = static_cast<uint16_t>(source.locomotionFlags);
+    target.locomotionFlags = source.locomotionFlags;
     target.stateFlags = static_cast<uint16_t>(source.flags);
     target.locomotionLevel = static_cast<uint8_t>(source.locomotionLevel);
     target.authorityAttentionLevel = source.authorityAttentionLevel;
@@ -115,6 +114,7 @@ bool CoopEnemyStateWire::Encode(
     target.mannequinSequence = source.mannequinSequence;
     target.mannequinOrdinal = source.mannequinOrdinal;
     target.mannequinReserved = source.mannequinReserved;
+    target.interactionRevision = source.interactionRevision;
     target.mannequinPriority = source.mannequinPriority;
     std::copy(
         std::begin(source.mannequinTagState),
@@ -228,6 +228,7 @@ bool CoopEnemyStateWire::Decode(
     target.mannequinSequence = source.mannequinSequence;
     target.mannequinOrdinal = source.mannequinOrdinal;
     target.mannequinReserved = source.mannequinReserved;
+    target.interactionRevision = source.interactionRevision;
     target.mannequinPriority = source.mannequinPriority;
     std::copy(
         std::begin(source.mannequinTagState),

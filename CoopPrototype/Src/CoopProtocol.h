@@ -8,7 +8,7 @@
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 259;
+constexpr uint16_t kProtocolVersion = 260;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -428,6 +428,7 @@ enum class PacketType : uint16_t
     EnemyMannequinAction = 0x23,
     EnemyDeathPresentation = 0x24,
     TextChat = 0x25,
+    EnemyInteraction = 0x26,
 };
 
 enum class EnemyMannequinActionCommand : uint16_t
@@ -741,6 +742,7 @@ struct TestMimicStatePacket
     uint64_t targetAccountToken = 0;
     uint64_t authorityOwnerAccountToken = 0;
     uint32_t authorityEpoch = 0;
+    uint32_t interactionRevision = 0;
     uint8_t authorityAttentionLevel = 0;
     uint8_t authorityReserved[3] = {};
 };
@@ -770,7 +772,7 @@ struct EnemyStateWirePacket
     float lastDamage = 0.0f;
     uint32_t commitSequence = 0;
     uint16_t sourceFlags = 0;
-    uint16_t locomotionFlags = 0;
+    uint32_t locomotionFlags = 0;
     uint16_t stateFlags = 0;
     uint8_t locomotionLevel = 0;
     uint8_t authorityAttentionLevel = 0;
@@ -790,9 +792,39 @@ struct EnemyStateWirePacket
     uint64_t targetAccountToken = 0;
     uint64_t authorityOwnerAccountToken = 0;
     uint32_t authorityEpoch = 0;
+    uint32_t interactionRevision = 0;
 };
 
-// Direct enemy snapshots keep their 144-byte wire budget. A folded logical
+enum class EnemyInteractionCommand : uint16_t
+{
+    HackCompleted = 1,
+    Accepted = 2,
+    Rejected = 3,
+};
+
+// The player's minigame completed locally. Only the native effect waits for
+// the owner; never replay UI, consume resources or steal locomotion authority.
+struct EnemyInteractionPacket
+{
+    uint32_t magic = kPacketMagic;
+    uint16_t version = kProtocolVersion;
+    uint16_t type = static_cast<uint16_t>(PacketType::EnemyInteraction);
+    uint32_t requestId = 0;
+    uint32_t worldEpoch = 0;
+    uint64_t hostSaveKeyHash = 0;
+    uint64_t areaId = 0;
+    uint64_t enemyNetId = 0;
+    uint64_t stableEnemyId = 0;
+    uint64_t authorityOwnerAccountToken = 0;
+    uint64_t targetAccountToken = 0;
+    uint32_t authorityEpoch = 0;
+    uint32_t interactionRevision = 0;
+    uint16_t command = static_cast<uint16_t>(EnemyInteractionCommand::HackCompleted);
+    uint16_t reserved = 0;
+};
+
+// Direct enemy snapshots carry an interaction revision in addition to the
+// original 144-byte state. A folded logical
 // sender tag occupies four bytes that were already reserved by both packet
 // representations. It disambiguates admitted players that share one UDP
 // endpoint (local Wine prefixes or multiple machines behind one relay/NAT).
@@ -1610,7 +1642,8 @@ static_assert(sizeof(AreaLeasePacket) <= kReliablePayloadSize);
 static_assert(sizeof(RemotePlayerDamagePacket) <= kMaxPacketSize);
 static_assert(sizeof(TestMimicSpawnPacket) <= kMaxPacketSize);
 static_assert(sizeof(TestMimicStatePacket) <= kMaxPacketSize);
-static_assert(sizeof(EnemyStateWirePacket) == 144);
+static_assert(sizeof(EnemyStateWirePacket) == 150);
+static_assert(sizeof(EnemyInteractionPacket) <= kReliablePayloadSize);
 static_assert(sizeof(EnemyStateWirePacket) < sizeof(TestMimicStatePacket));
 static_assert(sizeof(EnemyDamageRequestPacket) <= kMaxPacketSize);
 static_assert(sizeof(EnemyDeathPresentationPacket) <= kReliablePayloadSize);

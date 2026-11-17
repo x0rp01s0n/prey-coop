@@ -4,6 +4,7 @@
 #include "CoopRuntimeConfig.h"
 #include "CoopRuntimeLog.h"
 #include "CoopSerialSequence.h"
+#include "CoopInteractionPolicy.h"
 
 #include <algorithm>
 #include <array>
@@ -393,6 +394,7 @@ bool EnemyStatePacketMateriallyDiffers(
         current.targetAccountToken != previous.targetAccountToken ||
         current.authorityOwnerAccountToken != previous.authorityOwnerAccountToken ||
         current.authorityEpoch != previous.authorityEpoch ||
+        current.interactionRevision != previous.interactionRevision ||
         current.authorityAttentionLevel != previous.authorityAttentionLevel ||
         current.commitSequence != previous.commitSequence ||
         current.sourceFlags != previous.sourceFlags ||
@@ -6437,6 +6439,18 @@ void ModMain::ApplyEnemyLocomotionStateToLocal(const CoopProtocol::TestMimicStat
         }
     }
 
+    bool staleInteraction = false;
+    if (existingState)
+    {
+        staleInteraction = existingState->interactionRevisionEpoch == packet.authorityEpoch &&
+            !CoopInteractionPolicy::RevisionAtLeast(packet.interactionRevision, existingState->interactionRevision);
+        if (!staleInteraction)
+        {
+            existingState->interactionRevision = packet.interactionRevision;
+            existingState->interactionRevisionEpoch = packet.authorityEpoch;
+        }
+    }
+
     if (ArkNpc* npc = EntityUtils::GetArkNpc(entity))
     {
         bool localMindControlled = false;
@@ -6480,7 +6494,7 @@ void ModMain::ApplyEnemyLocomotionStateToLocal(const CoopProtocol::TestMimicStat
                 });
             m_applyingRemoteEnemyPersistentStatus = false;
         }
-        if (authorityCorrupted != localCorrupted)
+        if (!staleInteraction && authorityCorrupted != localCorrupted)
         {
             m_applyingRemoteEnemyPersistentStatus = true;
             TryGuardedVoidCall(
@@ -6496,15 +6510,21 @@ void ModMain::ApplyEnemyLocomotionStateToLocal(const CoopProtocol::TestMimicStat
                 });
             m_applyingRemoteEnemyPersistentStatus = false;
         }
-        if (authorityHacked && !localHacked)
+        if (!staleInteraction && authorityHacked && !localHacked)
         {
             m_applyingRemoteEnemyPersistentStatus = true;
             TryGuardedVoidCall("remote enemy apply hacked", [npc]() { npc->Hack(); });
             m_applyingRemoteEnemyPersistentStatus = false;
         }
+        if (!staleInteraction && authorityHacked && existingState)
+        {
+            bool applied = false;
+            if (TryGuardedCall("confirmed snapshot hack", [npc]() { return npc->IsHacked(); }, applied) && applied)
+                existingState->pendingHack = {};
+        }
     }
 
-    if (authorityFactionValid && gEnv && gEnv->pGame)
+    if (!staleInteraction && authorityFactionValid && gEnv && gEnv->pGame)
     {
         if (IArkFactionManager* factionInterface = gEnv->pGame->GetIArkFactionManager())
         {
@@ -8706,6 +8726,250 @@ void ModMain::OnNativeNpcGlooStateChanged(ArkNpc* npc, const char* stage, bool f
         " entity=" + std::to_string(entityId) +
         " frozen=" + std::to_string(frozen ? 1 : 0) +
         " sent=" + std::to_string(sent ? 1 : 0);
+}
+
+bool ModMain::SendEnemyInteractionTo(
+    const CoopProtocol::EnemyInteractionPacket& packet, uint64_t targetAccountToken)
+{
+    uint32_t address = m_remoteAddress;
+    uint16_t port = m_remotePort;
+    if (m_networkMode == CoopNetworkMode::Host)
+    {
+        const auto peer = m_remotePeers.find(targetAccountToken);
+        if (peer == m_remotePeers.end() || !peer->second.sessionReady ||
+            !IsKnownSameLevel(m_localLevelName, peer->second.levelName))
+            return false;
+        address = peer->second.address;
+        port = peer->second.port;
+    }
+    else if (!ResolveSessionHostEndpoint(address, port))
+        return false;
+    return SendReliablePayloadTo(static_cast<uint16_t>(CoopProtocol::PacketType::EnemyInteraction),
+        &packet, sizeof(packet), address, port, "enemy interaction send failed");
+}
+
+void ModMain::OnNativeNpcHackCompleted(ArkNpc* npc, bool wasHacked)
+{
+    if (!npc || wasHacked || m_applyingRemoteEnemyPersistentStatus ||
+        m_networkMode == CoopNetworkMode::Off || !IsEnemyReplicationGameplayReady() ||
+        !gEnv || !gEnv->pEntitySystem)
+        return;
+    bool hacked = false;
+    EntityId entityId = INVALID_ENTITYID;
+    if (!TryGuardedCall("completed hack IsHacked", [npc]() { return npc->IsHacked(); }, hacked) || !hacked ||
+        !TryGuardedCall("completed hack GetEntityId", [npc]() { return npc->GetEntityId(); }, entityId))
+        return;
+    const auto net = m_enemyNetIdsByEntity.find(entityId);
+    EnemyAuthorityState* state = net == m_enemyNetIdsByEntity.end() ? nullptr : FindEnemyAuthorityByNetId(net->second);
+    if (!state || !state->stableEnemyId || !state->authorityOwnerAccountToken || IsRemoteProxyEntity(entityId))
+        return;
+    if (!state->remoteLocomotionAuthority && state->authorityOwnerAccountToken == GetLocalAccountToken())
+    {
+        CoopSerialSequence::Advance(state->interactionRevision);
+        state->interactionRevisionEpoch = state->authorityEpoch;
+    }
+}
+
+bool ModMain::DeferNativeNpcHack(ArkNpc* npc)
+{
+    if (!npc || m_applyingRemoteEnemyPersistentStatus || m_networkMode == CoopNetworkMode::Off ||
+        !IsEnemyReplicationGameplayReady())
+        return false;
+    EntityId entityId = INVALID_ENTITYID;
+    bool hacked = false;
+    if (!TryGuardedCall("hack request entity", [npc]() { return npc->GetEntityId(); }, entityId) ||
+        !TryGuardedCall("hack request state", [npc]() { return npc->IsHacked(); }, hacked) || hacked)
+        return false;
+    const auto net = m_enemyNetIdsByEntity.find(entityId);
+    EnemyAuthorityState* state = net == m_enemyNetIdsByEntity.end() ? nullptr : FindEnemyAuthorityByNetId(net->second);
+    if (!state || !state->stableEnemyId || !state->authorityOwnerAccountToken ||
+        IsRemoteProxyEntity(entityId) || state->authorityOwnerAccountToken == GetLocalAccountToken())
+        return false;
+
+    const uint64_t now = GetTickCount64();
+    if (!state->pendingHack.IsCurrent(m_localWorldEpoch, m_localLevelId, now))
+    {
+        state->pendingHack = {};
+        state->pendingHack.id = CoopSerialSequence::Advance(m_enemyInteractionSequence);
+        state->pendingHack.worldEpoch = m_localWorldEpoch;
+        state->pendingHack.areaId = m_localLevelId;
+        state->pendingHack.deadlineMs = now + CoopInteractionPolicy::kRequestTimeoutMilliseconds;
+        LogCoop("native hack queued net=" + std::to_string(state->netId) +
+            " request=" + std::to_string(state->pendingHack.id));
+    }
+    TickPendingEnemyInteractions();
+    return true;
+}
+
+bool ModMain::ApplyNativeEnemyHack(EnemyAuthorityState& state, bool applyIfMissing)
+{
+    IEntity* entity = gEnv && gEnv->pEntitySystem ? gEnv->pEntitySystem->GetEntity(state.entityId) : nullptr;
+    ArkNpc* npc = entity ? EntityUtils::GetArkNpc(entity) : nullptr;
+    if (!npc)
+        return false;
+    bool accepted = false;
+    const bool previousApply = m_applyingRemoteEnemyPersistentStatus;
+    m_applyingRemoteEnemyPersistentStatus = true;
+    TryGuardedVoidCall("commit native hack", [&]()
+    {
+        if (!npc->IsDead())
+        {
+            if (applyIfMissing && !npc->IsHacked())
+                npc->Hack();
+            accepted = npc->IsHacked();
+        }
+    });
+    m_applyingRemoteEnemyPersistentStatus = previousApply;
+    return accepted;
+}
+
+void ModMain::TickPendingEnemyInteractions()
+{
+    if (m_networkMode == CoopNetworkMode::Off || !IsEnemyReplicationGameplayReady())
+        return;
+    const uint64_t now = GetTickCount64();
+    const uint64_t local = GetLocalAccountToken();
+    for (auto& entry : m_enemyAuthorities)
+    {
+        EnemyAuthorityState& state = entry.second;
+        auto& pending = state.pendingHack;
+        if (pending.id == 0)
+            continue;
+        if (!pending.IsCurrent(m_localWorldEpoch, m_localLevelId, now))
+        {
+            LogCoop("native hack cancelled net=" + std::to_string(state.netId) +
+                " request=" + std::to_string(pending.id) + " reason=scope_or_timeout");
+            pending = {};
+            continue;
+        }
+        if (state.authorityOwnerAccountToken == local)
+        {
+            if (ApplyNativeEnemyHack(state))
+            {
+                CoopSerialSequence::Advance(state.interactionRevision);
+                state.interactionRevisionEpoch = state.authorityEpoch;
+                state.hasLastTransmittedStatePacket = false;
+                if (m_networkMode == CoopNetworkMode::Host || IsClientAreaAuthorityActive())
+                    SendEnemyStateNow(state, "handoff hack state send failed");
+                else
+                    SendClientEnemyAuthorityStateNow(state,
+                        CoopProtocol::kEnemyStateSourceFlagAuthorityClaim |
+                            CoopProtocol::kEnemyStateSourceFlagAuthoritySnapshot,
+                        "handoff hack owner state send failed");
+            }
+            pending = {};
+            // Native script callbacks may change the registry during commit.
+            return;
+        }
+        const uint64_t saveKey = CurrentHostSaveKeyHash();
+        if (!state.authorityOwnerAccountToken || !state.authorityEpoch || !saveKey ||
+            !pending.NeedsSend(state.authorityOwnerAccountToken, state.authorityEpoch, saveKey, now))
+            continue;
+        CoopProtocol::EnemyInteractionPacket packet;
+        packet.requestId = pending.id;
+        packet.worldEpoch = pending.worldEpoch;
+        packet.hostSaveKeyHash = saveKey;
+        packet.areaId = pending.areaId;
+        packet.enemyNetId = state.netId;
+        packet.stableEnemyId = state.stableEnemyId;
+        packet.authorityOwnerAccountToken = state.authorityOwnerAccountToken;
+        packet.targetAccountToken = state.authorityOwnerAccountToken;
+        packet.authorityEpoch = state.authorityEpoch;
+        pending.retryAtMs = now + CoopInteractionPolicy::kSendRetryMilliseconds;
+        if (SendEnemyInteractionTo(packet, packet.targetAccountToken))
+        {
+            pending.sentOwner = packet.targetAccountToken;
+            pending.sentEpoch = packet.authorityEpoch;
+            pending.sentSaveKey = saveKey;
+        }
+    }
+}
+
+void ModMain::HandleEnemyInteraction(const CoopProtocol::EnemyInteractionPacket& packet)
+{
+    using Command = CoopProtocol::EnemyInteractionCommand;
+    const auto command = static_cast<Command>(packet.command);
+    if (!CoopInteractionPolicy::HasValidIdentity(packet) ||
+        packet.worldEpoch != m_localWorldEpoch || packet.areaId != m_localLevelId ||
+        packet.hostSaveKeyHash == 0 || packet.hostSaveKeyHash != CurrentHostSaveKeyHash())
+        return;
+    const auto source = m_remotePeers.find(m_activePacketSourceAccountToken);
+    if (source == m_remotePeers.end() || !source->second.sessionReady ||
+        !IsKnownSameLevel(m_localLevelName, source->second.levelName))
+        return;
+    EnemyAuthorityState* state = FindEnemyAuthorityByNetId(packet.enemyNetId);
+    if (!state || state->stableEnemyId != packet.stableEnemyId ||
+        state->authorityOwnerAccountToken != packet.authorityOwnerAccountToken ||
+        state->authorityEpoch != packet.authorityEpoch)
+        return;
+    const bool request = command == Command::HackCompleted;
+    if ((request && packet.targetAccountToken != state->authorityOwnerAccountToken) ||
+        (!request && m_activePacketSourceAccountToken != state->authorityOwnerAccountToken))
+        return;
+    const uint64_t local = GetLocalAccountToken();
+    if (packet.targetAccountToken != local)
+    {
+        if (m_networkMode != CoopNetworkMode::Host)
+            return;
+        const auto target = m_remotePeers.find(packet.targetAccountToken);
+        if (target == m_remotePeers.end() || !target->second.sessionReady ||
+            !IsKnownSameLevel(m_localLevelName, target->second.levelName) || target == source)
+            return;
+        QueueReliablePayloadToEndpoint(static_cast<uint16_t>(CoopProtocol::PacketType::EnemyInteraction),
+            &packet, sizeof(packet), target->second.address, target->second.port,
+            m_activePacketSourceAccountToken, "enemy interaction relay failed");
+        return;
+    }
+    if (!request)
+    {
+        if (!state->pendingHack.IsCurrent(m_localWorldEpoch, m_localLevelId, GetTickCount64()) ||
+            !state->pendingHack.MatchesReply(packet.requestId, m_activePacketSourceAccountToken, packet.authorityEpoch))
+            return;
+        if (command == Command::Accepted && packet.interactionRevision != 0)
+        {
+            if (state->interactionRevisionEpoch != packet.authorityEpoch ||
+                CoopInteractionPolicy::RevisionAtLeast(packet.interactionRevision, state->interactionRevision))
+            {
+                ApplyNativeEnemyHack(*state);
+                state->interactionRevision = packet.interactionRevision;
+                state->interactionRevisionEpoch = packet.authorityEpoch;
+            }
+        }
+        state->pendingHack = {};
+        LogCoop("native hack reply net=" + std::to_string(state->netId) +
+            " request=" + std::to_string(packet.requestId) + " accepted=" + std::to_string(command == Command::Accepted));
+        return;
+    }
+    if (state->remoteLocomotionAuthority || state->authorityOwnerAccountToken != local)
+        return;
+
+    CoopProtocol::EnemyInteractionPacket reply = packet;
+    reply.targetAccountToken = m_activePacketSourceAccountToken;
+    reply.command = static_cast<uint16_t>(Command::Rejected);
+    uint32_t& completed = state->completedInteractionsBySource[m_activePacketSourceAccountToken];
+    const bool duplicate = CoopSerialSequence::IsStaleOrDuplicate(packet.requestId, completed);
+    const bool accepted = ApplyNativeEnemyHack(*state, !duplicate);
+    if (accepted)
+    {
+        if (!duplicate)
+        {
+            CoopSerialSequence::Observe(packet.requestId, completed);
+            CoopSerialSequence::Advance(state->interactionRevision);
+            state->interactionRevisionEpoch = state->authorityEpoch;
+        }
+        reply.command = static_cast<uint16_t>(Command::Accepted);
+    }
+    reply.interactionRevision = state->interactionRevision;
+    SendEnemyInteractionTo(reply, reply.targetAccountToken);
+    if (m_networkMode == CoopNetworkMode::Host || IsClientAreaAuthorityActive())
+        SendEnemyStateNow(*state, "interaction state send failed");
+    else
+        SendClientEnemyAuthorityStateNow(*state, CoopProtocol::kEnemyStateSourceFlagAuthorityClaim |
+            CoopProtocol::kEnemyStateSourceFlagAuthoritySnapshot,
+            "interaction owner state send failed");
+    LogCoop("native hack commit net=" + std::to_string(state->netId) +
+        " request=" + std::to_string(packet.requestId) + " accepted=" + std::to_string(accepted) +
+        " duplicate=" + std::to_string(duplicate));
 }
 
 void ModMain::OnNativeNpcPersistentStatusChanged(
