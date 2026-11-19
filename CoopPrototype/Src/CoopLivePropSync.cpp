@@ -25,6 +25,7 @@
 #include <Prey/CryCore/Platform/CryWindows.h>
 #include <Prey/CrySystem/IConsole.h>
 #include <Prey/CrySystem/ITimer.h>
+#include <Prey/GameDll/ark/ArkInteractionInfo.h>
 #include <Prey/GameDll/ark/ArkTimeScaleManager.h>
 #include <Prey/GameDll/ark/npc/ArkNpc.h>
 #include <Prey/GameDll/ark/player/ArkPlayer.h>
@@ -376,24 +377,6 @@ bool IsLivePropCorpseEntity(IEntity& entity, bool localCarried, std::string& rea
     return IsLivePropCorpseNpc(npc, localCarried, reason);
 }
 
-bool IsLocalPlayerCarryingEntity(EntityId entityId)
-{
-    if (entityId == INVALID_ENTITYID || !ArkPlayer::GetInstancePtr())
-        return false;
-
-    unsigned carriedEntityId = INVALID_ENTITYID;
-    std::string reason;
-    return TryGuardedCall(
-            "live prop local ArkPlayerCarry picked entity",
-            []() -> unsigned
-            {
-                return ArkPlayer::GetInstance().m_interaction.m_playerCarry.m_pickedUpEntityId;
-            },
-            carriedEntityId,
-            &reason) &&
-        carriedEntityId == entityId;
-}
-
 EntityId GetLocalCarriedEntityId()
 {
     if (!ArkPlayer::GetInstancePtr())
@@ -405,7 +388,11 @@ EntityId GetLocalCarriedEntityId()
             "live prop local carried entity id",
             []() -> unsigned
             {
-                return ArkPlayer::GetInstance().m_interaction.m_playerCarry.m_pickedUpEntityId;
+                const auto& carry = ArkPlayer::GetInstance().m_interaction.m_playerCarry;
+                // Vanilla retains the ID after release until collision is restored.
+                return carry.m_pickedUpEntityId != INVALID_ENTITYID && !carry.m_collisionRestoreTimer.IsValid()
+                    ? carry.m_pickedUpEntityId
+                    : INVALID_ENTITYID;
             },
             carriedEntityId,
             &reason))
@@ -414,6 +401,11 @@ EntityId GetLocalCarriedEntityId()
     }
 
     return carriedEntityId;
+}
+
+bool IsLocalPlayerCarryingEntity(EntityId entityId)
+{
+    return entityId != INVALID_ENTITYID && entityId == GetLocalCarriedEntityId();
 }
 
 bool IsFiniteFloat(float value)
@@ -1024,7 +1016,23 @@ bool ModMain::IsLivePropRemoteProtected(const LivePropState& state, float now) c
         (remotePhase || remoteCarried || remoteBallistic || remoteActive);
 }
 
-bool ModMain::ShouldTrackLivePropEntity(IEntity& entity, std::string& reason, bool allowCarryableItem) const
+namespace
+{
+bool IsLooseLiveProp(IEntity& entity, std::string& reason)
+{
+    IEntity* parent = nullptr;
+    if (!TryGuardedCall("live prop IEntity::GetParent", [&entity]() { return entity.GetParent(); }, parent, &reason))
+        return false;
+    if (!parent)
+        return true;
+
+    // The wire pose is in world space; an attached entity follows its native parent.
+    reason = "parented entity";
+    return false;
+}
+}
+
+bool ModMain::ShouldTrackLivePropEntity(IEntity& entity, std::string& reason, bool allowCarryableItem, bool remoteCarried) const
 {
     EntityId entityId = INVALID_ENTITYID;
     if (!TryGuardedCall("live prop IEntity::GetId", [&entity]() { return entity.GetId(); }, entityId, &reason) ||
@@ -1059,6 +1067,9 @@ bool ModMain::ShouldTrackLivePropEntity(IEntity& entity, std::string& reason, bo
             return false;
         }
     }
+
+    if (!IsLooseLiveProp(entity, reason))
+        return false;
 
     const bool localCarried = IsLocalPlayerCarryingEntity(entityId);
     allowCarryableItem = allowCarryableItem || localCarried;
@@ -1125,6 +1136,34 @@ bool ModMain::ShouldTrackLivePropEntity(IEntity& entity, std::string& reason, bo
     const bool carriedTurretTransform =
         allowCarryableItem && className.find("arkturret") != std::string::npos;
 
+    bool carriedInteractiveObject = false;
+    if (allowCarryableItem && className == "arkinteractiveobject")
+    {
+        // A native grab admits this prop, not a generic contact with a device.
+        carriedInteractiveObject = localCarried;
+        uint64_t guid = 0;
+        if (!carriedInteractiveObject &&
+            TryGuardedCall("live prop tracked GetGuid", [&entity]() { return entity.GetGuid(); }, guid, &reason))
+        {
+            const auto tracked = m_liveProps.find(guid);
+            carriedInteractiveObject = tracked != m_liveProps.end() && tracked->second.hasSnapshot &&
+                tracked->second.entityId == entityId;
+        }
+        if (!carriedInteractiveObject && remoteCarried)
+        {
+            std::array<ArkInteractionInfo, 4> interactions{};
+            bool populated = false;
+            carriedInteractiveObject = TryGuardedCall(
+                "live prop native carry interaction",
+                [&]() { return ArkPlayerInteraction::PopulateInteractionInfo(&entity, interactions); },
+                populated,
+                &reason) && populated && std::any_of(interactions.begin(), interactions.end(), [](const ArkInteractionInfo& info)
+                {
+                    return info.m_interactionType == EArkInteractionType::carry;
+                });
+        }
+    }
+
     IEntityArchetype* archetype = nullptr;
     const bool hasArchetype =
         TryGuardedCall("live prop IEntity::GetArchetype", [&entity]() { return entity.GetArchetype(); }, archetype, &reason) &&
@@ -1157,7 +1196,8 @@ bool ModMain::ShouldTrackLivePropEntity(IEntity& entity, std::string& reason, bo
     // carry/collision path; ordinary lights keep native device transforms.
     if (IsBlockedLivePropClass(className) &&
         !carriedTurretTransform &&
-        !carriedArkLightTransform)
+        !carriedArkLightTransform &&
+        !carriedInteractiveObject)
     {
         reason = "untracked class " + className;
         return false;
@@ -3040,7 +3080,7 @@ void ModMain::TickLivePropSync(float frameTime)
 
         std::string reason;
         IEntity* entity = ResolveLivePropEntity(state.guid, state.entityId, reason);
-        if (!entity)
+        if (!entity || !IsLooseLiveProp(*entity, reason))
         {
             state.pendingRemoteApply = false;
             state.remoteApplyStepsRemaining = 0;
@@ -3843,7 +3883,7 @@ void ModMain::HandleLivePropTransform(const CoopProtocol::LivePropTransformPacke
 
     std::string reason;
     IEntity* entity = ResolveLivePropEntity(packet.guid, state.entityId, reason);
-    if (!entity || !ShouldTrackLivePropEntity(*entity, reason, true))
+    if (!entity || !ShouldTrackLivePropEntity(*entity, reason, true, packetCarried))
     {
         ++m_droppedLivePropPackets;
         m_lastLivePropEvent = "dropped live prop guid=" + std::to_string(packet.guid) + " reason=" + reason;
