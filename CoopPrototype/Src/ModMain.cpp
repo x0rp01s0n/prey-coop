@@ -461,9 +461,9 @@ static PreyFunction<void(ArkTurret* const, unsigned, bool)> s_funcCoopArkTurretS
 static PreyFunction<void(ArkTurret* const, float)> s_funcCoopArkTurretSetHealth(0x15E6F10);
 static PreyFunction<void(ArkTurret* const)> s_funcCoopArkTurretSetToMaxHealth(0x15E6FE0);
 static PreyFunction<void(ArkTurret* const, bool)> s_funcCoopArkTurretOnHealthChanged(0x15E3460);
-static PreyFunction<void(ArkTurret* const, bool, bool)> s_funcCoopArkTurretOnBrokenChanged(0x15E30E0);
+static PreyFunction<void(IArkRepairableListener* const, bool, bool)> s_funcCoopArkTurretOnBrokenChanged(0x15E30E0);
 static PreyFunction<void(ArkTurret* const)> s_funcCoopArkTurretOnHackSucceeded(0x15E3400);
-static PreyFunction<void(ArkTurret* const)> s_funcCoopArkTurretOnFortified(0x15E3170);
+static PreyFunction<void(IArkRepairableListener* const)> s_funcCoopArkTurretOnFortified(0x15E3170);
 bool IsLocalPlayerCarryingTurretEntity(EntityId entityId)
 {
     if (entityId == INVALID_ENTITYID || !ArkPlayer::GetInstancePtr())
@@ -3424,6 +3424,7 @@ bool IsAreaScopedReliablePayload(uint16_t payloadType)
     case CoopProtocol::PacketType::SharedStorage:
     case CoopProtocol::PacketType::HazardEvent:
     case CoopProtocol::PacketType::CorpsePhantomRequest:
+    case CoopProtocol::PacketType::EnemyInteraction:
         return true;
     default:
         return false;
@@ -7998,6 +7999,7 @@ static auto s_hookArkOperatorDispenserUpdate = ArkOperatorDispenser::FUpdate.Mak
 static auto s_hookArkOperatorDispenserAssignOperator = ArkOperatorDispenser::FAssignOperator.MakeHook();
 static auto s_hookArkOperatorDispenserPostSerialize = ArkOperatorDispenser::FPostSerialize.MakeHook();
 static auto s_hookArkKeypadSetLocked = ArkKeypad::FSetLocked.MakeHook();
+static auto s_hookArkKeypadSetState = ArkKeypad::FSetState.MakeHook();
 static auto s_hookArkKeycardReaderSetLocked = ArkKeycardReader::FSetLocked.MakeHook();
 static PreyFunction<IEntity*(CScriptBind_Entity* const, IFunctionHandler*)> s_funcScriptBindEntityGetEntity(0x9445F0);
 static auto s_hookScriptBindEntityGotoState = CScriptBind_Entity::FGotoState.MakeHook();
@@ -8398,6 +8400,7 @@ static auto s_hookArkNpcStopGlooEffects = ArkNpc::FStopGlooEffects.MakeHook();
 static auto s_hookArkNpcOnGlooFrozen = ArkNpc::FOnGlooFrozen.MakeHook();
 static auto s_hookArkNpcOnGlooBroken = ArkNpc::FOnGlooBroken.MakeHook();
 static auto s_hookArkNpcPerformMindControlled = ArkNpc::FPerformMindControlled.MakeHook();
+static auto s_hookArkNpcHack = ArkNpc::FHack.MakeHook();
 static auto s_hookArkNpcPerformStopMindControlled = ArkNpc::FPerformStopMindControlled.MakeHook();
 static auto s_hookArkNpcStartPsiSuppressed = ArkNpc::FStartPsiSuppressed.MakeHook();
 static auto s_hookArkNpcEndPsiSuppressed = ArkNpc::FEndPsiSuppressed.MakeHook();
@@ -10906,7 +10909,7 @@ static ArkInteractiveScreen* FindArkInteractiveScreenByStableIdForCoop(uint64_t 
     return screen;
 }
 
-static ArkInteractiveMachine* GetArkInteractiveMachineExtensionFromEntity(IEntity* entity)
+ArkInteractiveMachine* ModMain::GetArkInteractiveMachineExtensionFromEntity(IEntity* entity) const
 {
     if (!entity || !gEnv || !gEnv->pGame)
         return nullptr;
@@ -10966,6 +10969,11 @@ static ArkInteractiveMachine* GetArkInteractiveMachineExtensionFromEntity(IEntit
     }
 
     return nullptr;
+}
+
+static ArkInteractiveMachine* GetArkInteractiveMachineExtensionFromEntity(IEntity* entity)
+{
+    return gMod ? gMod->GetArkInteractiveMachineExtensionFromEntity(entity) : nullptr;
 }
 
 static uint64_t GetArkInteractiveMachineStableIdForCoop(ArkInteractiveMachine* machine, std::string* outDetail)
@@ -12969,12 +12977,13 @@ static void ArkTurret_PostInit_Hook(ArkTurret* turret, IGameObject* gameObject)
         gMod->OnNativeTurretInitializedForHook(turret, "ArkTurret::PostInit");
 }
 
-static void ArkTurret_OnBrokenChanged_Hook(ArkTurret* turret, bool broken, bool wasForced)
+static void ArkTurret_OnBrokenChanged_Hook(IArkRepairableListener* listener, bool broken, bool wasForced)
 {
     ++s_turretStateTransitionHookDepth;
-    s_hookArkTurretOnBrokenChanged.InvokeOrig(turret, broken, wasForced);
+    s_hookArkTurretOnBrokenChanged.InvokeOrig(listener, broken, wasForced);
     --s_turretStateTransitionHookDepth;
 
+    ArkTurret* turret = static_cast<ArkTurret*>(listener);
     QueueTurretStateAfterNativeTransition(turret, "ArkTurret::OnBrokenChanged");
 }
 
@@ -12996,12 +13005,13 @@ static void ArkTurret_OnHackSucceeded_Hook(ArkTurret* turret)
     QueueTurretStateAfterNativeTransition(turret, "ArkTurret::OnHackSucceeded");
 }
 
-static void ArkTurret_OnFortified_Hook(ArkTurret* turret)
+static void ArkTurret_OnFortified_Hook(IArkRepairableListener* listener)
 {
     ++s_turretStateTransitionHookDepth;
-    s_hookArkTurretOnFortified.InvokeOrig(turret);
+    s_hookArkTurretOnFortified.InvokeOrig(listener);
     --s_turretStateTransitionHookDepth;
 
+    ArkTurret* turret = static_cast<ArkTurret*>(listener);
     QueueTurretStateAfterNativeTransition(turret, "ArkTurret::OnFortified");
 }
 
@@ -14109,10 +14119,28 @@ static bool ArkRepairable_SetBroken_Hook(ArkRepairable* repairable, bool broken,
     const bool result = s_hookArkRepairableSetBroken.InvokeOrig(repairable, broken, force);
     if (gMod && repairable)
     {
+        const bool after = repairable->m_bBroken;
         gMod->OnNativeRepairableStateChanged(
             repairable->m_pEntity,
-            before != repairable->m_bBroken,
+            before != after,
             "ArkRepairable::SetBroken");
+        if (before && !after && repairable->m_pEntity)
+        {
+            ArkTurret* turret = nullptr;
+            if (TryGuardedCall(
+                    "repairable turret repair GetArkTurret",
+                    [repairable]() { return EntityUtils::GetArkTurret(repairable->m_pEntity); },
+                    turret,
+                    nullptr) &&
+                turret)
+            {
+                gMod->QueueLocalTurretBrokenStateEventForHook(
+                    turret,
+                    false,
+                    force,
+                    "ArkRepairable::SetBroken repair edge");
+            }
+        }
     }
     return result;
 }
@@ -14153,6 +14181,10 @@ static bool ArkRepairableLite_SetBroken_Hook(ArkRepairableLite* repairable, bool
     if (gMod && repairable)
     {
         gMod->OnNativeGravShaftStateChanged(
+            repairable->m_pEntity,
+            before != repairable->m_bBroken,
+            "ArkRepairableLite::SetBroken");
+        gMod->OnNativeRepairableStateChanged(
             repairable->m_pEntity,
             before != repairable->m_bBroken,
             "ArkRepairableLite::SetBroken");
@@ -15163,6 +15195,18 @@ static void ArkNpc_OnGlooBroken_Hook(ArkNpc* npc)
     s_hookArkNpcOnGlooBroken.InvokeOrig(npc);
     if (gMod)
         gMod->OnNativeNpcGlooStateChanged(npc, "ArkNpc::OnGlooBroken", false);
+}
+
+static void ArkNpc_Hack_Hook(ArkNpc* npc)
+{
+    if (gMod && gMod->DeferNativeNpcHack(npc))
+        return;
+    bool wasHacked = false;
+    const bool known = npc && CoopRuntimeGuards::TryGuardedCall(
+        "native hack before", [npc]() { return npc->IsHacked(); }, wasHacked);
+    s_hookArkNpcHack.InvokeOrig(npc);
+    if (gMod && known)
+        gMod->OnNativeNpcHackCompleted(npc, wasHacked);
 }
 
 static void ArkNpc_PerformMindControlled_Hook(ArkNpc* npc)
@@ -21621,6 +21665,8 @@ static void ArkOperatorDispenser_PostSerialize_Hook(ArkOperatorDispenser* dispen
             "ArkOperatorDispenser::PostSerialize");
 }
 
+static thread_local uint32_t s_keypadStateMutationHookDepth = 0;
+
 static bool ArkKeypad_SetLocked_Hook(ArkKeypad* keypad, bool locked, bool force)
 {
     bool before = false;
@@ -21630,7 +21676,9 @@ static bool ArkKeypad_SetLocked_Hook(ArkKeypad* keypad, bool locked, bool force)
     std::string reason;
     const bool beforeOk = TryReadArkKeypadLocked(keypad, before, &beforeState, "area object keypad locked before", &reason);
 
+    ++s_keypadStateMutationHookDepth;
     const bool result = s_hookArkKeypadSetLocked.InvokeOrig(keypad, locked, force);
+    --s_keypadStateMutationHookDepth;
 
     const bool afterOk = TryReadArkKeypadLocked(keypad, after, &afterState, "area object keypad locked after", &reason);
     (void)beforeState;
@@ -21643,6 +21691,48 @@ static bool ArkKeypad_SetLocked_Hook(ArkKeypad* keypad, bool locked, bool force)
             (beforeOk && afterOk && before != after) || (!beforeOk && afterOk),
             "ArkKeypad::SetLocked");
     return result;
+}
+
+static void ArkKeypad_SetState_Hook(
+    ArkKeypad* keypad,
+    ArkKeypad::EArkKeypadState state,
+    bool force)
+{
+    bool beforeLocked = false;
+    int beforeState = 0;
+    const bool beforeOk = TryReadArkKeypadLocked(
+        keypad,
+        beforeLocked,
+        &beforeState,
+        "area object keypad state before",
+        nullptr);
+
+    s_hookArkKeypadSetState.InvokeOrig(keypad, state, force);
+
+    if (!keypad || !gMod || s_keypadStateMutationHookDepth != 0)
+        return;
+
+    bool afterLocked = false;
+    int afterState = 0;
+    const bool afterOk = TryReadArkKeypadLocked(
+        keypad,
+        afterLocked,
+        &afterState,
+        "area object keypad state after",
+        nullptr);
+    const bool terminalState =
+        afterState == static_cast<int>(ArkKeypad::EArkKeypadState::Locked) ||
+        afterState == static_cast<int>(ArkKeypad::EArkKeypadState::Unlocked);
+    if (afterOk && terminalState &&
+        ((beforeOk && beforeLocked != afterLocked) || !beforeOk))
+    {
+        gMod->OnLocalAreaObjectKeypadStateChanged(
+            keypad,
+            CoopProtocol::kAreaObjectEventKeypadLocked,
+            afterLocked,
+            true,
+            "ArkKeypad::SetState terminal lock transition");
+    }
 }
 
 static bool ArkKeycardReader_SetLocked_Hook(ArkKeycardReader* reader, bool locked, bool force)
@@ -26848,6 +26938,9 @@ void ModMain::EndCoopLoadGuard(const char* reason)
     m_localLevelId = HashLevelName(m_localLevelName);
     if (m_networkMode == CoopNetworkMode::Client)
     {
+        // Resetting the active peer above requires a fresh Hello after any
+        // native load, including an independent area transition.
+        m_clientConnectStartTime = GetNowSeconds();
         if (arkLevelTransitionComplete)
             m_clientLocalAreaEnteredByTransitionLevel = m_localLevelName;
         else if (hostWorldLoadComplete || loadFailed)
@@ -26884,13 +26977,6 @@ void ModMain::EndCoopLoadGuard(const char* reason)
     if (hostWorldLoadComplete)
     {
         SetTransitionPhase("host_world_load_finalize", reason);
-        if (m_networkMode == CoopNetworkMode::Client && !m_hasRemoteSession)
-        {
-            // Player-state recovery may deliberately keep the join gate
-            // closed after the native load. Give that upload/ack handshake a
-            // fresh bounded window before TickPeerTimeout runs this frame.
-            m_clientConnectStartTime = GetNowSeconds();
-        }
         m_pendingHostWorldRequest = false;
         m_hasPendingHostWorldOffer = false;
         m_lastWorldSyncEvent = "host world load complete";
@@ -32265,6 +32351,7 @@ void ModMain::InitHooks()
         s_hookArkOperatorDispenserAssignOperator.SetHookFunc(&ArkOperatorDispenser_AssignOperator_Hook);
         s_hookArkOperatorDispenserPostSerialize.SetHookFunc(&ArkOperatorDispenser_PostSerialize_Hook);
         s_hookArkKeypadSetLocked.SetHookFunc(&ArkKeypad_SetLocked_Hook);
+        s_hookArkKeypadSetState.SetHookFunc(&ArkKeypad_SetState_Hook);
         s_hookArkKeycardReaderSetLocked.SetHookFunc(&ArkKeycardReader_SetLocked_Hook);
         s_hookScriptBindEntityGotoState.SetHookFunc(&ScriptBindEntity_GotoState_Hook);
         s_hookArkInteractiveObjectActivate.SetHookFunc(&ArkInteractiveObject_Activate_Hook);
@@ -32553,6 +32640,7 @@ void ModMain::InitHooks()
         s_hookArkNpcOnGlooFrozen.SetHookFunc(&ArkNpc_OnGlooFrozen_Hook);
         s_hookArkNpcOnGlooBroken.SetHookFunc(&ArkNpc_OnGlooBroken_Hook);
         s_hookArkNpcPerformMindControlled.SetHookFunc(&ArkNpc_PerformMindControlled_Hook);
+        s_hookArkNpcHack.SetHookFunc(&ArkNpc_Hack_Hook);
         s_hookArkNpcPerformStopMindControlled.SetHookFunc(&ArkNpc_PerformStopMindControlled_Hook);
         s_hookArkNpcStartPsiSuppressed.SetHookFunc(&ArkNpc_StartPsiSuppressed_Hook);
         s_hookArkNpcEndPsiSuppressed.SetHookFunc(&ArkNpc_EndPsiSuppressed_Hook);
@@ -36433,6 +36521,7 @@ void ModMain::MainUpdate(unsigned updateFlags)
     tracePostProxyStep("after TickEnemyMimicryStateHeartbeat");
     TickPendingEnemyDeathCommits(frameTime);
     tracePostProxyStep("after TickPendingEnemyDeathCommits");
+    TickPendingEnemyInteractions();
     TickRemoteEnemySmoothing(frameTime, realFrameTime);
     tracePostProxyStep("after TickRemoteEnemySmoothing");
     TickAreaLease(frameTime);
@@ -44113,6 +44202,9 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
         source.targetAccountToken = 0xA1B2C3D4E5F60718ull;
         source.authorityOwnerAccountToken = 0x1827364554637281ull;
         source.authorityEpoch = 77;
+        source.locomotionFlags = CoopProtocol::kEnemyLocomotionFlagRagdolled |
+            CoopProtocol::kEnemyLocomotionFlagStunned;
+        source.interactionRevision = 93;
         source.authorityAttentionLevel = static_cast<uint8_t>(EArkAttentionLevel::interested);
         source.semanticContextId = 113;
         source.semanticSequence = 19;
@@ -44136,11 +44228,13 @@ bool ModMain::HandleRuntimeControlCommand(const std::string& command, const std:
             source.entityGuid,
             decoded);
         const bool wireOk =
-            sizeof(CoopProtocol::EnemyStateWirePacket) == 144 &&
+            sizeof(CoopProtocol::EnemyStateWirePacket) == 150 &&
             decodedOk &&
             decoded.targetAccountToken == source.targetAccountToken &&
             decoded.authorityOwnerAccountToken == source.authorityOwnerAccountToken &&
             decoded.authorityEpoch == source.authorityEpoch &&
+            decoded.locomotionFlags == source.locomotionFlags &&
+            decoded.interactionRevision == source.interactionRevision &&
             decoded.authorityAttentionLevel == source.authorityAttentionLevel &&
             decoded.semanticContextId == source.semanticContextId &&
             decoded.semanticSequence == source.semanticSequence &&
@@ -56978,9 +57072,15 @@ bool ModMain::QueueLocalTurretAuthorityReleaseRequest(IEntity& entity, const cha
 
 void ModMain::QueueLocalTurretBrokenStateEventForHook(ArkTurret* turret, bool broken, bool wasForced, const char* reason)
 {
-    (void)broken;
     (void)wasForced;
-    QueueLocalTurretSnapshotStateForHook(turret, reason);
+    if (!turret || broken || m_networkMode != CoopNetworkMode::Host || m_applyingRemoteEnemyAbilityFxEvent)
+        return;
+
+    IEntity* entity = FindEntityForTurretPointer(turret);
+    if (!entity || LocalOwnsTurretAuthority(*entity, true))
+        return;
+
+    QueueLocalTurretSnapshotEventForEntity(*entity, reason, 0, 0, true);
 }
 
 void ModMain::QueueLocalTurretSnapshotStateForHook(ArkTurret* turret, const char* reason)
@@ -57040,7 +57140,8 @@ bool ModMain::QueueLocalTurretSnapshotEventForEntity(
     IEntity& entity,
     const char* reason,
     uint32_t targetAddress,
-    uint16_t targetPort)
+    uint16_t targetPort,
+    bool localRepairEdge)
 {
     if (m_networkMode == CoopNetworkMode::Off ||
         m_socket == kInvalidNetworkSocket ||
@@ -57106,18 +57207,21 @@ bool ModMain::QueueLocalTurretSnapshotEventForEntity(
             transitionReason.find("StartPickupMode") != std::string::npos ||
             transitionReason.find("StopPickupMode") != std::string::npos ||
             transitionReason.find("OnHackSucceeded") != std::string::npos ||
-            transitionReason.find("OnFortified") != std::string::npos;
+            transitionReason.find("OnFortified") != std::string::npos ||
+            localRepairEdge;
         const bool observerHealthCallback =
             transitionReason.find("OnHealthChanged") != std::string::npos ||
-            transitionReason.find("OnBrokenChanged") != std::string::npos;
+            transitionReason.find("OnBrokenChanged") != std::string::npos ||
+            localRepairEdge;
         if (observerHealthCallback && authority.ownerAccountToken != GetLocalAccountToken())
         {
             float currentHealth = 0.0f;
             float currentMaxHealth = 0.0f;
             const bool localRepair =
-                transitionReason.find("OnHealthChanged") != std::string::npos &&
-                ReadEntityHealth(entity.GetId(), currentHealth, currentMaxHealth) &&
-                authority.lastHealth >= 0.0f && currentHealth > authority.lastHealth + 0.05f;
+                localRepairEdge ||
+                (transitionReason.find("OnHealthChanged") != std::string::npos &&
+                    ReadEntityHealth(entity.GetId(), currentHealth, currentMaxHealth) &&
+                    authority.lastHealth >= 0.0f && currentHealth > authority.lastHealth + 0.05f);
             if (!localRepair)
                 return false;
             localInteraction = true;
@@ -57677,7 +57781,7 @@ bool ModMain::ApplyTurretSnapshotStateToEntity(
         {
             TryGuardedVoidCall(
                 "turret state apply authoritative OnFortified",
-                [turret]() { s_funcCoopArkTurretOnFortified(turret); },
+                [turret]() { s_funcCoopArkTurretOnFortified(static_cast<IArkRepairableListener*>(turret)); },
                 &guardReason);
         }
     }
@@ -57969,7 +58073,7 @@ bool ModMain::ApplyTurretBrokenStateToEntity(IEntity& entity, bool broken, bool 
     }
 
     TryGuardedVoidCall("turret broken apply OnBrokenChanged", [turret, broken, wasForced]() {
-        s_funcCoopArkTurretOnBrokenChanged(turret, broken, wasForced);
+        s_funcCoopArkTurretOnBrokenChanged(static_cast<IArkRepairableListener*>(turret), broken, wasForced);
     }, &guardReason);
 
     m_applyingRemoteEnemyAbilityFxEvent = previousRemoteApply;
@@ -58550,6 +58654,7 @@ bool ModMain::BuildEnemyStatePacket(EnemyAuthorityState& state, CoopProtocol::Te
             : GetLocalAccountToken();
     packet.authorityEpoch = state.authorityEpoch;
     packet.authorityAttentionLevel = state.authorityAttentionLevel;
+    packet.interactionRevision = state.interactionRevision;
     CoopProtocol::SetEnemyStateSourceAccountTag(packet, GetLocalAccountToken());
 
     IEntity* entity = nullptr;
@@ -69066,7 +69171,8 @@ void ModMain::HandleReliableEnvelope(const CoopProtocol::ReliableEnvelopePacket&
         reliablePayloadType == CoopProtocol::PacketType::EnemyAbilityFxEvent ||
         reliablePayloadType == CoopProtocol::PacketType::EnemyMannequinAction ||
         reliablePayloadType == CoopProtocol::PacketType::EnemyRoster ||
-        reliablePayloadType == CoopProtocol::PacketType::CorpsePhantomRequest;
+        reliablePayloadType == CoopProtocol::PacketType::CorpsePhantomRequest ||
+        reliablePayloadType == CoopProtocol::PacketType::EnemyInteraction;
     const bool enemyReplicationReceiveReady =
         IsEnemyReplicationGameplayReady() ||
         (reliablePayloadType == CoopProtocol::PacketType::EnemyRoster &&
@@ -69451,6 +69557,15 @@ void ModMain::HandleReliablePayload(uint16_t payloadType, const uint8_t* payload
         CoopProtocol::TestMimicStatePacket packet = {};
         std::memcpy(&packet, payload, sizeof(packet));
         HandleTestMimicState(packet);
+        return;
+    }
+    case CoopProtocol::PacketType::EnemyInteraction:
+    {
+        if (payloadSize != sizeof(CoopProtocol::EnemyInteractionPacket) || !IsEnemyReplicationGameplayReady())
+            return;
+        CoopProtocol::EnemyInteractionPacket packet = {};
+        std::memcpy(&packet, payload, sizeof(packet));
+        HandleEnemyInteraction(packet);
         return;
     }
     case CoopProtocol::PacketType::EnemyDamageRequest:
@@ -70104,6 +70219,22 @@ void ModMain::RelayReliablePayloadToPeers(
     }
 
     uint64_t targetAccountToken = 0;
+    if (!sourceInHostArea && type == CoopProtocol::PacketType::EnemyInteraction &&
+        packet.payloadSize == sizeof(CoopProtocol::EnemyInteractionPacket))
+    {
+        CoopProtocol::EnemyInteractionPacket interaction = {};
+        std::memcpy(&interaction, packet.payload, sizeof(interaction));
+        const auto target = m_remotePeers.find(interaction.targetAccountToken);
+        // The host routes but does not simulate this area. The destination
+        // validates stable NPC identity and the current enemy lease itself.
+        if (target == m_remotePeers.end() || sourcePeer->worldEpoch != m_localWorldEpoch ||
+            !CoopInteractionPolicy::CanRelay(interaction, m_localWorldEpoch, CurrentHostSaveKeyHash(),
+                packet.sourceAccountToken, sourcePeer->levelId, target->second.levelId))
+            return;
+        targetAccountToken = interaction.targetAccountToken;
+        relayShared = targetAccountToken != GetLocalAccountToken() &&
+            targetAccountToken != packet.sourceAccountToken;
+    }
     if (type == CoopProtocol::PacketType::RemotePlayerDamage &&
         packet.payloadSize == sizeof(CoopProtocol::RemotePlayerDamagePacket))
     {
@@ -72793,6 +72924,9 @@ void ModMain::HandleTestMimicState(const CoopProtocol::TestMimicStatePacket& pac
 
     if (packet.authorityOwnerAccountToken == GetLocalAccountToken())
     {
+        // The grant was sequenced by the area authority. Our first owner
+        // snapshot must be newer than that grant on every observer.
+        CoopSerialSequence::Observe(packet.sequence, m_mimicStateSequence);
         if (!authorityState)
         {
             ++m_enemyAuthorityClaimsDenied;

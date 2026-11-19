@@ -20,6 +20,7 @@
 #include "CoopDamagePolicy.h"
 #include "CoopEnemyAuthorityPolicy.h"
 #include "CoopEnemyControlPolicy.h"
+#include "CoopInteractionPolicy.h"
 #include "CoopEventRouter.h"
 #include "CoopNetworkTelemetry.h"
 #include "CoopCoverageDiscovery.h"
@@ -435,6 +436,8 @@ public:
         const char* stage);
     void OnNativeNpcGlooStateChanged(ArkNpc* npc, const char* stage, bool frozen);
     void OnNativeNpcPersistentStatusChanged(ArkNpc* npc, uint32_t statusFlag, bool enabled, const char* stage);
+    void OnNativeNpcHackCompleted(ArkNpc* npc, bool wasHacked);
+    bool DeferNativeNpcHack(ArkNpc* npc);
     void RecordPsiFxSniper(std::string event);
     bool MarkLocalGooResultSource(EntityId projectileEntityId, const char* reason);
     bool TryCorrectRemoteGooFinalTransform(CArkProjectileGoo* goo, EntityId projectileEntityId, const char* reason, bool logTrace = true);
@@ -1070,6 +1073,10 @@ private:
         uint16_t localAbilityFxKind = CoopProtocol::kEnemyAbilityFxNone;
         uint32_t localNativeLocomotionFlags = 0;
         uint32_t localPersistentStatusFlags = 0;
+        uint32_t interactionRevision = 0;
+        uint32_t interactionRevisionEpoch = 0;
+        CoopInteractionPolicy::PendingHack pendingHack;
+        std::unordered_map<uint64_t, uint32_t> completedInteractionsBySource;
         uint32_t localMannequinFlags = 0;
         uint32_t localMannequinAttackKind = 0;
         uint32_t localMannequinSequence = 0;
@@ -1768,6 +1775,7 @@ public:
     void OnNativeElectricalBoxStateChanged(IEntity* entity, bool changed, const char* reason);
     void OnNativeRepairableStateChanged(IEntity* entity, bool changed, const char* reason);
     void OnNativeGravShaftStateChanged(IEntity* entity, bool changed, const char* reason);
+    ArkInteractiveMachine* GetArkInteractiveMachineExtensionFromEntity(IEntity* entity) const;
     void OnNativePsiLiftFieldStarted(CArkPsiPowerLift* power, bool result, const char* reason);
     void OnNativeBreakableHealthChanged(CArkBreakable* breakable, float before, float after, const char* reason);
     void OnNativeBreakableGlassImpact(
@@ -1989,6 +1997,10 @@ private:
     void HandleDialogueLease(const CoopProtocol::DialogueLeasePacket& packet);
     void HandleTimeDilation(const CoopProtocol::TimeDilationPacket& packet);
     void HandleEnemyDamageRequest(const CoopProtocol::EnemyDamageRequestPacket& packet);
+    void HandleEnemyInteraction(const CoopProtocol::EnemyInteractionPacket& packet);
+    bool SendEnemyInteractionTo(const CoopProtocol::EnemyInteractionPacket& packet, uint64_t targetAccountToken);
+    void TickPendingEnemyInteractions();
+    bool ApplyNativeEnemyHack(EnemyAuthorityState& state, bool applyIfMissing = true);
     void HandleEnemyDeathPresentation(const CoopProtocol::EnemyDeathPresentationPacket& packet);
     void HandleLivePropTransform(const CoopProtocol::LivePropTransformPacket& packet);
     void HandleGooResult(const CoopProtocol::GooResultPacket& packet);
@@ -2416,7 +2428,8 @@ private:
         IEntity& entity,
         const char* reason,
         uint32_t targetAddress = 0,
-        uint16_t targetPort = 0);
+        uint16_t targetPort = 0,
+        bool localRepairEdge = false);
     uint32_t QueueLocalTurretSnapshotEventsToEndpoint(uint32_t address, uint16_t port, const char* reason);
     uint16_t BuildTurretStateFlags(IEntity& entity, ArkTurret& turret, const char* reason) const;
     bool ApplyRemoteTurretSnapshotEvent(const CoopProtocol::EnemyAbilityFxEventPacket& packet, const Vec3& position, const Vec3& direction);
@@ -3486,6 +3499,7 @@ private:
     std::unordered_set<EntityId> m_networkConsumedCystoidNestEntityIds;
     bool m_applyingRemoteEnemyGlooState = false;
     bool m_applyingRemoteEnemyPersistentStatus = false;
+    uint32_t m_enemyInteractionSequence = 0;
     uint32_t m_remoteProxyTransformWriteDepth = 0;
     uint32_t m_remoteEnemyTransformWriteDepth = 0;
     std::unordered_set<EntityId> m_remoteGooResultEntityIds;

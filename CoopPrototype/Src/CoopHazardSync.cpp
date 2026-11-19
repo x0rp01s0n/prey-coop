@@ -18,6 +18,7 @@
 #include <Prey/GameDll/ark/environment/ArkAreaHazard.h>
 #include <Prey/GameDll/ark/environment/ArkElectricalBox.h>
 #include <Prey/GameDll/ark/environment/ArkChargeTrap.h>
+#include <Prey/GameDll/ark/ArkInteractiveMachine.h>
 #include <Prey/GameDll/ark/ArkRepairableObject.h>
 #include <Prey/GameDll/ark/arkgravshaftentity.h>
 #include <Prey/GameDll/ark/player/ArkPlayer.h>
@@ -350,6 +351,103 @@ T* ResolveHazardExtensionByGuid(
         return nullptr;
     }
     return static_cast<T*>(extension);
+}
+
+ArkInteractiveMachine* ResolveInteractiveMachineByGuid(
+    uint64_t guid,
+    uint64_t archetypeId,
+    std::string& reason)
+{
+    if (guid == 0 || !gEnv || !gEnv->pEntitySystem || !gEnv->pGame)
+    {
+        reason = "missing_runtime_or_identity";
+        return nullptr;
+    }
+
+    EntityId entityId = INVALID_ENTITYID;
+    IEntity* entity = nullptr;
+    IEntityArchetype* archetype = nullptr;
+    uint64_t localArchetypeId = 0;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "interactive repairable FindEntityByGuid",
+            [guid]() { return gEnv->pEntitySystem->FindEntityByGuid(static_cast<EntityGUID>(guid)); },
+            entityId,
+            &reason) ||
+        entityId == INVALID_ENTITYID ||
+        !CoopRuntimeGuards::TryGuardedCall(
+            "interactive repairable GetEntity",
+            [entityId]() { return gEnv->pEntitySystem->GetEntity(entityId); },
+            entity,
+            &reason) ||
+        !entity ||
+        !CoopRuntimeGuards::TryGuardedCall(
+            "interactive repairable GetArchetype",
+            [entity]() { return entity->GetArchetype(); },
+            archetype,
+            &reason))
+    {
+        return nullptr;
+    }
+    if (archetype && !CoopRuntimeGuards::TryGuardedCall(
+            "interactive repairable archetype GetId",
+            [archetype]() { return archetype->GetId(); },
+            localArchetypeId,
+            &reason))
+    {
+        return nullptr;
+    }
+    if (archetypeId != 0 && localArchetypeId != archetypeId)
+    {
+        reason = "interactive_repairable_identity_mismatch";
+        return nullptr;
+    }
+
+    if (!gMod)
+    {
+        reason = "interactive_repairable_mod_missing";
+        return nullptr;
+    }
+    ArkInteractiveMachine* machine = gMod->GetArkInteractiveMachineExtensionFromEntity(entity);
+    if (!machine)
+        reason = "interactive_repairable_extension_missing";
+    return machine;
+}
+
+struct RepairableComponent
+{
+    ArkRepairable* full = nullptr;
+    ArkRepairableLite* lite = nullptr;
+};
+
+RepairableComponent ResolvePersistentRepairableByGuid(
+    uint64_t guid,
+    uint64_t archetypeId,
+    std::string& reason)
+{
+    if (ArkChargeTrap* trap = ResolveHazardExtensionByGuid<ArkChargeTrap>(
+            guid,
+            archetypeId,
+            "ArkChargeTrap",
+            reason))
+    {
+        return { &trap->m_repairable, nullptr };
+    }
+    if (ArkRepairableObject* object = ResolveHazardExtensionByGuid<ArkRepairableObject>(
+            guid,
+            archetypeId,
+            "ArkRepairableObject",
+            reason))
+    {
+        return { &object->m_repairable, nullptr };
+    }
+    if (ArkInteractiveMachine* machine = ResolveInteractiveMachineByGuid(
+            guid,
+            archetypeId,
+            reason))
+    {
+        return { nullptr, &machine->m_repairable };
+    }
+    return {};
 }
 
 bool ApplyGravShaftAggregateState(
@@ -1100,33 +1198,50 @@ void ModMain::OnNativeRepairableStateChanged(
         OnNativeElectricalBoxStateChanged(entity, true, reason);
         return;
     }
-    if (std::strcmp(className, "ArkChargeTrap") != 0 &&
-        std::strcmp(className, "ArkRepairableObject") != 0)
+    if (std::strcmp(className, "ArkTurret") == 0 ||
+        std::strcmp(className, "ArkGravShaft") == 0)
     {
         return;
     }
 
-    IEntityArchetype* archetype = entity->GetArchetype();
-    const uint64_t archetypeId = archetype ? archetype->GetId() : 0;
-    ArkRepairable* repairable = nullptr;
-    std::string resolveReason;
-    if (std::strcmp(className, "ArkChargeTrap") == 0)
+    uint64_t guid = 0;
+    IEntityArchetype* archetype = nullptr;
+    uint64_t archetypeId = 0;
+    if (!CoopRuntimeGuards::TryGuardedCall(
+            "repairable state GetGuid",
+            [entity]() { return entity->GetGuid(); },
+            guid,
+            &guardReason) ||
+        guid == 0 ||
+        !CoopRuntimeGuards::TryGuardedCall(
+            "repairable state GetArchetype",
+            [entity]() { return entity->GetArchetype(); },
+            archetype,
+            &guardReason))
     {
-        ArkChargeTrap* trap = ResolveHazardExtensionByGuid<ArkChargeTrap>(
-            entity->GetGuid(), archetypeId, "ArkChargeTrap", resolveReason);
-        repairable = trap ? &trap->m_repairable : nullptr;
+        return;
     }
-    else
+    if (archetype && !CoopRuntimeGuards::TryGuardedCall(
+            "repairable state archetype GetId",
+            [archetype]() { return archetype->GetId(); },
+            archetypeId,
+            &guardReason))
     {
-        ArkRepairableObject* object = ResolveHazardExtensionByGuid<ArkRepairableObject>(
-            entity->GetGuid(), archetypeId, "ArkRepairableObject", resolveReason);
-        repairable = object ? &object->m_repairable : nullptr;
+        return;
     }
-    if (!repairable)
+
+    RepairableComponent component = ResolvePersistentRepairableByGuid(
+        guid,
+        archetypeId,
+        guardReason);
+    if (!component.full && !component.lite)
         return;
 
-    uint16_t state = repairable->m_bBroken ? CoopProtocol::kRepairableStateBroken : 0u;
-    if (repairable->m_bFortified)
+    const bool broken = component.full
+        ? component.full->m_bBroken
+        : component.lite->m_bBroken;
+    uint16_t state = broken ? CoopProtocol::kRepairableStateBroken : 0u;
+    if (component.full && component.full->m_bFortified)
         state |= CoopProtocol::kRepairableStateFortified;
     QueueLocalPersistentHazardState(
         entity,
@@ -2508,37 +2623,32 @@ void ModMain::HandleHazardEvent(const CoopProtocol::HazardEventPacket& packet)
         {
             const bool broken = (packet.flags & CoopProtocol::kRepairableStateBroken) != 0;
             const bool fortified = (packet.flags & CoopProtocol::kRepairableStateFortified) != 0;
-            ArkRepairable* repairable = nullptr;
-            ArkChargeTrap* trap = ResolveHazardExtensionByGuid<ArkChargeTrap>(
+            RepairableComponent component = ResolvePersistentRepairableByGuid(
                 packet.targetGuid,
                 packet.archetypeId,
-                "ArkChargeTrap",
                 detail);
-            if (trap)
-            {
-                repairable = &trap->m_repairable;
-            }
-            else
-            {
-                ArkRepairableObject* object = ResolveHazardExtensionByGuid<ArkRepairableObject>(
-                    packet.targetGuid,
-                    packet.archetypeId,
-                    "ArkRepairableObject",
-                    detail);
-                repairable = object ? &object->m_repairable : nullptr;
-            }
-            if (repairable)
+            if (component.full)
             {
                 bool changed = false;
                 const bool called = CoopRuntimeGuards::TryGuardedCall(
                     "persistent repairable SetBroken",
-                    [repairable, broken]() { return ArkRepairable::FSetBroken(repairable, broken, true); },
+                    [repairable = component.full, broken]() { return ArkRepairable::FSetBroken(repairable, broken, true); },
                     changed,
                     &detail);
                 if (called)
-                    ApplyRepairableFortifiedState(*repairable, fortified);
-                applied = called && repairable->m_bBroken == broken &&
-                    repairable->m_bFortified == fortified;
+                    ApplyRepairableFortifiedState(*component.full, fortified);
+                applied = called && component.full->m_bBroken == broken &&
+                    component.full->m_bFortified == fortified;
+            }
+            else if (component.lite)
+            {
+                bool changed = false;
+                const bool called = CoopRuntimeGuards::TryGuardedCall(
+                    "persistent repairable lite SetBroken",
+                    [repairable = component.lite, broken]() { return ArkRepairableLite::FSetBroken(repairable, broken, true); },
+                    changed,
+                    &detail);
+                applied = called && component.lite->m_bBroken == broken && !fortified;
             }
         }
         else if (kind == CoopProtocol::HazardEventKind::ExplosiveTankExplode)
