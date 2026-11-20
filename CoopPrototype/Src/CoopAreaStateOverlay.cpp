@@ -407,21 +407,27 @@ bool ApplyCoopAreaStateOverlayJsonl(
             continue;
         }
 
-        const bool transformOk = TryGuardedVoidCall(
-            "area overlay SetPosRotScale",
-            [&]()
-            {
-                entity->SetPosRotScale(position, rotation, scale, ENTITY_XFORM_USER);
-            },
-            &reason);
-        if (transformOk)
+        IEntity* parent = nullptr;
+        if (!TryGuardedCall("area overlay GetParent", [entity]() { return entity->GetParent(); }, parent, &reason))
         {
-            ++outStats.transformedEntities;
-            if (outTransformedGuids)
-                outTransformedGuids->push_back(guid);
-        }
-        else
             ++outStats.errors;
+        }
+        else if (!parent)
+        {
+            // A saved world pose is not a local pose for a native attachment.
+            const bool transformOk = TryGuardedVoidCall(
+                "area overlay SetPosRotScale",
+                [&]() { entity->SetPosRotScale(position, rotation, scale, ENTITY_XFORM_USER); },
+                &reason);
+            if (transformOk)
+            {
+                ++outStats.transformedEntities;
+                if (outTransformedGuids)
+                    outTransformedGuids->push_back(guid);
+            }
+            else
+                ++outStats.errors;
+        }
 
         const bool hideOk = TryGuardedVoidCall(
             "area overlay Hide",

@@ -2204,7 +2204,7 @@ private:
     void SetCurrentHostSaveStateKey(const std::string& saveKey, bool retainPrevious);
     bool BuildLivePropTransformPacket(CoopProtocol::LivePropTransformPacket& packet, const LivePropState& state);
     bool CaptureLivePropState(IEntity& entity, bool removed, LivePropState& outState, std::string& reason, bool allowCarryableItem = false) const;
-    bool ShouldTrackLivePropEntity(IEntity& entity, std::string& reason, bool allowCarryableItem = false) const;
+    bool ShouldTrackLivePropEntity(IEntity& entity, std::string& reason, bool allowCarryableItem = false, bool remoteCarried = false) const;
     void RetireLivePropTrackingForSharedDrop(EntityId entityId);
     IEntity* ResolveLivePropEntity(uint64_t guid, EntityId cachedEntityId, std::string& reason);
     const char* GetLivePropLeasePhaseName(LivePropLeasePhase phase) const;
