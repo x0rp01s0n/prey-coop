@@ -726,6 +726,8 @@ public:
     bool EnsureLocalPlayerWeaponRegistered(unsigned itemId, const char* reason);
     bool ResetLocalPlayerWeaponsForInventoryReplacement(const char* reason);
     uint32_t ReconcileLocalPlayerWeaponsFromInventory(const char* reason, bool resetWeaponState);
+    bool IsLivePropHeldByPeer(const IEntity& entity) const;
+    void OnArkPlayerCarryStarted(EntityId entityId);
     void OnArkPlayerCarryThrowHook(ArkPlayerCarry* carry, const char* phase, bool result);
     void OnArkPlayerCarryStopHook(EntityId entityId, float impulse, bool applyAngularImpulse, bool thrown, bool fromSerialize);
     std::string GetSaveGamePathOverrideForHook(const char* path, bool quick, int reason, const char* checkpointName);
@@ -1506,7 +1508,7 @@ private:
         Quat targetRotation = Quat::CreateIdentity();
         Vec3 targetScale = Vec3Constants<float>::fVec3_One;
         uint32_t flags = 0;
-        uint32_t lastReceivedSequence = 0;
+        uint64_t remoteCarrierAccountToken = 0;
         float lastQueuedTime = -1000.0f;
         float lastSentTime = -1000.0f;
         float activeUntilTime = -1000.0f;
@@ -4524,6 +4526,7 @@ private:
     std::vector<EntityId> m_debugSpawnedEnemyEntityIds;
     std::unordered_set<EntityId> m_pendingEnemyRegistryEntityIds;
     std::unordered_map<uint64_t, LivePropState> m_liveProps;
+    std::unordered_map<uint64_t, std::unordered_map<uint64_t, uint32_t>> m_livePropSequencesBySource;
     std::unordered_set<uint64_t> m_areaOverlayLivePropCandidates;
     float m_areaOverlayLivePropCandidateUntilTime = -1000.0f;
     uint64_t m_nextEnemyNetId = 100;
