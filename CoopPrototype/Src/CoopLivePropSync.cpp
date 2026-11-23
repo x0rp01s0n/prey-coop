@@ -25,6 +25,7 @@
 #include <Prey/CryCore/Platform/CryWindows.h>
 #include <Prey/CrySystem/IConsole.h>
 #include <Prey/CrySystem/ITimer.h>
+#include <Prey/GameDll/ark/ArkInteractionInfo.h>
 #include <Prey/GameDll/ark/ArkTimeScaleManager.h>
 #include <Prey/GameDll/ark/npc/ArkNpc.h>
 #include <Prey/GameDll/ark/player/ArkPlayer.h>
@@ -123,9 +124,7 @@ constexpr size_t kMaxLivePropSendsPerTick = 6;
 
 EntityId g_livePropLastCarriedEntityId = INVALID_ENTITYID;
 uint64_t g_livePropLastCarriedGuid = 0;
-EntityId g_livePropCarrySuppressEntityId = INVALID_ENTITYID;
-uint64_t g_livePropCarrySuppressGuid = 0;
-float g_livePropCarrySuppressUntilTime = -1000.0f;
+EntityId g_livePropReleasedEntityId = INVALID_ENTITYID;
 EntityId g_livePropPendingThrowEntityId = INVALID_ENTITYID;
 float g_livePropPendingThrowUntilTime = -1000.0f;
 
@@ -151,14 +150,6 @@ bool IsLobbyMainLiftLooseCargoPosition(
 float NowSeconds()
 {
     return gEnv && gEnv->pTimer ? gEnv->pTimer->GetAsyncCurTime() : 0.0f;
-}
-
-bool IsCarrySuppressActiveFor(EntityId entityId, uint64_t guid, float now)
-{
-    return g_livePropCarrySuppressEntityId != INVALID_ENTITYID &&
-        now <= g_livePropCarrySuppressUntilTime &&
-        (entityId == g_livePropCarrySuppressEntityId ||
-            (guid != 0 && guid == g_livePropCarrySuppressGuid));
 }
 
 bool IsLocalPlayerNearPosition(const Vec3& position, float maxDistanceSq)
@@ -376,24 +367,6 @@ bool IsLivePropCorpseEntity(IEntity& entity, bool localCarried, std::string& rea
     return IsLivePropCorpseNpc(npc, localCarried, reason);
 }
 
-bool IsLocalPlayerCarryingEntity(EntityId entityId)
-{
-    if (entityId == INVALID_ENTITYID || !ArkPlayer::GetInstancePtr())
-        return false;
-
-    unsigned carriedEntityId = INVALID_ENTITYID;
-    std::string reason;
-    return TryGuardedCall(
-            "live prop local ArkPlayerCarry picked entity",
-            []() -> unsigned
-            {
-                return ArkPlayer::GetInstance().m_interaction.m_playerCarry.m_pickedUpEntityId;
-            },
-            carriedEntityId,
-            &reason) &&
-        carriedEntityId == entityId;
-}
-
 EntityId GetLocalCarriedEntityId()
 {
     if (!ArkPlayer::GetInstancePtr())
@@ -405,7 +378,11 @@ EntityId GetLocalCarriedEntityId()
             "live prop local carried entity id",
             []() -> unsigned
             {
-                return ArkPlayer::GetInstance().m_interaction.m_playerCarry.m_pickedUpEntityId;
+                const auto& carry = ArkPlayer::GetInstance().m_interaction.m_playerCarry;
+                // Vanilla can still report the old ID while it restores collision.
+                return carry.m_pickedUpEntityId != g_livePropReleasedEntityId && !carry.m_collisionRestoreTimer.IsValid()
+                    ? carry.m_pickedUpEntityId
+                    : INVALID_ENTITYID;
             },
             carriedEntityId,
             &reason))
@@ -414,6 +391,11 @@ EntityId GetLocalCarriedEntityId()
     }
 
     return carriedEntityId;
+}
+
+bool IsLocalPlayerCarryingEntity(EntityId entityId)
+{
+    return entityId != INVALID_ENTITYID && entityId == GetLocalCarriedEntityId();
 }
 
 bool IsFiniteFloat(float value)
@@ -766,6 +748,7 @@ bool RotationChangedEnough(const Quat& a, const Quat& b, float epsilon)
 void ModMain::ResetLivePropSyncState(const char* reason)
 {
     m_liveProps.clear();
+    m_livePropSequencesBySource.clear();
     m_areaOverlayLivePropCandidates.clear();
     m_areaOverlayLivePropCandidateUntilTime = -1000.0f;
     m_livePropSequence = 0;
@@ -797,9 +780,7 @@ void ModMain::ResetLivePropSyncState(const char* reason)
     m_livePropApplyActive = false;
     g_livePropLastCarriedEntityId = INVALID_ENTITYID;
     g_livePropLastCarriedGuid = 0;
-    g_livePropCarrySuppressEntityId = INVALID_ENTITYID;
-    g_livePropCarrySuppressGuid = 0;
-    g_livePropCarrySuppressUntilTime = -1000.0f;
+    g_livePropReleasedEntityId = INVALID_ENTITYID;
     g_livePropPendingThrowEntityId = INVALID_ENTITYID;
     g_livePropPendingThrowUntilTime = -1000.0f;
     m_lastLivePropEvent = reason ? reason : "live prop reset";
@@ -811,11 +792,9 @@ void ModMain::PromoteAreaOverlayLiveProp(LivePropState&& snapshot, float authori
 {
     const float now = NowSeconds();
     LivePropState& state = m_liveProps[snapshot.guid];
-    const uint32_t lastReceivedSequence = state.lastReceivedSequence;
     const float lastAppliedTime = state.lastAppliedTime;
 
     state = std::move(snapshot);
-    state.lastReceivedSequence = lastReceivedSequence;
     state.lastSentTime = -1000.0f;
     state.lastAppliedTime = lastAppliedTime;
     state.localAuthorityUntilTime = authorityUntilTime;
@@ -1024,7 +1003,23 @@ bool ModMain::IsLivePropRemoteProtected(const LivePropState& state, float now) c
         (remotePhase || remoteCarried || remoteBallistic || remoteActive);
 }
 
-bool ModMain::ShouldTrackLivePropEntity(IEntity& entity, std::string& reason, bool allowCarryableItem) const
+namespace
+{
+bool IsLooseLiveProp(IEntity& entity, std::string& reason)
+{
+    IEntity* parent = nullptr;
+    if (!TryGuardedCall("live prop IEntity::GetParent", [&entity]() { return entity.GetParent(); }, parent, &reason))
+        return false;
+    if (!parent)
+        return true;
+
+    // The wire pose is in world space; an attached entity follows its native parent.
+    reason = "parented entity";
+    return false;
+}
+}
+
+bool ModMain::ShouldTrackLivePropEntity(IEntity& entity, std::string& reason, bool allowCarryableItem, bool remoteCarried) const
 {
     EntityId entityId = INVALID_ENTITYID;
     if (!TryGuardedCall("live prop IEntity::GetId", [&entity]() { return entity.GetId(); }, entityId, &reason) ||
@@ -1059,6 +1054,9 @@ bool ModMain::ShouldTrackLivePropEntity(IEntity& entity, std::string& reason, bo
             return false;
         }
     }
+
+    if (!IsLooseLiveProp(entity, reason))
+        return false;
 
     const bool localCarried = IsLocalPlayerCarryingEntity(entityId);
     allowCarryableItem = allowCarryableItem || localCarried;
@@ -1125,6 +1123,34 @@ bool ModMain::ShouldTrackLivePropEntity(IEntity& entity, std::string& reason, bo
     const bool carriedTurretTransform =
         allowCarryableItem && className.find("arkturret") != std::string::npos;
 
+    bool carriedInteractiveObject = false;
+    if (allowCarryableItem && className == "arkinteractiveobject")
+    {
+        // A native grab admits this prop, not a generic contact with a device.
+        carriedInteractiveObject = localCarried;
+        uint64_t guid = 0;
+        if (!carriedInteractiveObject &&
+            TryGuardedCall("live prop tracked GetGuid", [&entity]() { return entity.GetGuid(); }, guid, &reason))
+        {
+            const auto tracked = m_liveProps.find(guid);
+            carriedInteractiveObject = tracked != m_liveProps.end() && tracked->second.hasSnapshot &&
+                tracked->second.entityId == entityId;
+        }
+        if (!carriedInteractiveObject && remoteCarried)
+        {
+            std::array<ArkInteractionInfo, 4> interactions{};
+            bool populated = false;
+            carriedInteractiveObject = TryGuardedCall(
+                "live prop native carry interaction",
+                [&]() { return ArkPlayerInteraction::PopulateInteractionInfo(&entity, interactions); },
+                populated,
+                &reason) && populated && std::any_of(interactions.begin(), interactions.end(), [](const ArkInteractionInfo& info)
+                {
+                    return info.m_interactionType == EArkInteractionType::carry;
+                });
+        }
+    }
+
     IEntityArchetype* archetype = nullptr;
     const bool hasArchetype =
         TryGuardedCall("live prop IEntity::GetArchetype", [&entity]() { return entity.GetArchetype(); }, archetype, &reason) &&
@@ -1157,7 +1183,8 @@ bool ModMain::ShouldTrackLivePropEntity(IEntity& entity, std::string& reason, bo
     // carry/collision path; ordinary lights keep native device transforms.
     if (IsBlockedLivePropClass(className) &&
         !carriedTurretTransform &&
-        !carriedArkLightTransform)
+        !carriedArkLightTransform &&
+        !carriedInteractiveObject)
     {
         reason = "untracked class " + className;
         return false;
@@ -1226,6 +1253,7 @@ bool ModMain::CaptureLivePropState(IEntity& entity, bool removed, LivePropState&
         return false;
     }
 
+    // Replicate the actual Vanilla pose, not the carry target that physics can obstruct.
     uint64_t rawGuid = 0;
     if (!TryGuardedCall("live prop IEntity::GetId capture", [&entity]() { return entity.GetId(); }, outState.entityId, &reason) ||
         !TryGuardedCall("live prop IEntity::GetGuid capture", [&entity]() { return entity.GetGuid(); }, rawGuid, &reason) ||
@@ -1265,8 +1293,6 @@ bool ModMain::CaptureLivePropState(IEntity& entity, bool removed, LivePropState&
         return false;
     }
 
-    if (outState.carried && IsCarrySuppressActiveFor(outState.entityId, outState.guid, NowSeconds()))
-        outState.carried = false;
     if (!outState.carried &&
         IsLobbyMainLiftLooseCargoPosition(outState.levelName, outState.position))
     {
@@ -1279,28 +1305,6 @@ bool ModMain::CaptureLivePropState(IEntity& entity, bool removed, LivePropState&
         outState.flags |= CoopProtocol::kLivePropTransformFlagHidden;
     if (removed)
         outState.flags |= CoopProtocol::kLivePropTransformFlagRemoved;
-
-    if (outState.carried && !corpseNpc && EnvFlagDefaultEnabled("COOP_LIVE_PROP_USE_CARRY_TARGET") && ArkPlayer::GetInstancePtr())
-    {
-        QuatT carryTarget(IDENTITY);
-        std::string carryReason;
-        if (TryGuardedCall(
-                "live prop ArkPlayerCarry GetLerpTargetLocation",
-                [&entity]() -> QuatT
-                {
-                    auto& carry = ArkPlayer::GetInstance().m_interaction.m_playerCarry;
-                    return carry.GetLerpTargetLocation(&entity, carry.m_pickupEntityOriginalRotation);
-                },
-                carryTarget,
-                &carryReason) &&
-            IsFiniteVec3(carryTarget.t) &&
-            IsFiniteQuat(carryTarget.q))
-        {
-            outState.position = carryTarget.t;
-            outState.rotation = carryTarget.q;
-            outState.rotation.Normalize();
-        }
-    }
 
     if (!IsFiniteVec3(outState.position) ||
         !IsFiniteQuat(outState.rotation) ||
@@ -1403,15 +1407,6 @@ void ModMain::QueueLivePropTransform(IEntity& entity, bool removed, const char* 
     AppendLivePropDebugTrace("queue.capture", snapshot.guid, snapshot.entityId, &snapshot, reason ? reason : "entity event");
 
     const float now = NowSeconds();
-    if (snapshot.carried && IsCarrySuppressActiveFor(snapshot.entityId, snapshot.guid, now))
-    {
-        m_lastLivePropEvent =
-            "suppressed stale carry xform guid=" + std::to_string(snapshot.guid) +
-            " reason=" + (reason ? reason : "release suppress");
-        AppendLivePropDebugTrace("queue.suppress.stale_carry", snapshot.guid, snapshot.entityId, &snapshot, m_lastLivePropEvent.c_str());
-        return;
-    }
-
     auto existingIt = m_liveProps.find(snapshot.guid);
     if (snapshot.carried)
     {
@@ -1444,7 +1439,6 @@ void ModMain::QueueLivePropTransform(IEntity& entity, bool removed, const char* 
             previousState.angularVelocity.GetLengthSquared() >= kLivePropAngularVelocityActiveSq;
 
         state = snapshot;
-        state.lastReceivedSequence = hadPreviousState ? previousState.lastReceivedSequence : 0;
         state.lastSentTime = needsGrabReset ? -1000.0f : previousState.lastSentTime;
         state.lastAppliedTime = hadPreviousState ? previousState.lastAppliedTime : -1000.0f;
         state.localAuthorityUntilTime = now + kLivePropLocalCarryAuthorityGraceSeconds;
@@ -1513,7 +1507,6 @@ void ModMain::QueueLivePropTransform(IEntity& entity, bool removed, const char* 
         if (canSendClientMotionProposal && !likelyImmediateRemoteEcho)
         {
             LivePropState& state = m_liveProps[snapshot.guid];
-            const uint32_t lastReceivedSequence = state.lastReceivedSequence;
             const float lastSentTime = state.lastSentTime;
             const float lastAppliedTime = state.lastAppliedTime;
             const float remoteAuthorityUntilTime = state.remoteAuthorityUntilTime;
@@ -1524,7 +1517,6 @@ void ModMain::QueueLivePropTransform(IEntity& entity, bool removed, const char* 
             const bool pendingRemoteApply = state.pendingRemoteApply;
             const uint8_t remoteApplyStepsRemaining = state.remoteApplyStepsRemaining;
             state = snapshot;
-            state.lastReceivedSequence = lastReceivedSequence;
             state.lastSentTime = lastSentTime;
             state.lastAppliedTime = lastAppliedTime;
             state.remoteAuthorityUntilTime = remoteAuthorityUntilTime;
@@ -1591,7 +1583,6 @@ void ModMain::QueueLivePropTransform(IEntity& entity, bool removed, const char* 
     if (!significant)
         return;
 
-    const uint32_t lastReceivedSequence = state.lastReceivedSequence;
     const float lastSentTime = state.lastSentTime;
     const float lastAppliedTime = state.lastAppliedTime;
     const float localAuthorityUntilTime = state.localAuthorityUntilTime;
@@ -1607,7 +1598,6 @@ void ModMain::QueueLivePropTransform(IEntity& entity, bool removed, const char* 
     const Vec3 previousVelocity = state.velocity;
     const Vec3 previousAngularVelocity = state.angularVelocity;
     state = snapshot;
-    state.lastReceivedSequence = lastReceivedSequence;
     state.lastSentTime = lastSentTime;
     state.lastAppliedTime = lastAppliedTime;
     state.localAuthorityUntilTime = carried ?
@@ -1923,7 +1913,6 @@ bool ModMain::QueueLivePropCollisionAuthority(
     }
 
     LivePropState& state = m_liveProps[snapshot.guid];
-    const uint32_t lastReceivedSequence = state.lastReceivedSequence;
     const float lastSentTime = state.lastSentTime;
     const float lastAppliedTime = state.lastAppliedTime;
     const float localAuthorityUntilTime = state.localAuthorityUntilTime;
@@ -1936,7 +1925,6 @@ bool ModMain::QueueLivePropCollisionAuthority(
     const Vec3 previousAngularVelocity = state.angularVelocity;
 
     state = snapshot;
-    state.lastReceivedSequence = lastReceivedSequence;
     state.lastSentTime = hadContactAuthority ? lastSentTime : -1000.0f;
     state.lastAppliedTime = lastAppliedTime;
     state.localAuthorityUntilTime = std::max(
@@ -2423,6 +2411,31 @@ void ModMain::HandleLivePropCollisionEvent(IEntity& entity, const SEntityEvent& 
     }
 }
 
+bool ModMain::IsLivePropHeldByPeer(const IEntity& entity) const
+{
+    if (!m_enableLivePropSync || m_networkMode == CoopNetworkMode::Off ||
+        !IsSessionGameplayReady())
+    {
+        return false;
+    }
+
+    const EntityId entityId = entity.GetId();
+    const float now = NowSeconds();
+    return std::any_of(m_liveProps.begin(), m_liveProps.end(), [&](const auto& entry)
+    {
+        const LivePropState& state = entry.second;
+        return state.entityId == entityId && state.remoteCarrierAccountToken != 0 &&
+            state.leasePhase == LivePropLeasePhase::CarriedRemote && now <= state.remoteAuthorityUntilTime &&
+            IsKnownSameLevel(state.levelName, m_localLevelName);
+    });
+}
+
+void ModMain::OnArkPlayerCarryStarted(EntityId entityId)
+{
+    if (entityId == g_livePropReleasedEntityId)
+        g_livePropReleasedEntityId = INVALID_ENTITYID;
+}
+
 void ModMain::OnArkPlayerCarryThrowHook(ArkPlayerCarry* carry, const char* phase, bool result)
 {
     const std::string phaseText = phase && phase[0] ? phase : "unknown";
@@ -2515,6 +2528,7 @@ void ModMain::OnArkPlayerCarryStopHook(EntityId entityId, float impulse, bool ap
     if (!entity)
         return;
 
+    g_livePropReleasedEntityId = entityId;
     std::string reason;
     LivePropState snapshot;
     if (!CaptureLivePropState(*entity, false, snapshot, reason, true))
@@ -2537,10 +2551,8 @@ void ModMain::OnArkPlayerCarryStopHook(EntityId entityId, float impulse, bool ap
         m_lastLivePropCarryEvent = "throw overrides remote authority guid=" + std::to_string(snapshot.guid);
 
     const LivePropState previousState = state;
-    const uint32_t lastReceivedSequence = previousState.lastReceivedSequence;
     const float lastAppliedTime = previousState.lastAppliedTime;
     state = snapshot;
-    state.lastReceivedSequence = lastReceivedSequence;
     state.lastAppliedTime = lastAppliedTime;
     state.flags &= ~CoopProtocol::kLivePropTransformFlagCarried;
     state.flags |= CoopProtocol::kLivePropTransformFlagActive;
@@ -2637,9 +2649,6 @@ void ModMain::OnArkPlayerCarryStopHook(EntityId entityId, float impulse, bool ap
     state.remoteApplyStepsRemaining = 0;
     state.dirty = true;
     state.lastSentTime = -1000.0f;
-    g_livePropCarrySuppressEntityId = entityId;
-    g_livePropCarrySuppressGuid = state.guid;
-    g_livePropCarrySuppressUntilTime = now + authoritySeconds;
     g_livePropLastCarriedEntityId = INVALID_ENTITYID;
     g_livePropLastCarriedGuid = 0;
 
@@ -2715,27 +2724,6 @@ void ModMain::TickLivePropSync(float frameTime)
 
     uint64_t carriedGuid = 0;
     EntityId carriedEntityId = GetLocalCarriedEntityId();
-    if (g_livePropCarrySuppressEntityId != INVALID_ENTITYID)
-    {
-        if (now > g_livePropCarrySuppressUntilTime ||
-            (carriedEntityId != INVALID_ENTITYID &&
-                !IsCarrySuppressActiveFor(carriedEntityId, g_livePropCarrySuppressGuid, now)))
-        {
-            g_livePropCarrySuppressEntityId = INVALID_ENTITYID;
-            g_livePropCarrySuppressGuid = 0;
-            g_livePropCarrySuppressUntilTime = -1000.0f;
-        }
-        else if (carriedEntityId == g_livePropCarrySuppressEntityId)
-        {
-            carriedEntityId = INVALID_ENTITYID;
-        }
-        else if (carriedEntityId == INVALID_ENTITYID)
-        {
-            g_livePropCarrySuppressEntityId = INVALID_ENTITYID;
-            g_livePropCarrySuppressGuid = 0;
-            g_livePropCarrySuppressUntilTime = -1000.0f;
-        }
-    }
 
     auto queueReleasedCarriedProp = [&](EntityId releasedEntityId, uint64_t releasedGuid, const char* label)
     {
@@ -2769,12 +2757,10 @@ void ModMain::TickLivePropSync(float frameTime)
 
         LivePropState& state = stateIt->second;
         const LivePropState previousState = state;
-        const uint32_t lastReceivedSequence = state.lastReceivedSequence;
         const float lastSentTime = state.lastSentTime;
         if (snapshot.hasSnapshot)
         {
             state = snapshot;
-            state.lastReceivedSequence = lastReceivedSequence;
             state.lastSentTime = lastSentTime;
         }
         state.flags &= ~CoopProtocol::kLivePropTransformFlagCarried;
@@ -2952,15 +2938,13 @@ void ModMain::TickLivePropSync(float frameTime)
         if (!entity)
             continue;
 
-        if (IsLocalPlayerCarryingEntity(entity->GetId()) &&
-            !IsCarrySuppressActiveFor(entity->GetId(), state.guid, now))
+        if (IsLocalPlayerCarryingEntity(entity->GetId()))
             continue;
 
         LivePropState snapshot;
         if (!CaptureLivePropState(*entity, false, snapshot, reason, true))
             continue;
 
-        const uint32_t lastReceivedSequence = state.lastReceivedSequence;
         const float lastSentTime = state.lastSentTime;
         const float localAuthorityUntilTime = state.localAuthorityUntilTime;
         const float forceSendUntilTime = state.forceSendUntilTime;
@@ -2972,7 +2956,6 @@ void ModMain::TickLivePropSync(float frameTime)
         const Vec3 previousVelocity = state.velocity;
         const Vec3 previousAngularVelocity = state.angularVelocity;
         state = snapshot;
-        state.lastReceivedSequence = lastReceivedSequence;
         state.lastSentTime = lastSentTime;
         state.localAuthorityUntilTime = localAuthorityUntilTime;
         state.remoteAuthorityUntilTime = -1000.0f;
@@ -3040,7 +3023,7 @@ void ModMain::TickLivePropSync(float frameTime)
 
         std::string reason;
         IEntity* entity = ResolveLivePropEntity(state.guid, state.entityId, reason);
-        if (!entity)
+        if (!entity || !IsLooseLiveProp(*entity, reason))
         {
             state.pendingRemoteApply = false;
             state.remoteApplyStepsRemaining = 0;
@@ -3131,10 +3114,7 @@ void ModMain::TickLivePropSync(float frameTime)
                 std::to_string(state.guid);
             return false;
         }
-        const bool localCarryNow =
-            carried &&
-            IsLocalPlayerCarryingEntity(state.entityId) &&
-            !IsCarrySuppressActiveFor(state.entityId, state.guid, now);
+        const bool localCarryNow = carried && IsLocalPlayerCarryingEntity(state.entityId);
         const bool localBurst = state.localAuthorityUntilTime > now;
         const bool localFreeAuthority = m_networkMode == CoopNetworkMode::Host || IsClientAreaAuthorityActive();
         const bool localLeasePhase = IsLivePropLocalLeasePhase(state.leasePhase);
@@ -3825,25 +3805,32 @@ void ModMain::HandleLivePropTransform(const CoopProtocol::LivePropTransformPacke
         return;
     }
 
-    LivePropState& state = m_liveProps[packet.guid];
-    if (CoopSerialSequence::IsStaleOrDuplicate(packet.sequence, state.lastReceivedSequence))
+    // The thrower and catcher have independent packet sequences.
+    auto& sequences = m_livePropSequencesBySource[packet.sourceAccountToken];
+    const auto previousSequence = sequences.find(packet.guid);
+    if (previousSequence != sequences.end() &&
+        CoopSerialSequence::IsStaleOrDuplicate(packet.sequence, previousSequence->second))
     {
         ++m_droppedLivePropPackets;
         return;
     }
-    if (packetCarried && state.remoteBallisticActive && now <= state.remoteBallisticUntilTime)
+
+    LivePropState& state = m_liveProps[packet.guid];
+    if (state.leasePhase == LivePropLeasePhase::CarriedRemote &&
+        now <= state.remoteAuthorityUntilTime && state.remoteCarrierAccountToken != 0 &&
+        packet.sourceAccountToken != state.remoteCarrierAccountToken)
     {
         ++m_droppedLivePropPackets;
         m_lastLivePropEvent =
-            "dropped stale carried live prop guid=" + std::to_string(packet.guid) +
-            " reason=remote ballistic active";
-        AppendLivePropDebugTrace("recv.drop.stale_carried", packet.guid, state.entityId, &state, m_lastLivePropEvent.c_str());
+            "dropped live prop guid=" + std::to_string(packet.guid) +
+            " reason=held by another peer";
+        AppendLivePropDebugTrace("recv.drop.other_carrier", packet.guid, state.entityId, &state, m_lastLivePropEvent.c_str());
         return;
     }
 
     std::string reason;
     IEntity* entity = ResolveLivePropEntity(packet.guid, state.entityId, reason);
-    if (!entity || !ShouldTrackLivePropEntity(*entity, reason, true))
+    if (!entity || !ShouldTrackLivePropEntity(*entity, reason, true, packetCarried))
     {
         ++m_droppedLivePropPackets;
         m_lastLivePropEvent = "dropped live prop guid=" + std::to_string(packet.guid) + " reason=" + reason;
@@ -3852,37 +3839,15 @@ void ModMain::HandleLivePropTransform(const CoopProtocol::LivePropTransformPacke
     }
 
     const EntityId entityId = entity->GetId();
-    const bool releaseSuppressActive =
-        g_livePropCarrySuppressEntityId != INVALID_ENTITYID &&
-        now <= g_livePropCarrySuppressUntilTime &&
-        (entityId == g_livePropCarrySuppressEntityId ||
-            (g_livePropCarrySuppressGuid != 0 && packet.guid == g_livePropCarrySuppressGuid));
     if (IsLocalPlayerCarryingEntity(entityId))
     {
-        if (m_networkMode == CoopNetworkMode::Client && !packetCarried && releaseSuppressActive)
-        {
-            TryGuardedVoidCall(
-                "live prop accept remote release DropCarriedEntity",
-                []()
-                {
-                    ArkPlayer::GetInstance().m_interaction.m_playerCarry.DropCarriedEntity();
-                },
-                &reason);
-        }
-        else
-        {
-            ++m_droppedLivePropPackets;
-            m_lastLivePropEvent =
-                "dropped live prop guid=" + std::to_string(packet.guid) +
-                " reason=locally carried entity packetCarried=" + std::to_string(packetCarried ? 1 : 0);
-            return;
-        }
+        ++m_droppedLivePropPackets;
+        m_lastLivePropEvent =
+            "dropped live prop guid=" + std::to_string(packet.guid) + " reason=locally carried entity";
+        return;
     }
 
-    // A completed remote Vanilla pickup is stronger than a stale local
-    // flight/collision lease. A simultaneous local pickup was already
-    // rejected above by IsLocalPlayerCarryingEntity, so accepting carried
-    // here cannot steal an object from the local player's hands.
+    // A completed Vanilla grab ends flight, but cannot replace another carry.
     const bool localAuthorityActive =
         state.localAuthorityUntilTime > now &&
         !packetCarried;
@@ -3917,7 +3882,8 @@ void ModMain::HandleLivePropTransform(const CoopProtocol::LivePropTransformPacke
     state.releaseAngularVelocity = Vec3(ZERO);
     state.releaseMotionUntilTime = -1000.0f;
     state.flags = packet.flags;
-    CoopSerialSequence::Observe(packet.sequence, state.lastReceivedSequence);
+    CoopSerialSequence::Observe(packet.sequence, sequences[packet.guid]);
+    state.remoteCarrierAccountToken = packetCarried ? packet.sourceAccountToken : 0;
     state.localAuthorityUntilTime = localAuthorityActive ? previousLocalAuthorityUntilTime : -1000.0f;
     state.forceSendUntilTime = localAuthorityActive ? previousForceSendUntilTime : -1000.0f;
     state.contactAuthorityUntilTime = localAuthorityActive ? previousContactAuthorityUntilTime : -1000.0f;

@@ -8249,6 +8249,7 @@ static auto s_hookCArkWeaponOnEquip = CArkWeapon::FOnEquip.MakeHook();
 static auto s_hookArkRecyclerSpawnNextIngredient = ArkRecycler::FSpawnNextIngredient.MakeHook();
 static thread_local ArkPlayerWeaponComponent* s_activeLocalWeaponEquipComponent = nullptr;
 static thread_local unsigned s_activeLocalWeaponEquipId = INVALID_ENTITYID;
+static auto s_hookArkPlayerCarryStartCarrying = ArkPlayerCarry::FStartCarrying.MakeHook();
 static auto s_hookArkPlayerCarryThrowCarriedEntity = ArkPlayerCarry::FThrowCarriedEntity.MakeHook();
 static auto s_hookArkPlayerCarryStopCarrying = ArkPlayerCarry::FStopCarrying.MakeHook();
 static auto s_hookArkWeaponUtilsDoHitImpulse1 = ArkWeaponUtils::FDoHitImpulseOv1.MakeHook();
@@ -19833,6 +19834,17 @@ static void CArkItem_NotifyPlayerAcquired_Hook(const CArkItem* item, int count)
         return;
 
     s_hookCArkItemNotifyPlayerAcquired.InvokeOrig(item, count);
+}
+
+static bool ArkPlayerCarry_StartCarrying_Hook(ArkPlayerCarry* carry, IEntity* entity, bool remote, bool fromSerialize)
+{
+    if (gMod && entity && !remote && !fromSerialize && gMod->IsLivePropHeldByPeer(*entity))
+        return false;
+
+    const bool started = s_hookArkPlayerCarryStartCarrying.InvokeOrig(carry, entity, remote, fromSerialize);
+    if (started && gMod && entity && !remote)
+        gMod->OnArkPlayerCarryStarted(entity->GetId());
+    return started;
 }
 
 static bool ArkPlayerCarry_ThrowCarriedEntity_Hook(ArkPlayerCarry* carry)
@@ -32460,6 +32472,7 @@ void ModMain::InitHooks()
         s_hookArkPlayerWeaponComponentEquipWeapon.SetHookFunc(&ArkPlayerWeaponComponent_EquipWeapon_Hook);
         s_hookCArkWeaponOnEquip.SetHookFunc(&CArkWeapon_OnEquip_Hook);
     }
+    s_hookArkPlayerCarryStartCarrying.SetHookFunc(&ArkPlayerCarry_StartCarrying_Hook);
     s_hookArkPlayerCarryThrowCarriedEntity.SetHookFunc(&ArkPlayerCarry_ThrowCarriedEntity_Hook);
     s_hookArkPlayerCarryStopCarrying.SetHookFunc(&ArkPlayerCarry_StopCarrying_Hook);
     if (!EnvFlagEnabled("COOP_DISABLE_LIVE_PROP_IMPULSE_HOOKS"))
@@ -42548,10 +42561,8 @@ bool ModMain::DebugMoveNearestRuntimePropForTest(const std::vector<std::string>&
         {
             const float now = gEnv && gEnv->pTimer ? gEnv->pTimer->GetAsyncCurTime() : 0.0f;
             LivePropState& state = m_liveProps[snapshot.guid];
-            const uint32_t lastReceivedSequence = state.lastReceivedSequence;
             const float lastAppliedTime = state.lastAppliedTime;
             state = snapshot;
-            state.lastReceivedSequence = lastReceivedSequence;
             state.lastAppliedTime = lastAppliedTime;
             state.flags &= ~CoopProtocol::kLivePropTransformFlagCarried;
             state.carried = false;
@@ -42577,10 +42588,8 @@ bool ModMain::DebugMoveNearestRuntimePropForTest(const std::vector<std::string>&
         {
             const float now = gEnv && gEnv->pTimer ? gEnv->pTimer->GetAsyncCurTime() : 0.0f;
             LivePropState& state = m_liveProps[snapshot.guid];
-            const uint32_t lastReceivedSequence = state.lastReceivedSequence;
             const float lastAppliedTime = state.lastAppliedTime;
             state = snapshot;
-            state.lastReceivedSequence = lastReceivedSequence;
             state.lastAppliedTime = lastAppliedTime;
             state.flags &= ~(CoopProtocol::kLivePropTransformFlagCarried | CoopProtocol::kLivePropTransformFlagImpulse);
             state.carried = false;
@@ -71100,6 +71109,7 @@ void ModMain::RemoveRemotePeer(uint64_t accountToken, const char* reason, bool a
     if (it == m_remotePeers.end())
         return;
     const RemotePeerSession peer = it->second;
+    m_livePropSequencesBySource.erase(accountToken);
 
     // A host save transfer is shared by the active peer context, but its
     // completion state is still owned by the account it targets. Do not let
