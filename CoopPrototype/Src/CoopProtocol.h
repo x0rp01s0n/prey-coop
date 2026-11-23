@@ -8,7 +8,7 @@
 namespace CoopProtocol
 {
 constexpr uint32_t kPacketMagic = 0x504F4F43; // "COOP" on little endian
-constexpr uint16_t kProtocolVersion = 260;
+constexpr uint16_t kProtocolVersion = 261;
 constexpr uint32_t kModBuild = 20260725;
 constexpr size_t kUsernameSize = 32;
 constexpr size_t kPasswordSize = 32;
@@ -258,6 +258,7 @@ constexpr uint16_t kStoryEventConversationEnded = 33;
 constexpr uint16_t kStoryEventCutsceneIntent = 34;
 constexpr uint16_t kStoryEventGlobalInt = 35;
 constexpr uint16_t kStoryEventGlobalString = 36;
+constexpr uint16_t kStoryEventLiveExamEntered = 37;
 constexpr size_t kStoryTextValueCapacity = 32;
 constexpr uint16_t kStoryEventFlagUnlimited = 1u << 0;
 constexpr uint16_t kStoryEventFlagShowHud = 1u << 1;
