@@ -472,6 +472,7 @@ public:
         EntityId attachedEntityId,
         const char* reason);
     void RecordNativeNpcSpawnTrace(const char* stage, IEntity* entity, const char* detail);
+    void OnLiveExamWeaverSpawned(IEntity& entity, const Vec3& spawnPosition);
     void OnArkLevelTransitionConfirmed(ArkLevelTransitionDoor* door);
     void OnArkLevelTransitionDoorUpdated(ArkLevelTransitionDoor* door);
     bool TryCorrectTransitionWorldUIScreenLocation(
@@ -1930,6 +1931,8 @@ private:
     bool SendEnemyMannequinActionTo(const CoopProtocol::EnemyMannequinActionPacket& packet, uint32_t address, uint16_t port, const char* failurePrefix);
     bool BuildStoryEventPacket(CoopProtocol::StoryEventPacket& packet, uint16_t eventKind, uint64_t targetId, int32_t count, uint16_t flags, const char* reason, const char* textValue = nullptr);
     bool SendStoryEventTo(const CoopProtocol::StoryEventPacket& packet, uint32_t address, uint16_t port, const char* failurePrefix);
+    void RestoreLiveExamWeaverBinding();
+    bool m_liveExamEntered = false;
     bool BuildAreaObjectEventPacket(CoopProtocol::AreaObjectEventPacket& packet, uint16_t eventKind, uint64_t targetGuid, uint16_t value, uint32_t flags, const char* reason, int32_t count = 0, const char* textValue = nullptr);
     bool SendAreaObjectEventTo(const CoopProtocol::AreaObjectEventPacket& packet, uint32_t address, uint16_t port, const char* failurePrefix);
     bool SendDisconnectNoticeTo(uint32_t address, uint16_t port, uint32_t reason, const char* failurePrefix);

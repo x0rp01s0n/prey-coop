@@ -408,6 +408,10 @@ constexpr uint64_t kCoopSimulationLabsIntroElevatorKioskGuid =
 constexpr uint64_t kCoopSimulationLabsHelicopterUsePromptGuid =
     4761887372799457931ULL;
 constexpr const char* kCoopMainLiftOutageLink = "PhAmbush";
+constexpr uint64_t kLiveExamTriggerGuid = 0x492643BCF6871AE4ULL;
+constexpr uint64_t kLiveExamSpawnerGuid = 0x418C1753456051E0ULL;
+constexpr const char* kLiveExamWeaverName = "SpawnedArkNpcs.Overseers.Weaver.CoopLiveExamination";
+constexpr uint64_t kWeaverArchetypeId = 754;
 constexpr uint64_t kCoopMainLiftOutageRemoteEventId = 1713490239423853535ULL;
 constexpr const char* kCoopMainLiftOutageRemoteEventWireValue =
     "1713490239423853535";
@@ -15347,8 +15351,13 @@ static IEntity* ArkNpcSpawnManager_CreateNpc_SpawnTrace_Hook(
         spawnedState);
     if (gMod)
     {
-        const std::string detail = BuildNativeNpcSpawnDetail("CreateNpc", archetype, position, fromStartGameEntityId);
-        gMod->RecordNativeNpcSpawnTrace("ArkNpcSpawnManager::CreateNpc after", entity, detail.c_str());
+        if (entity && archetype.GetId() == kWeaverArchetypeId)
+            gMod->OnLiveExamWeaverSpawned(*entity, position);
+        if (gMod->ShouldTraceNativeNpcSpawn())
+        {
+            const std::string detail = BuildNativeNpcSpawnDetail("CreateNpc", archetype, position, fromStartGameEntityId);
+            gMod->RecordNativeNpcSpawnTrace("ArkNpcSpawnManager::CreateNpc after", entity, detail.c_str());
+        }
     }
     return entity;
 }
@@ -26672,6 +26681,7 @@ void ModMain::BeginCoopLoadGuard(const char* reason)
     const bool wasActive = m_saveLoadGuardActive;
     if (!wasActive)
     {
+        m_liveExamEntered = false;
         SendHostLoadStartingNotice(reason);
         ResetWorldPresentationForLoad(reason, true);
     }
@@ -32672,13 +32682,13 @@ void ModMain::InitHooks()
         s_hookArkNpcStartInstantDeath.SetHookFunc(&ArkNpc_StartInstantDeath_LifecycleTrace_Hook);
         s_hookArkNpcStartEnergizedDeath.SetHookFunc(&ArkNpc_StartEnergizedDeath_LifecycleTrace_Hook);
         s_hookArkNpcOnRecycled.SetHookFunc(&ArkNpc_OnRecycled_LifecycleTrace_Hook);
-        s_hookArkNpcSpawnManagerCreateNpc.SetHookFunc(&ArkNpcSpawnManager_CreateNpc_SpawnTrace_Hook);
         s_hookArkNpcSpawnManagerCreateNpcCorpse1.SetHookFunc(&ArkNpcSpawnManager_CreateNpcCorpse1_SpawnTrace_Hook);
         s_hookArkNpcSpawnManagerCreateNpcCorpse0.SetHookFunc(&ArkNpcSpawnManager_CreateNpcCorpse0_SpawnTrace_Hook);
         s_hookCEntitySystemOnEntityEvent.SetHookFunc(&CEntitySystem_OnEntityEvent_TransitionListenerGuard_Hook);
         s_hookCEntitySystemRemoveEntity.SetHookFunc(&CEntitySystem_RemoveEntity_LifecycleTrace_Hook);
         s_hookCEntitySystemDeleteEntity.SetHookFunc(&CEntitySystem_DeleteEntity_LifecycleTrace_Hook);
     }
+    s_hookArkNpcSpawnManagerCreateNpc.SetHookFunc(&ArkNpcSpawnManager_CreateNpc_SpawnTrace_Hook);
     if (!EnvFlagEnabled("COOP_DISABLE_ARK_NPC_ABILITY_OWNER_REMOVAL_GUARD"))
     {
         s_hookArkNpcAbilityManagerRemoveAbility.SetHookFunc(
@@ -60994,6 +61004,39 @@ void ModMain::OnLocalStoryRosterStateChanged(
     QueueLocalStoryEventForHook(eventKind, id, 1, 0, reason);
 }
 
+void ModMain::RestoreLiveExamWeaverBinding()
+{
+    if (!gEnv || !gEnv->pEntitySystem)
+        return;
+    auto* child = gEnv->pEntitySystem->FindEntityByName(kLiveExamWeaverName);
+    const auto* archetype = child ? child->GetArchetype() : nullptr;
+    if (!archetype || archetype->GetId() != kWeaverArchetypeId)
+        return;
+
+    m_enemyStableSpawnIdsByEntity[child->GetId()] = kLiveExamSpawnerGuid;
+    m_liveExamEntered = true;
+}
+
+void ModMain::OnLiveExamWeaverSpawned(IEntity& entity, const Vec3& spawnPosition)
+{
+    if (!gEnv || !gEnv->pEntitySystem)
+        return;
+    auto* entities = gEnv->pEntitySystem;
+    auto* spawner = entities->GetEntity(entities->FindEntityByGuid(kLiveExamSpawnerGuid));
+    if (!spawner || (spawner->GetWorldPos() - spawnPosition).GetLengthSquared() > 0.01f)
+        return;
+
+    // The graph binds the Weaver by entity ID. Its name survives a native
+    // save/load even though the spawner's runtime child ID does not.
+    entity.SetName(kLiveExamWeaverName);
+    m_enemyStableSpawnIdsByEntity[entity.GetId()] = kLiveExamSpawnerGuid;
+    if (m_liveExamEntered)
+        return;
+    m_liveExamEntered = true;
+    QueueLocalStoryEventForHook(
+        CoopProtocol::kStoryEventLiveExamEntered, kLiveExamTriggerGuid, 1, 0, "native Live Examination entry");
+}
+
 bool ModMain::QueueLocalStoryEventForHook(
     uint16_t eventKind,
     uint64_t targetId,
@@ -61011,7 +61054,7 @@ bool ModMain::QueueLocalStoryEventForHook(
 
     const bool classifiedStoryKind =
         eventKind >= CoopProtocol::kStoryEventGrantKeycard &&
-        eventKind <= CoopProtocol::kStoryEventGlobalString;
+        eventKind <= CoopProtocol::kStoryEventLiveExamEntered;
     const std::string coverageStoryDetail = reason && reason[0]
         ? std::string(reason)
         : "story_kind_" + std::to_string(eventKind);
@@ -67526,6 +67569,39 @@ bool ModMain::ApplyStoryEventMutation(const CoopProtocol::StoryEventPacket& pack
         return ok && after == desired;
     }
 
+    if (packet.eventKind == CoopProtocol::kStoryEventLiveExamEntered)
+    {
+        if (packet.targetId != kLiveExamTriggerGuid || !gEnv || !gEnv->pEntitySystem)
+            return false;
+        if (!m_liveExamEntered)
+            RestoreLiveExamWeaverBinding();
+        if (m_liveExamEntered)
+        {
+            detail = "live_exam_already_entered";
+            return true;
+        }
+
+        auto* entities = gEnv->pEntitySystem;
+        auto* trigger = entities->GetEntity(entities->FindEntityByGuid(kLiveExamTriggerGuid));
+        auto* script = trigger ? trigger->GetScriptTable() : nullptr;
+        if (!script)
+        {
+            detail = "missing_live_exam_trigger";
+            return false;
+        }
+
+        m_liveExamEntered = true;
+        bool entered = false;
+        const bool invoked = TryGuardedCall(
+            "Live Examination ProximityTrigger::Event_Enter",
+            [script]() { return Script::CallMethod(script, "Event_Enter", script); },
+            entered,
+            nullptr);
+        m_liveExamEntered = invoked && entered;
+        detail = m_liveExamEntered ? "activated_native_live_exam_entry" : "live_exam_enter_failed";
+        return m_liveExamEntered;
+    }
+
     if (packet.eventKind == CoopProtocol::kStoryEventRemoteEvent)
     {
         const StoryRemoteEventWhitelistEntry* entry = FindStoryRemoteEventById(packet.targetId);
@@ -72656,6 +72732,9 @@ void ModMain::HandleEnemyRoster(const CoopProtocol::EnemyRosterPacket& packet)
         m_lastEnemyRosterEvent = "ignored duplicate enemy roster net=" + std::to_string(packet.enemyNetId);
         return;
     }
+
+    if (packet.stableEnemyId == kLiveExamSpawnerGuid)
+        RestoreLiveExamWeaverBinding();
 
     record.stableEnemyId = packet.stableEnemyId;
     record.areaId = packet.areaId;
@@ -88847,6 +88926,13 @@ uint64_t ModMain::ResolveEnemyStableId(IEntity& entity, uint64_t archetypeId, ui
 
 uint32_t ModMain::BuildEnemyRosterFlags(IEntity& entity) const
 {
+    const auto stable = m_enemyStableSpawnIdsByEntity.find(entity.GetId());
+    if (stable != m_enemyStableSpawnIdsByEntity.end() && stable->second == kLiveExamSpawnerGuid)
+    {
+        return CoopProtocol::kEnemyRosterFlagAlive | CoopProtocol::kEnemyRosterFlagLevelAuthored |
+            CoopProtocol::kEnemyRosterFlagStoryCritical;
+    }
+
     bool loadedFromLevel = false;
     TryGuardedCall(
         "enemy roster IsLoadedFromLevelFile",
@@ -88888,6 +88974,8 @@ ModMain::EnemyAuthorityState& ModMain::EnsureEnemyAuthorityState(IEntity& entity
     const EntityId entityId = entity.GetId();
     const IEntityArchetype* archetype = entity.GetArchetype();
     const uint64_t archetypeId = archetype ? archetype->GetId() : 0;
+    if (archetypeId == kWeaverArchetypeId && m_enemyStableSpawnIdsByEntity.find(entityId) == m_enemyStableSpawnIdsByEntity.end())
+        RestoreLiveExamWeaverBinding();
     uint64_t nativeGuid = 0;
     TryGuardedCall(
         "enemy authority IEntity::GetGuid",
@@ -88901,6 +88989,8 @@ ModMain::EnemyAuthorityState& ModMain::EnsureEnemyAuthorityState(IEntity& entity
             ResolveOperatorDispenserStableSpawnIdForEnemy(entityId, "EnsureEnemyAuthorityState");
     }
     uint64_t stableEnemyId = ResolveEnemyStableId(entity, archetypeId, nativeGuid);
+    if (stableEnemyId == kLiveExamSpawnerGuid)
+        nativeGuid = 0; // The graph's child is native, but its runtime GUID is local.
     bool adoptedMimicReplacementIdentity = false;
     uint64_t netId = 0;
 
@@ -89660,6 +89750,7 @@ void ModMain::CullClientLocalEnemies()
         return;
     }
 
+    RestoreLiveExamWeaverBinding();
     std::vector<EntityId> entitiesToRemove;
     IEntityIt* iterator = gEnv->pEntitySystem->GetEntityIterator();
     if (!iterator)
@@ -89686,6 +89777,10 @@ void ModMain::CullClientLocalEnemies()
 
         const uint32_t flags = entity->GetFlags();
         if ((flags & kCoopRuntimeEntityFlags) == kCoopRuntimeEntityFlags)
+            continue;
+
+        const auto stable = m_enemyStableSpawnIdsByEntity.find(entityId);
+        if (stable != m_enemyStableSpawnIdsByEntity.end() && stable->second == kLiveExamSpawnerGuid)
             continue;
 
         entitiesToRemove.push_back(entityId);
