@@ -2227,11 +2227,12 @@ bool TrySpawnAndGiveInventoryItem(
         spawnPosition.z += 0.35f;
     }
 
+    // Native saves retain the inventory's entity IDs. The items they refer to
+    // must be created as savable entities, not as transient world replicas.
     SEntitySpawnParams params;
     params.sName = "CoopInventoryRestoreItem";
     params.pClass = archetype.GetClass();
     params.pArchetype = &archetype;
-    params.nFlags = ENTITY_FLAG_NO_SAVE | ENTITY_FLAG_PROCEDURAL;
     params.vPosition = spawnPosition;
     params.qRotation = spawnRotation;
 
